@@ -82,3 +82,12 @@ html.over-pet body:active {
   opacity: 1;
   transform: translate(-50%, 0) scale(1);
 }
+
+/* 常驻状态行压成单行（B3）：nowrap + 省略号，让它不可能长出第二行。
+   验收判据是渲染态几何（top >= 0 且高度 ≤ 单行行盒），不是字数 —— 字数只是输入侧的预防。
+   台词不挂这个类，照旧可以折行。 */
+#pet-bubble.status {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

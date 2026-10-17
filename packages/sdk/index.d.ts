@@ -129,12 +129,25 @@ export interface PluginContext {
   ble: PluginBle;
   /** 向自己的 widget 推数据，走 `<id>:widget` topic；需要能力 `widget`（bridge.ts:175-179） */
   widget: { update(data: unknown): Promise<void> };
-  /** 影响宠物本体；本体只暴露这两个受控入口，不给 canvas/DOM（bridge.ts:181-197）。宠物本体未初始化时 reject */
+  /** 影响宠物本体；本体只暴露这几个受控入口，不给 canvas/DOM（bridge.ts:181-197）。宠物本体未初始化时 reject */
   pet: {
     /** 参数只能是 petdex 九状态之一，其余名字会被桥拒绝（bridge.ts:184-186，白名单 src/pet/host.ts:9）。需要能力 `pet:react` */
     react(action: PetAction): Promise<void>;
     /** 弹一句台词：换行折叠成空格、trim、截 200 字；清洗后为空则 reject（bridge.ts:190-194）。需要能力 `pet:say` */
     say(text: string): Promise<void>;
+    /**
+     * 常驻状态行（B3）：宠物旁**长期**挂一行字，与 `say` 共用同一个气泡槽 ——
+     * 台词插进来时它被临时替换，3.6 秒后回位（ADR-0003 修订）。
+     *
+     * - 只有 `null` 表示清除；非字符串/非 null、以及清洗后为空都 reject（别拿空串当清除）。
+     * - 清洗：换行/制表**及所有控制字符**折叠成空格 → 压空格 → trim → 按码点取前 20 个。
+     * - 多个插件同时挂行时**各占一条**：界面显示**最近设置**的那条；`null` 只删自己那条，
+     *   删完回落到剩下最近的一条，都没了才收起。
+     * - 返回值只关于**你这一条**：设置时是生效后的文本（可能被截断），清除时是 `null`。
+     * - 渲染一律按文本（传 `<b>x</b>` 显示的就是这串字符），并且压成单行（CSS 截断）。
+     *   需要能力 `pet:say`。仅在插件入口可用，widget 拿不到（bridge.ts:195-220）。
+     */
+    setStatus(text: string | null): Promise<string | null>;
   };
   /** 出站请求（bridge.ts:199-222）。桥里唯一不走 gated 的成员：权限判断是自己的
    * ensurePermissions(["http", "http:<host>"])（bridge.ts:211），一次弹框申请两个键。

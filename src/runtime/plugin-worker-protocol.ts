@@ -8,7 +8,8 @@
 // 错误的规整（asHostError）留在宿主侧做，Worker 只消费 `{code, message}` 这个纯负载。
 import catalog from "../../packages/sdk/error-codes.json" with { type: "json" };
 
-/** 面向插件的 23 个方法（点号命名空间）。`log` 不占能力，但同样只能走这条通道。 */
+/** 面向插件的 23 个方法（点号命名空间）。`log` 不占能力，但同样只能走这条通道。
+ *  23 而不是 22：B3 加了 `pet.setStatus`，见 ADR-0006 的「增项记录（2026-10-17）」。 */
 export const PLUGIN_WORKER_METHODS = [
   "bus.publish",
   "bus.subscribe",
@@ -23,6 +24,7 @@ export const PLUGIN_WORKER_METHODS = [
   "widget.update",
   "pet.react",
   "pet.say",
+  "pet.setStatus",
   "http.request",
   "notify.show",
   "overlay.show",

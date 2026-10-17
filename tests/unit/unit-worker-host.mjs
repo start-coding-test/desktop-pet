@@ -24,7 +24,8 @@ const workerSrc = read("../../src/runtime/plugin-worker.ts");
 const runtimeSrc = read("../../src/runtime/plugin-runtime.ts");
 const sorted = (list) => [...list].sort();
 
-/** ADR-0006 契约里那张 23 个方法的表，逐字钉死（改名、增删都要先改 ADR） */
+/** ADR-0006 契约里那张 23 个方法的表，逐字钉死（改名、增删都要先改 ADR）
+ *  —— 第 23 个是 B3 的 `pet.setStatus`，见 ADR-0006「增项记录（2026-10-17）」 */
 const EXPECTED = [
   "agentHooks.install",
   "agentHooks.set",
@@ -45,6 +46,7 @@ const EXPECTED = [
   "overlay.show",
   "pet.react",
   "pet.say",
+  "pet.setStatus",
   "storage.delete",
   "storage.get",
   "storage.set",
