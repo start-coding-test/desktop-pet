@@ -1876,7 +1876,7 @@ export function unmount() {}
   const STATUS_A = "zz.status";
   const STATUS_B = "zz.status2";
   const STATUS_ON_ACTIVATE = "启动行";
-  const STATUS_INDEX = `export function activate(ctx) {
+  const STATUS_INDEX = `export async function activate(ctx) {
   const pid = ctx.pluginId;
   const reply = (id, body) => ctx.bus.publish(pid + ":res", Object.assign({ id: id }, body));
   ctx.bus.subscribe(pid + ":cmd", async (msg) => {
