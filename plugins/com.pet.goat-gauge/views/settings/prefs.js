@@ -7,7 +7,7 @@ const BADGE_MODES = [
   ["five_hour", "5 小时"],
   ["weekly", "本周"],
   ["monthly", "本月"],
-  ["cost_today", "本期成本"],
+  ["cost_period", "本期成本"],
 ];
 
 function listOf(textValue, fallback) {

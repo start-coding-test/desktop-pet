@@ -27,6 +27,13 @@ Command Code GOAT 的额度与 token 用量看板，移植自
 - 插件没有 `matchMedia` / 剪贴板能力：界面固定配色，studio URL 只显示文本。
 - 上游 `/alpha/*` 是未公开接口，字段变化时靠 `normalize.js` 的多字段兜底。
 
+## 验证边界
+
+- `npm run verify:release` 只安装 `tests/fixtures/l1-probe` 等 L1 夹具，**不安装本插件**；
+  它不能证明 goat-gauge 的 SVG / `<style>` 在打包版 CSP 下正常。
+- 本插件当前的运行时验证是 `tests/e2e/verify-goat-gauge.mjs`（dev，Worker realm）；
+  打包版 CSP 下的 SVG 渲染需要单独的夹具或 PM 本机人工检查，尚未覆盖。
+
 ## 许可证
 
 MIT License

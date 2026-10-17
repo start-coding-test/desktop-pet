@@ -4,6 +4,7 @@ import { fmtDateTime, fmtMoney } from "../format.js";
 import { TOPIC_CMD, TOPIC_WIDGET } from "../topics.js";
 import { addStyle, tag, text } from "./dom.js";
 import { createRing, RING_CSS } from "./rings.js";
+import { setClassIfChanged, setTextIfChanged } from "./write.js";
 
 const CSS = `
   .g-card { width: 300px; box-sizing: border-box; margin: 2px auto; padding: 6px 10px;
@@ -44,6 +45,13 @@ export function mountOverlay(root, ctx, cleanups) {
 
   let lastView = null;
   let mounted = false;
+  const cache = {};
+
+  function updateRings(view, now = Date.now()) {
+    five.update(view.windows.five_hour, now);
+    weekly.update(view.windows.weekly, now);
+    monthly.update(view.windows.monthly, now);
+  }
 
   function render(view) {
     lastView = view ?? null;
@@ -53,25 +61,35 @@ export function mountOverlay(root, ctx, cleanups) {
       mounted = false;
       return;
     }
-    const now = Date.now();
-    five.update(d.windows.five_hour, now);
-    weekly.update(d.windows.weekly, now);
-    monthly.update(d.windows.monthly, now);
+    updateRings(d);
 
-    updated.textContent = d.fetchedAt ? fmtDateTime(d.fetchedAt) : "尚未刷新";
+    setTextIfChanged(
+      updated,
+      d.fetchedAt ? fmtDateTime(d.fetchedAt) : "尚未刷新",
+      cache,
+      "updated",
+    );
     const value = Number(d.usage?.total_cost);
-    cost.textContent = Number.isFinite(value)
-      ? `本期 ${fmtMoney(value, d.config ?? {})}`
-      : "本期 —";
+    setTextIfChanged(
+      cost,
+      Number.isFinite(value) ? `本期 ${fmtMoney(value, d.config ?? {})}` : "本期 —",
+      cache,
+      "cost",
+    );
     if (d.state === "auth_error") {
-      note.className = "g-note g-error";
-      note.textContent = "凭据失效，暂停更新";
+      setClassIfChanged(note, "g-note g-error", cache, "noteClass");
+      setTextIfChanged(note, "凭据失效，暂停更新", cache, "note");
     } else if (d.state === "stale") {
-      note.className = "g-note";
-      note.textContent = "数据过期";
+      setClassIfChanged(note, "g-note", cache, "noteClass");
+      setTextIfChanged(note, "数据过期", cache, "note");
     } else {
-      note.className = "g-note";
-      note.textContent = d.account.mode === "demo" ? "演示模式" : (d.plan?.name ?? "");
+      setClassIfChanged(note, "g-note", cache, "noteClass");
+      setTextIfChanged(
+        note,
+        d.account.mode === "demo" ? "演示模式" : (d.plan?.name ?? ""),
+        cache,
+        "note",
+      );
     }
 
     if (!mounted) {
@@ -81,7 +99,8 @@ export function mountOverlay(root, ctx, cleanups) {
   }
 
   const timer = setInterval(() => {
-    if (lastView) render(lastView);
+    // 每秒只重算三环倒计时；头部/底部只在新 :widget 数据时更新。
+    if (lastView && mounted) updateRings(lastView);
   }, 1000);
   cleanups.push(() => clearInterval(timer));
   cleanups.push(ctx.bus.subscribe(TOPIC_WIDGET, (view) => render(view ?? {})));

@@ -27,6 +27,17 @@ const ONLINE = Boolean(env.GOAT_GAUGE_KEY) && env.GOAT_GAUGE_ONLINE === "1";
 const isPetPage = (t) => /localhost:1420\/(src\/)?index\.html$/.test(t.url);
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 const near = (a, b, tol = 6) => Math.abs(a - b) <= tol;
+
+/** Node 侧的异步谓词轮询；用于 store_get / 窗口可见性这类 host 调用。 */
+async function pollUntil(fn, timeoutMs = 10_000, intervalMs = 250) {
+  const until = Date.now() + timeoutMs;
+  while (Date.now() < until) {
+    const value = await fn().catch(() => null);
+    if (value) return value;
+    await sleep(intervalMs);
+  }
+  return null;
+}
 const r = createReport("GOAT 用量插件（dev）");
 
 let c = null;
@@ -157,7 +168,6 @@ const settingsHost = `#plugin-settings div[data-plugin-id=${JSON.stringify(PID)}
 /* ---------- 插件指令与视图 ---------- */
 async function send(cmd) {
   await c.ev(`window.__bus.publish(${JSON.stringify(`${PID}:cmd`)}, ${JSON.stringify(cmd)})`);
-  await sleep(1000);
 }
 
 async function readView() {
@@ -167,6 +177,15 @@ async function readView() {
 async function storeGet(key) {
   const res = await hostInvoke(c)("store_get", { pluginId: PID, key });
   return res.ok ? res.v : null;
+}
+
+/** 先 clearKey，再等存储里的 apiKey 真的为空；收尾/在线组都走这里。 */
+async function clearCred(timeoutMs = 8000) {
+  await send({ action: "clearKey" });
+  return pollUntil(async () => {
+    const cred = await storeGet("cred");
+    return cred && cred.apiKey === "" ? cred : null;
+  }, timeoutMs);
 }
 
 async function peekWidget() {
@@ -195,7 +214,6 @@ async function openPluginPage() {
   await settings.client.ev(
     `document.querySelector('#nav-plugins .nav-item[data-view=${JSON.stringify(PID)}]')?.click()`,
   );
-  await sleep(1200);
   const hostOk = await waitUntil(
     settings.client,
     `!!document.querySelector('#plugin-settings div[data-plugin-id=${JSON.stringify(PID)}]')`,
@@ -234,12 +252,14 @@ try {
   // 干净起点：撤销授权会连带清掉插件存储目录。
   settings = await openSettingsInvoker(PORT, c);
   await settings.invoke("permission_revoke", { pluginId: PID });
-  await sleep(1500);
+  await pollUntil(async () => {
+    const res = await hostInvoke(c)("store_get", { pluginId: PID, key: "cred" });
+    return !res.ok || res.v === null;
+  }, 8000);
 
   r.group("启用与授权");
   await writeEnabledIds(settings.invoke, [...origEnabled, PID]);
   await reloadAndWait(c);
-  await sleep(1500);
   await c.ev(`(async () => {
     const { bus } = await import('/src/runtime/event-bus.ts');
     window.__bus = { publish: (topic, payload) => bus.publish(topic, payload, ${JSON.stringify(PID)}) };
@@ -271,15 +291,12 @@ try {
     wanted.length > 0 && wanted.every((cap) => caps.has(cap)) && caps.size === wanted.length,
   );
 
-  await sleep(1500);
-  const emptyRect = await c.ev(
-    `(() => { const n = document.querySelector(${JSON.stringify(badgeHost)}); if (!n) return null; const b = n.getBoundingClientRect(); return { w: b.width, h: b.height }; })()`,
+  const empty = await waitUntil(
+    c,
+    `(() => { const n = document.querySelector(${JSON.stringify(badgeHost)}); if (!n) return false; const b = n.getBoundingClientRect(); return b.width === 0 && b.height === 0; })()`,
+    10_000,
   );
-  r.check(
-    "未配置且非演示时 badge 没有尺寸",
-    true,
-    !!emptyRect && emptyRect.w === 0 && emptyRect.h === 0,
-  );
+  r.check("未配置且非演示时 badge 没有尺寸", true, empty);
 
   // 观察 petController；notify 用插件在 ctx.notify.show resolve 后发的 :status 记录。
   const petReady = await waitUntil(c, `(async () => {
@@ -300,12 +317,8 @@ try {
   const badgeText = await waitShadowText(c, badgeHost, ".g-badge", "5h 63%", 20_000);
   r.check("badge 显示演示 5h 63%", true, badgeText.includes("5h 63%"));
 
-  let visible = false;
-  for (let i = 0; i < 30 && !visible; i++) {
-    visible = await overlayVisible().catch(() => false);
-    if (!visible) await sleep(500);
-  }
-  r.check("overlay 窗口可见", true, visible);
+  const visible = await pollUntil(() => overlayVisible(), 15_000, 500);
+  r.check("overlay 窗口可见", true, !!visible);
 
   const overlayTarget = (await listPages(PORT)).find(
     (t) => /overlay\.html/.test(t.url) && t.title === `DesktopPet Overlay · ${PID}`,
@@ -370,45 +383,76 @@ try {
   r.check("插件页已挂载", true, page.hostOk);
   r.check("插件页在 Worker realm", "worker", page.realm);
   await send({ action: "saveConfig", config: { refreshSec: 120 } });
+  const firstCfg = await pollUntil(async () => {
+    const current = await storeGet("config");
+    return current?.refreshSec === 120 ? current : null;
+  }, 8000);
+  r.check("刷新间隔先落库", true, !!firstCfg);
   await send({ action: "saveConfig", config: { currency: "CNY" } });
-  const cfg = await storeGet("config");
+  const cfg = await pollUntil(async () => {
+    const current = await storeGet("config");
+    return current &&
+      current.refreshSec === 120 &&
+      current.currency === "CNY" &&
+      current.overlayX === 300 &&
+      current.overlayY === 420
+      ? current
+      : null;
+  }, 8000);
   r.check("只改币种不抹刷新间隔", [120, "CNY", 300, 420], [
     cfg?.refreshSec,
     cfg?.currency,
     cfg?.overlayX,
     cfg?.overlayY,
   ]);
-  const peekedCfg = (await peekWidget())?.config ?? {};
+  const peekedCfg =
+    (await pollUntil(async () => {
+      const config = (await peekWidget())?.config;
+      return config && config.refreshSec === 120 && config.currency === "CNY"
+        ? config
+        : null;
+    }, 8000)) ?? {};
   r.check("widget 视图里的配置同步", [120, "CNY"], [peekedCfg.refreshSec, peekedCfg.currency]);
-  const uiRefresh = await shadowValue(
-    settings.client,
-    settingsHost,
-    'input[data-field="refreshSec"]',
-  ).catch(() => null);
-  const uiCurrency = await shadowValue(
-    settings.client,
-    settingsHost,
-    'select[data-field="currency"]',
-  ).catch(() => null);
+  const uiRefresh = await pollUntil(async () => {
+    const value = await shadowValue(
+      settings.client,
+      settingsHost,
+      'input[data-field="refreshSec"]',
+    ).catch(() => null);
+    return value === "120" ? value : null;
+  }, 8000);
+  const uiCurrency = await pollUntil(async () => {
+    const value = await shadowValue(
+      settings.client,
+      settingsHost,
+      'select[data-field="currency"]',
+    ).catch(() => null);
+    return value === "CNY" ? value : null;
+  }, 8000);
   r.check("设置页控件回显刷新间隔", "120", String(uiRefresh));
   r.check("设置页控件回显币种", "CNY", String(uiCurrency));
 
   await settings.close();
   settings = null;
-  await sleep(800);
   settings = await openSettingsInvoker(PORT, c);
   const reopened = await openPluginPage();
   r.check("重开设置窗插件页仍挂载", true, reopened.hostOk);
-  const uiRefresh2 = await shadowValue(
-    settings.client,
-    settingsHost,
-    'input[data-field="refreshSec"]',
-  ).catch(() => null);
-  const uiCurrency2 = await shadowValue(
-    settings.client,
-    settingsHost,
-    'select[data-field="currency"]',
-  ).catch(() => null);
+  const uiRefresh2 = await pollUntil(async () => {
+    const value = await shadowValue(
+      settings.client,
+      settingsHost,
+      'input[data-field="refreshSec"]',
+    ).catch(() => null);
+    return value === "120" ? value : null;
+  }, 8000);
+  const uiCurrency2 = await pollUntil(async () => {
+    const value = await shadowValue(
+      settings.client,
+      settingsHost,
+      'select[data-field="currency"]',
+    ).catch(() => null);
+    return value === "CNY" ? value : null;
+  }, 8000);
   r.check("重开后刷新间隔回显 120", "120", String(uiRefresh2));
   r.check("重开后币种回显 CNY", "CNY", String(uiCurrency2));
 
@@ -437,8 +481,13 @@ try {
     );
   const beforeNotify = Number(await countNotify()) || 0;
   const beforeFailed = Number(await c.ev("window.__pet.acts.filter((a) => a === 'failed').length")) || 0;
+  const beforeFetched = Number((await readView())?.fetchedAt) || 0;
   await send({ action: "demoScenario", scenario: "exhausted" });
-  await sleep(1500);
+  const refreshed = await pollUntil(async () => {
+    const view = await readView();
+    return view && Number(view.fetchedAt) > beforeFetched ? view : null;
+  }, 10_000);
+  r.check("第二次演示刷新完成", true, !!refreshed);
   const afterNotify = Number(await countNotify()) || 0;
   const afterFailed = Number(await c.ev("window.__pet.acts.filter((a) => a === 'failed').length")) || 0;
   r.check("同一窗口不重复通知", beforeNotify, afterNotify);
@@ -446,7 +495,10 @@ try {
 
   r.group("凭据：Key 不出现在视图/日志");
   await send({ action: "saveKey", key: TEST_KEY });
-  const storedCred = await storeGet("cred");
+  const storedCred = await pollUntil(async () => {
+    const cred = await storeGet("cred");
+    return cred?.apiKey === TEST_KEY ? cred : null;
+  }, 8000);
   r.check("测试 Key 已写入插件存储", TEST_KEY, storedCred?.apiKey);
   const peeked = await peekWidget();
   r.check("widget payload 不含测试 Key", false, JSON.stringify(peeked ?? null).includes(TEST_KEY));
@@ -454,28 +506,38 @@ try {
   const logHit = existsSync(logPath) && readFileSync(logPath, "utf8").includes(TEST_KEY);
   r.check("host.log 不含测试 Key", false, logHit);
 
+  const beforeClearFetched = Number((await readView())?.fetchedAt) || 0;
+  const clearedDemo = await clearCred();
+  r.check("演示测试 Key 已从插件存储清空", true, !!clearedDemo);
+  const afterClearView = await pollUntil(async () => {
+    const view = await readView();
+    return view && Number(view.fetchedAt) > beforeClearFetched ? view : null;
+  }, 8000);
+  r.check("清 Key 后 demo 继续刷新", true, !!afterClearView);
+
   r.group("停用：停止推送与收掉 overlay");
   const widgetCountBefore = (await readView()) ? Number(await c.ev("window.__seen.widget.length")) : 0;
   await writeEnabledIds(settings.invoke, origEnabled);
   await sleep(10_000);
   const widgetCountAfter = Number(await c.ev("window.__seen.widget.length")) || 0;
   r.check("停用后 10 秒没有新的 :widget 推送", widgetCountBefore, widgetCountAfter);
-  let hidden = false;
-  for (let i = 0; i < 24 && !hidden; i++) {
-    hidden = !(await overlayVisible().catch(() => true));
-    if (!hidden) await sleep(500);
-  }
-  r.check("停用后 overlay 已收起", true, hidden);
+  const hidden = await pollUntil(
+    async () => !(await overlayVisible().catch(() => true)),
+    12_000,
+    500,
+  );
+  r.check("停用后 overlay 已收起", true, !!hidden);
 
   r.group("撤销授权与重新启用");
   const beforeConsents = consents.length;
   await settings.invoke("permission_revoke", { pluginId: PID });
-  await sleep(1500);
-  const denied = await hostInvoke(c)("store_get", { pluginId: PID, key: "cred" });
-  r.check("撤销后存储读不到", true, !denied.ok || denied.v === null);
+  const denied = await pollUntil(async () => {
+    const res = await hostInvoke(c)("store_get", { pluginId: PID, key: "cred" });
+    return !res.ok || res.v === null ? res : null;
+  }, 8000);
+  r.check("撤销后存储读不到", true, !!denied && (!denied.ok || denied.v === null));
   await writeEnabledIds(settings.invoke, [...origEnabled, PID]);
   await reloadAndWait(c);
-  await sleep(1500);
   const reconsent = await waitConsentForPlugin(beforeConsents, 30_000);
   r.check("重新启用会重新弹同意框", true, !!reconsent?.rendered);
   const reconsentCaps = new Set(reconsent?.caps ?? []);
@@ -504,6 +566,8 @@ try {
     r.check("在线快照字段类型正确", true, onlineOk);
     const onlineLogHit = existsSync(logPath) && readFileSync(logPath, "utf8").includes(env.GOAT_GAUGE_KEY);
     r.check("host.log 不含真实 Key", false, onlineLogHit);
+    const clearedOnline = await clearCred();
+    r.check("在线真实 Key 已从插件存储清空", true, !!clearedOnline);
   } else {
     r.info("在线组已跳过", "需要同时设置 GOAT_GAUGE_KEY 与 GOAT_GAUGE_ONLINE=1");
   }
@@ -519,21 +583,24 @@ try {
   pump?.stop();
   oc?.close();
   try {
+    const canSend = await c.ev("typeof window.__bus?.publish === 'function'").catch(() => false);
+    if (canSend) await clearCred(3000).catch(() => undefined);
     if (!settings) settings = await openSettingsInvoker(PORT, c).catch(() => null);
     if (settings) {
       await writeEnabledIds(settings.invoke, origEnabled).catch(() => undefined);
       await settings.invoke("permission_revoke", { pluginId: PID }).catch(() => undefined);
+      await pollUntil(async () => {
+        const res = await hostInvoke(c)("store_get", { pluginId: PID, key: "cred" });
+        return !res.ok || res.v === null;
+      }, 8000).catch(() => undefined);
       settings.close();
     }
-    await sleep(1500);
     await reloadAndWait(c).catch(() => undefined);
-    await sleep(1000);
   } catch (err) {
     console.error("收尾失败", err);
   }
   const failed = r.summary();
   c?.close();
-  await sleep(400);
   process.exit(failed ? 1 : 0);
 }
 

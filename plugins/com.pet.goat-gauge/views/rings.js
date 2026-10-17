@@ -3,6 +3,7 @@
 import { arcPath, toneOfPct } from "../charts.js";
 import { fmtCountdown, fmtPct } from "../format.js";
 import { svg, tag, text } from "./dom.js";
+import { setAttrIfChanged, setClassIfChanged, setDatasetIfChanged, setTextIfChanged } from "./write.js";
 
 export const RING_CSS = `
   .g-rings { display: flex; justify-content: space-between; gap: 10px; }
@@ -54,6 +55,7 @@ export function createRing(dom, { size = 64, label, kind }) {
   const reset = text(dom, "—", "g-ring-reset");
   reset.dataset.role = "ring-reset";
   box.append(chart, value, labelNode, reset);
+  const cache = {};
 
   /**
    * @param {Record<string, any> | null | undefined} window
@@ -63,19 +65,19 @@ export function createRing(dom, { size = 64, label, kind }) {
     const available = window && window.available !== false;
     const pct = available ? Number(window.remaining_pct) : Number.NaN;
     if (!available || !Number.isFinite(pct)) {
-      progress.setAttribute("d", "");
-      value.textContent = "—";
-      reset.textContent = String(window?.note ?? "—");
-      box.className = "g-ring unavailable";
-      box.dataset.state = window ? "unavailable" : "empty";
+      setAttrIfChanged(progress, "d", "", cache);
+      setTextIfChanged(value, "—", cache, "value");
+      setTextIfChanged(reset, String(window?.note ?? "—"), cache, "reset");
+      setClassIfChanged(box, "g-ring unavailable", cache);
+      setDatasetIfChanged(box, "state", window ? "unavailable" : "empty", cache);
       return;
     }
-    progress.setAttribute("d", arcPath(center, center, radius, pct));
-    value.textContent = fmtPct(pct);
+    setAttrIfChanged(progress, "d", arcPath(center, center, radius, pct), cache);
+    setTextIfChanged(value, fmtPct(pct), cache, "value");
     const resetAt = Number(window.reset_at) || 0;
-    reset.textContent = resetAt > now ? fmtCountdown(resetAt, now) : "已重置";
-    box.className = `g-ring ${toneOfPct(pct)}`;
-    box.dataset.state = window.exceeded === true ? "exceeded" : "ok";
+    setTextIfChanged(reset, resetAt > now ? fmtCountdown(resetAt, now) : "已重置", cache, "reset");
+    setClassIfChanged(box, `g-ring ${toneOfPct(pct)}`, cache);
+    setDatasetIfChanged(box, "state", window.exceeded === true ? "exceeded" : "ok", cache);
   }
 
   return { box, chart, progress, value, reset, update };

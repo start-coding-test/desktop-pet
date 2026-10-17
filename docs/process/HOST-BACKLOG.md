@@ -385,3 +385,11 @@ MVP 范围：<这一轮只做什么>
   而 PM 的卡在 §6 里写"首次调用会弹框"是错的。**派卡前先把 PLUGIN_SDK §2 对一遍**。
 - std Mutex 一律 `unwrap_or_else(|p| p.into_inner())`。
 - 宿主日志：`%LOCALAPPDATA%\com.desktoppet.pet\logs\host.log`，验收时先看它再猜。
+
+## 5. 宿主缺口（goat-gauge 评审提出，2026-10-17）
+
+| # | 现象 | 插件侧怎么绕过 | 建议 |
+|---|---|---|---|
+| G1 | `ctx.dom` 的 SVG 白名单缺 `stroke-width` / `stroke-linecap` / `fill-opacity` 等呈现属性，表外名字静默拒收。 | 圆环用 `path` 的 `d` 画弧，线宽/线帽/透明度写进 `<style>` 元素的 CSS；刻度用 HTML `span`，不用 SVG `text`。 | 评估把常用 SVG 呈现属性加入 `WIDGET_ATTRS` / `WIDGET_STYLE_PROPS`，或提供 SVG 专用样式通道；改词表时同步 `unit:migrate` 与 SDK §5.1。 |
+| G2 | `ctx.http.request` 只返回 `status` / `content_type` / `body` / `truncated`，没有响应头。 | 429 无法读 `Retry-After`，只用本地冷却阶梯 60s→2m→5m→15m→30m。 | 在 `HttpResponse` 增加 `headers`（至少 `retry-after`）或 `retryAfterMs` 字段；桥与 Rust 同改。 |
+| G3 | Widget 在 Worker 里没有 `matchMedia` / 主题能力，无法跟随系统深浅色。 | badge / overlay 固定深色、设置页固定浅色；不接 `navigator.clipboard`，外链只显示文本。 | 评估 `ctx.theme` 或 `layout` 推送带 `colorScheme`；剪贴板另开能力卡。 |
