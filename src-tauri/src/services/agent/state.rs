@@ -85,7 +85,7 @@ fn state_for_event(phase: &str, notification_kind: &str) -> Option<&'static str>
         }
         "stop" => Some("completed"),
         "tool-failure" | "stop-failure" => Some("failed"),
-        "session-end" => Some("idle"),
+        "session-end" | "interrupt" => Some("idle"),
         _ => None,
     }
 }
@@ -187,6 +187,15 @@ impl AgentState {
         Some(state)
     }
 
+    /// 切换 Agent 时清空会话表。旧 Agent 的会话不该继续挂在状态卡上，
+    /// 等 90 秒 TTL 才消失 —— 那是「已经换人了还在演上一位」。返回清掉的条数，便于日志与单测。
+    pub(super) fn clear_sessions(&self) -> usize {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let n = sessions.len();
+        sessions.clear();
+        n
+    }
+
     /// 当前最活跃那个会话的标题与步数（卡片要显示的就是它）
     pub(super) fn active_summary(&self) -> (String, u32) {
         let sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
@@ -237,12 +246,37 @@ impl AgentState {
                 "lastState": last_state,
                 "title": title,
                 "steps": steps,
+                // 来源标识：A02 起每条都带，插件侧不再需要猜「现在在跟谁说话」
+                "agent": super::linkage::current_agent(),
             }),
-            None => {
-                json!({ "state": aggregate, "counter": counter, "title": title, "steps": steps })
-            }
+            None => json!({
+                "state": aggregate,
+                "counter": counter,
+                "title": title,
+                "steps": steps,
+                "agent": super::linkage::current_agent(),
+            }),
         };
         drop(emitted);
         app.emit("agent:state", payload).is_ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::state_for_event;
+
+    /// interrupt 是 A02 新增的 phase（Codex 的 Interrupt 事件），语义就是「这轮被打断、回到空闲」。
+    #[test]
+    fn interrupt_maps_to_idle() {
+        assert_eq!(state_for_event("interrupt", ""), Some("idle"));
+        // 对照：session-end 一直映射到 idle，两者共用那条尾巴
+        assert_eq!(state_for_event("session-end", ""), Some("idle"));
+        // 白名单里其余 phase 不能因为这一行改动而漂移
+        assert_eq!(state_for_event("pre", ""), Some("running"));
+        assert_eq!(state_for_event("stop", ""), Some("completed"));
+        assert_eq!(state_for_event("tool-failure", ""), Some("failed"));
+        assert_eq!(state_for_event("approval-request", ""), Some("needs_input"));
+        assert_eq!(state_for_event("no-such-phase", ""), None);
     }
 }

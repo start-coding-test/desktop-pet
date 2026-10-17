@@ -17,11 +17,14 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::RwLock;
 
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::plugin_caps::AGENT_HOOKS;
+use crate::services::agent::phases::DEFAULT_AGENT;
+use crate::services::agent::AgentState;
 use crate::services::agent_hooks::{self, FileReport};
 use crate::services::permission::PermissionState;
 
@@ -85,6 +88,29 @@ fn set_broadcast(on: bool) {
     BROADCAST.store(on, Ordering::Relaxed);
 }
 
+/// 当前 Agent 的进程内缓存。来源过滤要对**每一行**事件比对它，不能每行去开磁盘；
+/// 而这个文件只有本进程会写（设置页与启停联动都在宿主里），所以写完即刷新就足够一致。
+/// 独立的 `--pet-hook-cleanup` 进程只读不写 `agent`，不会把这个缓存带歪。
+static CURRENT_AGENT: RwLock<Option<String>> = RwLock::new(None);
+
+/// 缓存里认定的当前 Agent。还没读过状态文件时按 `qoder` —— 与 `--agent` 缺省同一口径，
+/// 所以 A01 时代不带来源字段的事件与 hook 条目都不会被自己的过滤器误杀。
+pub fn current_agent() -> String {
+    CURRENT_AGENT
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+        .unwrap_or_else(|| DEFAULT_AGENT.to_string())
+}
+
+/// 从状态文件把缓存刷成新值，并回传该值。写完之后、启动补写之后都必须调用，
+/// 否则来源过滤会拿旧值去判新到的事件。
+pub fn sync_current_agent(app_data: &Path) -> Option<String> {
+    let agent = agent_choice(app_data);
+    *CURRENT_AGENT.write().unwrap_or_else(|p| p.into_inner()) = agent.clone();
+    agent
+}
+
 fn load(app_data: &Path) -> Loaded {
     let path = state_path(app_data);
     let raw = match fs::read_to_string(&path) {
@@ -143,6 +169,16 @@ fn note_choice(app: &AppHandle, agent: Option<&str>) {
     let Some(data) = app_data(app) else { return };
     if let Err(e) = record_choice(&data, agent) {
         log::warn!("写入联动状态失败: {e}");
+    }
+    // 写完立刻刷新：来源过滤与「切换清会话」都读这个缓存，不能等下次启动再对齐
+    let before = current_agent();
+    let after = sync_current_agent(&data)
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| before.clone());
+    if after != before {
+        // 换人了：旧 Agent 的会话表必须清空，否则状态卡会拿着上一个 Agent 的会话继续演
+        let n = app.state::<std::sync::Arc<AgentState>>().clear_sessions();
+        log::info!("当前 Agent 由 {before} 切到 {after}，清掉 {n} 条会话");
     }
 }
 
@@ -268,7 +304,7 @@ fn apply(app: &AppHandle, prev_on: Option<bool>, now_on: bool, ids: &[String]) {
     // 广播闸门先按现状拨过去：卸载失败也不该让 watcher 继续把事件推给宠物
     set_broadcast(now_on);
     let Some(data) = app_data(app) else { return };
-    let agent = agent_choice(&data);
+    let agent = sync_current_agent(&data);
     let action = decide(prev_on, now_on, any_consented(app, ids), agent.as_deref());
     if action == Action::None {
         return;
@@ -346,6 +382,8 @@ pub fn startup(app: &AppHandle) {
         report(app, "startup-cleanup", &reports);
     });
     log::info!("启动补写联动状态: {migrated:?}");
+    // 补写可能刚刚新建了状态文件，缓存要在第一次读事件之前对齐
+    sync_current_agent(&data);
 }
 
 /// 启动阶段的两步及其顺序。
