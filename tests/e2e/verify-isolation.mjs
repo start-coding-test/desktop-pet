@@ -1875,7 +1875,6 @@ export function unmount() {}
   r.group("B3 常驻状态行：显示 / 单行几何 / 仲裁回落 / 台词优先 / 回收");
   const STATUS_A = "zz.status";
   const STATUS_B = "zz.status2";
-  const STATUS_ON_ACTIVATE = "启动行";
   const STATUS_INDEX = `export async function activate(ctx) {
   const pid = ctx.pluginId;
   const reply = (id, body) => ctx.bus.publish(pid + ":res", Object.assign({ id: id }, body));
@@ -1889,9 +1888,6 @@ export function unmount() {}
       reply(msg.id, { ok: false, e: String(e && e.message ? e.message : e) });
     }
   });
-  // 激活即挂一行：用来验「宿主随机台词让路」。激活与宠物窗那句 700ms 启动台词的先后不确定，
-  // 所以让路按「整段观察期内气泡从未显示过台词」判（见下），不赌时序。
-  await ctx.pet.setStatus(${JSON.stringify(STATUS_ON_ACTIVATE)});
 }
 export function deactivate() {}
 `;
@@ -1910,18 +1906,14 @@ export function deactivate() {}
     writeFileSync(join(dir, "index.js"), STATUS_INDEX);
     writeFileSync(join(dir, "manifest.json"), statusManifest(id));
   }
-  // 随机台词让路 / 迎回位都靠「气泡文本随时间怎么变」判，先把采样器装上（挂在宠物窗）
-  await c.ev(`(async () => {
+  // 采样器必须等 reload 之后再装：window 上的东西（订阅与数组）会被那次重载整个冲掉 ——
+  // 上一版就栽在这儿，结果每条 statusCall 都等满 15s 超时
+  const installedCollectors = `(async () => {
     const { bus } = await import('/src/runtime/event-bus.ts');
     window.__statusRes = [];
-    window.__bubbleSeen = [];
     for (const pid of ['${STATUS_A}', '${STATUS_B}']) bus.subscribe(pid + ':res', (p) => window.__statusRes.push(p));
-    window.__bubbleTimer = setInterval(() => {
-      const b = document.getElementById('pet-bubble');
-      window.__bubbleSeen.push(b.classList.contains('show') ? b.textContent : '');
-    }, 120);
     return true;
-  })()`);
+  })()`;
   let statusSeq = 0;
   /** 指令经总线投给插件入口，结果同样经总线回来（回不传就返回可读失败，而不是 TypeError） */
   const statusCall = async (pid, action, text) => {
@@ -1964,18 +1956,35 @@ export function deactivate() {}
     const consent = await driveConsent("allow", id).catch(() => null);
     r.check(`同意框列出了 ${id} 声明的能力（含 pet:say）`, true, !!consent && consent.caps.some((x) => x.includes("pet:say")));
   }
-  // 观察期：既不赌激活时序（状态行可能晚于启动台词），也不赌随机时机 ——
-  // 只要「启动那句随机台词」出现过，它会在槽里亮 3.6s，120ms 的采样必然抓到
-  const b3Seen = await waitUntil(c, `window.__bubbleSeen.length >= 50`, 8_000).catch(() => false);
-  const b3Texts = b3Seen ? await c.ev(`[...new Set(window.__bubbleSeen)]`) : [];
-  const b3NonStatus = b3Texts.filter((t) => t !== "" && t !== STATUS_ON_ACTIVATE);
+  await c.ev(installedCollectors);
+  // 先挂一行。**不在激活里挂**：首次启用时 pet:say 还没授权，激活里调 setStatus 会当场 reject
+  // （上一版就是这么假红的：激活时挂行失败 → 后面全崩）
+  const b3Seed = await statusCall(STATUS_A, "set", "常驻行");
+  r.check("设置返回生效后的文本", "常驻行", b3Seed.v);
+  const b3SeedNow = await bubbleNow();
+  r.check("挂上一行后界面显示它、且带 .status（单行化生效）", "常驻行|true", [b3SeedNow.text, b3SeedNow.status].join("|"));
+  // 随机台词让路：把 Math.random 钉死，等一次闲置自言自语（45s 一拍 ⇒ 48s 窗口内必然 ≥1 拍），
+  // 全程 120ms 采样气泡文本 —— 守卫被摘掉时那一拍会弹台词并亮 3.6s，必然被抓到。
+  // 这样判不赌「激活 vs 启动台词」的时序，也只等一个固定窗口。
+  await c.ev(`(() => {
+    window.__savedRandom = Math.random;
+    Math.random = () => 0;
+    window.__bubbleSeen = [];
+    window.__bubbleTimer = setInterval(() => {
+      const b = document.getElementById('pet-bubble');
+      window.__bubbleSeen.push(b.classList.contains('show') ? b.textContent : '');
+    }, 120);
+    return true;
+  })()`);
+  await waitUntil(c, `window.__bubbleSeen.length >= 400`, 52_000).catch(() => false);
+  const b3Texts = await c.ev(`[...new Set(window.__bubbleSeen)]`);
+  await c.ev(`(() => { clearInterval(window.__bubbleTimer); Math.random = window.__savedRandom; return true; })()`);
   r.check(
-    "有常驻行时宿主启动那句随机台词没出现（整个观察期气泡里只有常驻行）",
+    "有常驻行时宿主随机台词让路（整段窗口内气泡只出现过常驻行）",
     "[]",
-    JSON.stringify(b3NonStatus),
+    JSON.stringify(b3Texts.filter((t) => t !== "" && t !== "常驻行")),
   );
-  r.check("fixture 激活时挂的那行确实显示出来了（观察期见过它）", true, b3Texts.includes(STATUS_ON_ACTIVATE));
-  await c.ev(`clearInterval(window.__bubbleTimer); true`);
+  r.check("观察期确实采样到了常驻行（采样器活着，这条不是空转）", true, b3Texts.includes("常驻行"));
 
   const b3Geo = await bubbleBox();
   r.check("常驻行有 .status 类（CSS 单行化生效）", true, (await bubbleNow()).status);
