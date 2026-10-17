@@ -158,11 +158,28 @@ fn remember(topic: &str, payload: &serde_json::Value) {
 /// 面板就把没碰过的那个也按默认值写回去，表现成「配置根本没保存」。
 /// 只回 `*:widget`（插件给自己界面看的展示数据），cmd / status / devices
 /// 这类指令与中间态一律不回。
+///
+/// S4：读展示数据也要先报自己是**谁**。以前只查窗口标签与 `:widget` 后缀，
+/// 宿主 realm 里的代码 `invoke("bus_peek", { topic: "<别人的 id>:widget" })`
+/// 就能读到别的插件的展示数据（P1-3 在订阅侧堵的是同一类问题）。归属照
+/// `bus_publish` 那一套解析（悬浮窗只认宿主注册表，其余中继窗口才认自报值），
+/// 并要求 topic 恰好是 `{id}:widget`，不满足一律 None。
+///
+/// 自报 id 的**形状**在这一层拦（边界校验），归属与 topic 的对应关系归 `peek_allowed`。
 #[tauri::command]
-pub fn bus_peek(window: tauri::Window, topic: String) -> Option<serde_json::Value> {
+pub fn bus_peek(
+    window: tauri::Window,
+    topic: String,
+    plugin_id: Option<String>,
+) -> Option<serde_json::Value> {
     let label = window.label().to_string();
-    let hosts_widgets = label == "settings" || label == "pet" || label.starts_with("overlay-");
-    if !hosts_widgets || !is_widget_topic(&topic) {
+    let owner = resolve_owner(
+        &label,
+        plugin_id,
+        crate::window::overlay::owner_of_label(&label),
+    );
+    let owner = owner.as_deref().filter(|id| crate::ids::is_safe_id(id));
+    if !peek_allowed(&label, owner, &topic) {
         return None;
     }
     retained()
@@ -171,6 +188,22 @@ pub fn bus_peek(window: tauri::Window, topic: String) -> Option<serde_json::Valu
         .0
         .get(&topic)
         .cloned()
+}
+
+/// 「这一扇窗能不能读这个 topic 的最近一份」：窗口名单、展示数据形状、归属与 topic 是否同一家。
+/// 抽成纯函数（ADR-0005），命令体只管边界校验、取锁与取值。
+///
+/// 这里不再重复判 id 形状：形状是调用边界上的事（命令体那一句），而**读得到数据**的前提是
+/// 这个 topic 曾经进过保留表 —— 那要过 `check_publish` 的 `is_safe_id`，所以形状不合法的 id
+/// 根本不会有数据可读。
+fn peek_allowed(label: &str, owner: Option<&str>, topic: &str) -> bool {
+    if !relaying_from(label) || !is_widget_topic(topic) {
+        return false;
+    }
+    let Some(id) = owner else {
+        return false;
+    };
+    topic == format!("{id}:widget")
 }
 
 #[cfg(test)]
@@ -338,6 +371,63 @@ mod tests {
             resolve_owner("consent-r1", Some("com.pet.todo".to_string()), None),
             None,
             "同意框一类窗口既不中继，自报 id 也不该被采纳"
+        );
+    }
+
+    /// S4 的正身：读展示数据要先报自己是谁，且这个 topic 必须归他 —— 报成别人也读不到别人的。
+    #[test]
+    fn peek_only_serves_the_topic_of_the_named_owner() {
+        assert!(peek_allowed("pet", Some("todo"), "todo:widget"));
+        assert!(
+            !peek_allowed("pet", Some("todo"), "com.pet.astock:widget"),
+            "报了自己的 id 却去读别人的 :widget"
+        );
+        // 展示数据之外的 topic 一律不回（cmd 这类是指令）
+        assert!(!peek_allowed("pet", Some("todo"), "todo:cmd"));
+        assert!(!peek_allowed("pet", Some("todo"), "ble:heart-rate"));
+        assert!(!peek_allowed("pet", Some("todo"), "todo:"));
+    }
+
+    /// 缺归属、非中继窗口：全部 None（fail-closed，不许放行）
+    #[test]
+    fn peek_is_closed_without_an_owner_or_from_a_guest_window() {
+        assert!(
+            !peek_allowed("pet", None, "todo:widget"),
+            "缺 plugin_id 必须拒"
+        );
+        assert!(!peek_allowed("consent-r1", Some("todo"), "todo:widget"));
+        assert!(!peek_allowed("main", Some("todo"), "todo:widget"));
+    }
+
+    /// 非法 id 的**形状闸**在命令体的边界校验那一句（`.filter(crate::ids::is_safe_id)`）。
+    /// 这里钉住它下面那层：无论 id 长什么样，topic 不与它同一家就一个字都不给 ——
+    /// 形状不合法的 id 连数据都不会有（写进保留表要过 `check_publish` 的同一道闸）。
+    #[test]
+    fn peek_never_serves_a_topic_that_is_not_the_owners_own() {
+        assert!(!peek_allowed("pet", Some("C:"), "todo:widget"));
+        assert!(!peek_allowed("pet", Some("todo"), "C::widget"));
+    }
+
+    /// 悬浮窗那条 label 是宿主开窗时自己定的：归属只认注册表，自报值作废 —— 读不到别人的
+    #[test]
+    fn overlay_peek_uses_the_registry_owner_not_the_self_reported_id() {
+        let owner = resolve_owner(
+            "overlay-com.pet.todo",
+            Some("com.pet.astock".to_string()),
+            Some("com.pet.todo".to_string()),
+        );
+        assert!(peek_allowed(
+            "overlay-com.pet.todo",
+            owner.as_deref(),
+            "com.pet.todo:widget"
+        ));
+        assert!(
+            !peek_allowed(
+                "overlay-com.pet.todo",
+                owner.as_deref(),
+                "com.pet.astock:widget"
+            ),
+            "悬浮窗按自报值读走了别人的展示数据"
         );
     }
 }

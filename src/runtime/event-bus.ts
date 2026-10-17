@@ -44,7 +44,12 @@ class EventBus {
     this.dispatch(topic, payload);
   }
 
-  subscribe(topic: string, handler: Handler): () => void {
+  /**
+   * `pluginId` 是「以哪个插件的名义订阅」：`bus_peek` 现在要按它校验 topic 归属（S4），
+   * 所以读 `*:widget` 的回灌必须把它带上，否则宿主回 None。宿主自己的订阅（不代表某个插件）
+   * 不传，也就读不到任何插件的展示数据 —— 缺归属一律拒是刻意的 fail-closed。
+   */
+  subscribe(topic: string, handler: Handler, pluginId?: string): () => void {
     let set = this.handlers.get(topic);
     if (!set) {
       set = new Set();
@@ -56,7 +61,7 @@ class EventBus {
     // 表现成「配置根本没保存」。只有 `*:widget` 是这种展示数据。
     if (topic.endsWith(":widget")) {
       const owners = set;
-      void invoke<unknown>("bus_peek", { topic })
+      void invoke<unknown>("bus_peek", { topic, pluginId: pluginId ?? null })
         .then((value) => {
           if (value === null || !owners.has(handler)) return;
           try {

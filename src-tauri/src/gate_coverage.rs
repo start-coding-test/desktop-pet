@@ -29,6 +29,11 @@ mod tests {
             "plugin_file_version",
             "取文件 mtime 给 import() 拼 cache-busting，由 id + rel 校验兜底，不是能力面",
         ),
+        (
+            "bus_peek",
+            "只读回灌：只认调用方自己 \"{id}:widget\"，归属由 resolve_owner 加 topic 等值判定，\
+             悬浮窗只认宿主注册表；自报 id 的残余风险见 ADR-0011",
+        ),
     ];
 
     /// 直接调门禁的写法

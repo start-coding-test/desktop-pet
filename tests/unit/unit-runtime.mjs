@@ -248,9 +248,26 @@ resetStub();
   const off = bus.subscribe("zz.probe:widget", (p) => replayed.push(p));
   check("订阅 widget topic 会问宿主取回灌", true, tauriCalls.some((c) => c.cmd === "bus_peek"));
   off();
-  deep("bus_peek 只带 topic 一个参数", tauriCalls.find((c) => c.cmd === "bus_peek")?.args, {
-    topic: "zz.probe:widget",
-  });
+  // S4：回灌要报**订阅方自己**的身份（宿主侧不代表任何插件时是 null），宿主按它校验 topic 归属
+  deep(
+    "bus_peek 带 topic 与订阅方身份（宿主自己的订阅是 null）",
+    tauriCalls.find((c) => c.cmd === "bus_peek")?.args,
+    { topic: "zz.probe:widget", pluginId: null },
+  );
+}
+
+{
+  // S4 反例：传出去的是**订阅方的身份**，不是从 topic 前缀里解析出来的 ——
+  // 否则订别人的 topic 会自动带上别人的 id，归属校验就形同虚设
+  resetStub();
+  setReply("bus_peek", { mode: "badge" });
+  const off = bus.subscribe("com.pet.astock:widget", () => {}, "com.pet.todo");
+  deep(
+    "订阅方是 todo、topic 是 astock：传出去的仍是订阅方的 id，不是 topic 前缀",
+    tauriCalls.find((c) => c.cmd === "bus_peek")?.args,
+    { topic: "com.pet.astock:widget", pluginId: "com.pet.todo" },
+  );
+  off();
 }
 
 {

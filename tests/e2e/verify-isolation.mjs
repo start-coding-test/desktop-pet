@@ -1287,7 +1287,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     await bus.publish(\`\${PID}:widget\`, { mode: 'overlay', v: 1 }, PID);
     await new Promise((r) => setTimeout(r, 400));
     let got = null;
-    const off = bus.subscribe(\`\${PID}:widget\`, (d) => { got = d; });
+    const off = bus.subscribe(\`\${PID}:widget\`, (d) => { got = d; }, PID);
     await new Promise((r) => setTimeout(r, 700));
     off();
     let cmdGot = 'no-call';
@@ -1295,11 +1295,18 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     await new Promise((r) => setTimeout(r, 400));
     off2();
     const peekedCmd = await inv('bus_peek', { topic: \`\${PID}:cmd\` });
-    return { got, cmdGot, peekedCmd };
+    // S4：同一份已存在的数据，报成别人的 id 就读不到；报自己 ✓；不报（缺归属）也读不到
+    const peekOwn = await inv('bus_peek', { topic: \`\${PID}:widget\`, pluginId: PID });
+    const peekForged = await inv('bus_peek', { topic: \`\${PID}:widget\`, pluginId: 'com.pet.todo' });
+    const peekNoOwner = await inv('bus_peek', { topic: \`\${PID}:widget\` });
+    return { got, cmdGot, peekedCmd, peekOwn, peekForged, peekNoOwner };
   })()`);
   r.check("新订阅立刻拿到最近一份 widget 数据", "overlay", peek.got?.mode ?? null);
   r.check("非 widget topic 不会被回灌", "no-call", peek.cmdGot);
   r.check("bus_peek 拒绝非 widget topic", null, peek.peekedCmd);
+  r.check("宿主 realm 直接 peek 别人的 :widget 拿到 null（S4）", null, peek.peekForged);
+  r.check("报自己的 id 仍读得到自己的展示数据（不是把路堵死）", "overlay", peek.peekOwn?.mode ?? null);
+  r.check("缺 plugin_id 一律 null（fail-closed，缺归属不放行）", null, peek.peekNoOwner);
 
   r.group("点击穿透判定（#16，注入假光标，不依赖真实鼠标）");
   const ct = await c.ev(`(async () => {

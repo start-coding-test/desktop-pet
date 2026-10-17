@@ -36,7 +36,7 @@ export function assertSubscribable(pluginId: string, topic: string, permissions:
 /** 交给插件/widget 的总线视图：只有 publish/subscribe，拿不到 handlers 与 inject */
 type BusLike = {
   publish(topic: string, payload: unknown, pluginId?: string): void;
-  subscribe(topic: string, handler: (payload: unknown) => void): () => void;
+  subscribe(topic: string, handler: (payload: unknown) => void, pluginId?: string): () => void;
 };
 
 export type ScopedBus = {
@@ -60,7 +60,8 @@ export function createScopedBus(
     },
     subscribe: (topic: string, handler: (payload: unknown) => void): (() => void) => {
       assertSubscribable(pluginId, topic, permissions);
-      return bus.subscribe(topic, handler);
+      // 带上 pluginId：`*:widget` 的回灌要按它校验 topic 归属（S4，见 commands/bus.rs::bus_peek）
+      return bus.subscribe(topic, handler, pluginId);
     },
   });
 }

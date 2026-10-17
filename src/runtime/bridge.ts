@@ -170,7 +170,8 @@ export function buildContext(manifest: ManifestLike): PluginContext {
       /** 返回退订函数（先 await 才拿到）。停用插件时宿主统一回收，见 runtime/subscriptions.ts */
       subscribe: gated(manifest, BUS_SUBSCRIBE, (topic: string, handler: (payload: unknown) => void) => {
         assertSubscribable(pid, topic, manifest.permissions ?? []);
-        const off = bus.subscribe(topic, handler);
+        // 带上自己的 id：`*:widget` 的回灌要按它校验 topic 归属（S4，见 commands/bus.rs::bus_peek）
+        const off = bus.subscribe(topic, handler, pid);
         return Promise.resolve(register(pid, off));
       }),
     },
