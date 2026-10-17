@@ -156,3 +156,19 @@ dev 用 `npm run dev:debug`（无 CSP），打包版用 `tauri build --no-bundle
   四个入口闭包共 20 个文件对宿主 realm 零依赖（B=0、C=0），把 Worker 变成默认即可收口第 1/2/3/5 条；
   **阶段二才是硬骨头** —— 338 行 DOM 全在 widget 图，缺的是渲染指令词汇表与一条反向事件通道（`el-on` 17 行在 23 表里没有对应物）。
 - L1/L2 都不改能力名单与授权模型（K3/K4 交付的那套），改的只是「谁在替插件说话」。
+
+## 增项记录（2026-10-17，B3 常驻状态行）
+
+- **方法表从 22 加到 23**：新增 `pet.setStatus`（命名空间 `pet`）。宿主侧实现落在
+  `src/runtime/bridge.ts` 的 `pet` 段（**能力仍是 `pet:say`，不新增能力**），派发表加在
+  `src/runtime/worker-plugin-host.ts`，Worker 侧代理加在 `src/runtime/plugin-worker.ts`，
+  表本体在 `src/runtime/plugin-worker-protocol.ts`。
+- **为什么**：B3（气泡常驻状态行）要让插件把一行状态长期挂在宠物旁。插件**入口默认就在 Worker 里跑**，
+  名字不进表等于 Worker 里的入口一个都调不到这个方法（A9b 的 agent 桥正是这么用）。
+- **这是明确的边界扩张，不是放宽校验**：表的闭集口径不变（「表即插件能说的全部话」），
+  `tests/unit/unit-worker-host.mjs` 照旧**逐字钉死「恰好等于这 23 个名字」**（不改成「包含」「至少」），
+  计数与文件头文案同步改成 23。
+- **本文两处旧数字**：第 5 行「面向插件的 22 个方法」与第 43 行「接口面 = 22 个方法」按本条读作
+  **23** —— 本次按派单只改表与 pin，这两处文字未同步（已报给 PM 清点）。
+- 其余口径不变：`pet.setStatus` 仍只能由**插件入口**调用（`WIDGET_CALL_METHODS` 不加名字，
+  widget 的渲染契约不动，见 ADR-0008）。
