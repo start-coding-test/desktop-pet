@@ -29,9 +29,19 @@ pub fn run() {
     // Agent hook 的接收分支必须排在一切之前：它只把 stdin 落到一个文件就退出。
     // 走完整启动流程不仅慢，还会被下面的单实例插件把参数转发给已运行的实例，
     // 于是 stdin 与这次事件一起丢掉。
-    if let Some(phase) = services::agent::hook_phase_from_args(&mut std::env::args()) {
-        services::agent::hook_ingest(phase);
-        return;
+    //
+    // Rejected 分支单独存在是因为它绝不能掉到下面的启动流程里：一次写坏的 hook 条目
+    // （未知 phase 或未知 --agent）要是继续往下走，就会在用户的桌面上把 GUI 拉起来。
+    match services::agent::hook_phase_from_args(&mut std::env::args()) {
+        services::agent::phases::HookArgs::NotForUs => {}
+        services::agent::phases::HookArgs::Rejected(why) => {
+            eprintln!("desktop-pet: 忽略一次 --pet-hook 调用（{why}），不采集也不启动应用");
+            return;
+        }
+        services::agent::phases::HookArgs::Event(cmd) => {
+            services::agent::hook_ingest(cmd.phase, cmd.agent);
+            return;
+        }
     }
 
     // 插件与形象的文件协议必须在窗口创建前注册
