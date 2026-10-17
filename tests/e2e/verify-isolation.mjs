@@ -1652,6 +1652,7 @@ export function unmount() {}
       const n = document.querySelector('#hook-probe-slot-2 div[data-plugin-id="zz.legacyprobe"]');
       const realm = n ? n.dataset.widgetRealm : null;
       await widgetHost.unmount('zz.legacyprobe');
+      document.getElementById('hook-probe-slot-2')?.remove();
       return realm;
     })()`);
     r.check("旧接口 widget 在 settings 区被拦下（blocked，点名也不放行）", "blocked", legacyRealm);

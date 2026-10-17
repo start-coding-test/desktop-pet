@@ -216,7 +216,10 @@ class WidgetHost {
     startedAt: number,
   ): void {
     if (this.epochOf(pluginId) !== startedAt) return;
-    console.warn(`[widget] ${reason}`);
+    // 走 console.info 而不是 warn：被拦下是**设计好的结果**（照 ADR-0008 迁移就没了），
+    // 与 widget-renderer 拒收 op 走 debug 是同一条理由 —— 正常路径不该把宿主页的
+    // 「自身无报错」门变成红的。全文在 note.title 与这条日志里。
+    console.info(`[widget] ${reason}`);
     const { host, shadow } = this.createSlot(pluginId, region, root, "blocked");
     const note = document.createElement("div");
     note.setAttribute("role", "note");
