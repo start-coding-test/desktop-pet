@@ -619,12 +619,15 @@ mod tests {
     /// 看起来是显然的，但它是 NSIS 钩子与 stdin 采集共用同一个 exe 的唯一分流点。
     #[test]
     fn the_cleanup_flag_is_not_a_hook_phase() {
+        use crate::services::agent::phases::{HookArgs, HookCommand};
         let mut cleanup = ["desktop-pet.exe", "--pet-hook-cleanup"]
             .iter()
             .map(|s| (*s).to_string());
+        // 判定不变（「它不是一条 hook 事件」），期望值比原来更具体：
+        // 旧写法只说「拿不到 phase」（None 把「不是给我们的」和「被拒」混成一个值）
         assert_eq!(
             crate::services::agent::hook_phase_from_args(&mut cleanup),
-            None
+            HookArgs::NotForUs
         );
         // 对照：真的 hook 分支照旧解析得到，别把这条测试写成两边都不认
         let mut real = ["desktop-pet.exe", "--pet-hook", "pre"]
@@ -632,7 +635,10 @@ mod tests {
             .map(|s| (*s).to_string());
         assert_eq!(
             crate::services::agent::hook_phase_from_args(&mut real),
-            Some("pre")
+            HookArgs::Event(HookCommand {
+                phase: "pre",
+                agent: "qoder"
+            })
         );
     }
 
