@@ -6,6 +6,7 @@
 // 与浏览器里那批 verify 断言的分工：这里只测**纯逻辑**（不需要窗口、不需要真协议），
 // 好处是零 GUI、秒级、能在 CI 的门禁里跑；像素、CSP、真实 IPC 仍归 verify:*。
 // 求值时机与迁移前的常驻单测一致：交互在本文件顶层按源码顺序跑完，eq 只在事后比快照。
+import { readFileSync } from "node:fs";
 import { check, deep, eq, group, throws } from "./harness.mjs";
 import { calls as tauriCalls, resetStub, setReply } from "./tauri-stub.mjs";
 
@@ -246,7 +247,11 @@ resetStub();
   setReply("bus_peek", { mode: "badge" });
   const replayed = [];
   const off = bus.subscribe("zz.probe:widget", (p) => replayed.push(p));
-  check("订阅 widget topic 会问宿主取回灌", true, tauriCalls.some((c) => c.cmd === "bus_peek"));
+  check(
+    "订阅 widget topic 会问宿主取回灌",
+    tauriCalls.some((c) => c.cmd === "bus_peek"),
+    "stub 没记录到 bus_peek 调用",
+  );
   off();
   // S4：回灌要报**订阅方自己**的身份（宿主侧不代表任何插件时是 null），宿主按它校验 topic 归属
   deep(
@@ -268,6 +273,22 @@ resetStub();
     { topic: "com.pet.astock:widget", pluginId: "com.pet.todo" },
   );
   off();
+}
+
+{
+  // S4：悬浮窗那一支的归属只认宿主注册表（label 是宿主开窗时定的，页面伪造不了）。
+  // 这条**只能钉源码形状**：注册表本体是 overlay.rs 里的私有 static，离线造不出它的状态；
+  // 而「命令体把注册表值交给归属解析」正是漏了就让自报值生效的那一步（变异 M2 实测如此）。
+  const busSrc = readFileSync(new URL("../../src-tauri/src/commands/bus.rs", import.meta.url), "utf8");
+  const busCode = busSrc.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  // 只看 bus_peek 这一段：bus_publish 里有一模一样的一行，扫全文会让这条钉空转
+  const peekAt = busCode.indexOf("pub fn bus_peek");
+  const peekBody = busCode.slice(peekAt, busCode.indexOf("fn peek_allowed", peekAt));
+  check(
+    "bus_peek 的归属解析带上了宿主注册表（悬浮窗自报值作废的那一支）",
+    peekAt > 0 && peekBody.includes("crate::window::overlay::owner_of_label(&label)"),
+    `在 bus.rs 里没找到这一行（peekAt=${peekAt}）`,
+  );
 }
 
 {
