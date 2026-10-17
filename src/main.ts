@@ -112,8 +112,10 @@ function sayRandom(text: string): void {
 function setStatus(pluginId: string, text: string | null): string | null {
   if (text === null) {
     statusLines.delete(pluginId);
-  } else {
-    // delete + set：重设要把这条挪到队尾，「最近设置的那条」才认得出来
+  } else if (statusLines.get(pluginId) !== text) {
+    // delete + set：重设要把这条挪到队尾，「最近设置的那条」才认得出来。
+    // **内容没变就不动顺序**（幂等）—— 否则插件高频重设同一个值就能一直占着队首，
+    // 把别的插件的行永久压在下面，那是刷而不是状态更新。
     statusLines.delete(pluginId);
     statusLines.set(pluginId, text);
   }

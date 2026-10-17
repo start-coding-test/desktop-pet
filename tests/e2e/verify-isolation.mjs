@@ -1870,6 +1870,189 @@ export function unmount() {}
     sc.close();
   }
 
+  // ---------- B3：气泡常驻状态行（宿主侧） ----------
+  // 两个 fixture（id 不同）验「每个插件各占一条 + 回落」；同一份入口脚本靠 ctx.pluginId 区分 topic。
+  r.group("B3 常驻状态行：显示 / 单行几何 / 仲裁回落 / 台词优先 / 回收");
+  const STATUS_A = "zz.status";
+  const STATUS_B = "zz.status2";
+  const STATUS_ON_ACTIVATE = "启动行";
+  const STATUS_INDEX = `export function activate(ctx) {
+  const pid = ctx.pluginId;
+  const reply = (id, body) => ctx.bus.publish(pid + ":res", Object.assign({ id: id }, body));
+  ctx.bus.subscribe(pid + ":cmd", async (msg) => {
+    try {
+      if (msg.action === "set") reply(msg.id, { ok: true, v: await ctx.pet.setStatus(msg.text) });
+      else if (msg.action === "clear") reply(msg.id, { ok: true, v: await ctx.pet.setStatus(null) });
+      else if (msg.action === "say") { await ctx.pet.say(String(msg.text)); reply(msg.id, { ok: true }); }
+      else reply(msg.id, { ok: false, e: "未知 action" });
+    } catch (e) {
+      reply(msg.id, { ok: false, e: String(e && e.message ? e.message : e) });
+    }
+  });
+  // 激活即挂一行：用来验「宿主随机台词让路」。激活与宠物窗那句 700ms 启动台词的先后不确定，
+  // 所以让路按「整段观察期内气泡从未显示过台词」判（见下），不赌时序。
+  await ctx.pet.setStatus(${JSON.stringify(STATUS_ON_ACTIVATE)});
+}
+export function deactivate() {}
+`;
+  const statusManifest = (id) =>
+    JSON.stringify({
+      id,
+      name: `常驻行探针 ${id}`,
+      version: "0.0.0",
+      entry: "index.js",
+      permissions: ["pet:say", "bus:publish", "bus:subscribe"],
+      description: "验证气泡常驻行的显示、仲裁与回收（B3）。",
+    });
+  for (const id of [STATUS_A, STATUS_B]) {
+    const dir = join(PLUGINS_DIR, id);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "index.js"), STATUS_INDEX);
+    writeFileSync(join(dir, "manifest.json"), statusManifest(id));
+  }
+  // 随机台词让路 / 迎回位都靠「气泡文本随时间怎么变」判，先把采样器装上（挂在宠物窗）
+  await c.ev(`(async () => {
+    const { bus } = await import('/src/runtime/event-bus.ts');
+    window.__statusRes = [];
+    window.__bubbleSeen = [];
+    for (const pid of ['${STATUS_A}', '${STATUS_B}']) bus.subscribe(pid + ':res', (p) => window.__statusRes.push(p));
+    window.__bubbleTimer = setInterval(() => {
+      const b = document.getElementById('pet-bubble');
+      window.__bubbleSeen.push(b.classList.contains('show') ? b.textContent : '');
+    }, 120);
+    return true;
+  })()`);
+  let statusSeq = 0;
+  /** 指令经总线投给插件入口，结果同样经总线回来（回不传就返回可读失败，而不是 TypeError） */
+  const statusCall = async (pid, action, text) => {
+    const id = ++statusSeq;
+    await c.ev(`(async () => {
+      const { bus } = await import('/src/runtime/event-bus.ts');
+      bus.inject(${JSON.stringify(pid)} + ':cmd', { id: ${id}, action: ${JSON.stringify(action)}, text: ${JSON.stringify(text ?? null)} });
+      return true;
+    })()`);
+    const hit = `((window.__statusRes || []).find((r) => r.id === ${id})) ?? null`;
+    const got = await waitUntil(c, `!!(${hit})`, 15_000).catch(() => false);
+    if (!got) return { ok: false, e: `插件没回传 ${pid} ${action} 的结果（15s）` };
+    return c.ev(hit);
+  };
+  const bubbleNow = () =>
+    c.ev(`(() => { const b = document.getElementById('pet-bubble'); return { show: b.classList.contains('show'), status: b.classList.contains('status'), text: b.textContent }; })()`);
+  /** 单行行盒 = 行高 + 上下内边距（由渲染态算出来，不写死数字） */
+  const bubbleBox = () =>
+    c.ev(`(() => {
+      const b = document.getElementById('pet-bubble');
+      const cs = getComputedStyle(b);
+      const rect = b.getBoundingClientRect();
+      return {
+        top: rect.top,
+        height: rect.height,
+        width: rect.width,
+        oneLine: parseFloat(cs.fontSize) * parseFloat(cs.lineHeight) + parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom),
+        maxWidth: parseFloat(cs.maxWidth),
+      };
+    })()`);
+
+  const enabledBeforeB3 = await readEnabledIds(invoke(c));
+  r.check("基线：没挂常驻行时气泡是收起的", false, (await bubbleNow()).show);
+  // 上面那一段结尾把设置窗关了，句柄也随窗作废：本组要写启停清单与撤授权，重开一扇
+  settings = await openSettingsInvoker(PORT, c);
+  await setEnabled([...new Set([...enabledBeforeB3, STATUS_A, STATUS_B])]);
+  await reloadAndWait(c);
+  // 激活会为两个 fixture 各弹一次同意框（声明的三项能力）
+  for (const id of [STATUS_A, STATUS_B]) {
+    const consent = await driveConsent("allow", id).catch(() => null);
+    r.check(`同意框列出了 ${id} 声明的能力（含 pet:say）`, true, !!consent && consent.caps.some((x) => x.includes("pet:say")));
+  }
+  // 观察期：既不赌激活时序（状态行可能晚于启动台词），也不赌随机时机 ——
+  // 只要「启动那句随机台词」出现过，它会在槽里亮 3.6s，120ms 的采样必然抓到
+  const b3Seen = await waitUntil(c, `window.__bubbleSeen.length >= 50`, 8_000).catch(() => false);
+  const b3Texts = b3Seen ? await c.ev(`[...new Set(window.__bubbleSeen)]`) : [];
+  const b3NonStatus = b3Texts.filter((t) => t !== "" && t !== STATUS_ON_ACTIVATE);
+  r.check(
+    "有常驻行时宿主启动那句随机台词没出现（整个观察期气泡里只有常驻行）",
+    "[]",
+    JSON.stringify(b3NonStatus),
+  );
+  r.check("fixture 激活时挂的那行确实显示出来了（观察期见过它）", true, b3Texts.includes(STATUS_ON_ACTIVATE));
+  await c.ev(`clearInterval(window.__bubbleTimer); true`);
+
+  const b3Geo = await bubbleBox();
+  r.check("常驻行有 .status 类（CSS 单行化生效）", true, (await bubbleNow()).status);
+  r.check(
+    "渲染态几何：气泡顶边不越出窗口上沿，且高度就是单行行盒",
+    true,
+    b3Geo.top >= 0 && Math.abs(b3Geo.height - b3Geo.oneLine) <= 1,
+  );
+  r.check("宽度没超出立绘宽（既有断言不破）", true, b3Geo.width <= b3Geo.maxWidth + 1);
+
+  const b3Long = await statusCall(STATUS_A, "set", "超长".repeat(40));
+  r.check("远超 20 字照样只占一行", true, Math.abs((await bubbleBox()).height - b3Geo.oneLine) <= 1);
+  r.check("输入侧按码点截到 20（返回值自证）", 20, [...String(b3Long.v ?? "")].length);
+  r.check("界面上的文本就是那 20 个字", String(b3Long.v ?? ""), (await bubbleNow()).text);
+
+  const b3Escaped = await statusCall(STATUS_A, "set", "<b>x</b>");
+  const b3Html = await c.ev(`document.getElementById('pet-bubble').innerHTML`);
+  const b3AsText = await bubbleNow();
+  r.check("尖括号走 textContent（界面显示字面文本）", "<b>x</b>", b3AsText.text);
+  r.check("设置返回的就是这串字面文本（没被当成标记处理）", "<b>x</b>", b3Escaped.v);
+  r.check("没有真的建出 <b> 元素（标签被转义）", true, /&lt;b&gt;/.test(b3Html) && (await c.ev(`document.getElementById('pet-bubble').querySelector('b') === null`)));
+
+  const b3Bad = await statusCall(STATUS_A, "set", 123);
+  r.check("非字符串/非 null 直接拒", true, b3Bad.ok === false && /只接受字符串或 null/.test(String(b3Bad.e)));
+  const b3Empty = await statusCall(STATUS_A, "set", "  \n\t ");
+  r.check("清洗后为空 → 拒（不悄悄清掉）", true, b3Empty.ok === false && /非空文本内容/.test(String(b3Empty.e)));
+  const b3Folded = await statusCall(STATUS_A, "set", "a\u0007b\u0000c\td");
+  r.check("控制字符（含 BEL/NUL/制表）一律折叠成空格", "a b c d", b3Folded.v);
+
+  const b3A1 = await statusCall(STATUS_A, "set", "A行");
+  const b3B1 = await statusCall(STATUS_B, "set", "B行");
+  r.check("A 设了显示 A、B 设了显示 B（最近设置的生效）", "B行", (await bubbleNow()).text);
+  r.check("两次设置都拿到了生效值", "A行|B行", [b3A1.v, b3B1.v].join("|"));
+  const b3AgainA = await statusCall(STATUS_A, "set", "A行");
+  r.check("重复设置相同文本不改回落顺序（B 仍在上，防刷）", "B行", (await bubbleNow()).text);
+  r.check("重复设置照样返回生效值（幂等只作用在顺序上）", "A行", b3AgainA.v);
+  const b3BClear = await statusCall(STATUS_B, "clear");
+  r.check("B 清除后回落到 A 那条", "A行", (await bubbleNow()).text);
+  r.check("清除的返回值是 null（只关于自己那条）", null, b3BClear.v);
+  const b3AClear = await statusCall(STATUS_A, "clear");
+  r.check("A 清除的返回值也是 null", null, b3AClear.v);
+  r.check("A 也清掉后气泡收起", false, (await bubbleNow()).show);
+
+  // 台词优先：say 占槽 → 3.6s 后回位到常驻行；台词期间 setStatus 不打断正在显示的台词
+  await statusCall(STATUS_A, "set", "常驻1");
+  await statusCall(STATUS_A, "say", "一句台词");
+  r.check("台词插进来就占用槽（常驻行被临时替换）", "一句台词", (await bubbleNow()).text);
+  await statusCall(STATUS_A, "set", "常驻2");
+  r.check("台词显示期间状态行只是被替换，不打断这句台词", "一句台词", (await bubbleNow()).text);
+  await sleep(3_700);
+  r.check("3.6s 后台词收起、常驻行回位（回到最新那条内容）", "常驻2", (await bubbleNow()).text);
+
+  // 隐藏后恢复：状态行按当前状态回来
+  const b3Hidden = await call("set_pet_hidden", { hidden: true });
+  r.check("宠物窗能隐身（既有命令）", true, b3Hidden.ok === true);
+  await sleep(400);
+  const b3Shown = await call("set_pet_hidden", { hidden: false });
+  r.check("宠物窗能回来", true, b3Shown.ok === true);
+  await sleep(600);
+  r.check("隐藏再显示之后常驻行仍在（按当前状态回来）", "常驻2", (await bubbleNow()).text);
+
+  // 回收：A 停用只摘 A 那条；B 的还在
+  await statusCall(STATUS_B, "set", "B行");
+  await setEnabled([...new Set([...enabledBeforeB3, STATUS_B])]);
+  await sleep(1_200);
+  r.check("停用 A 后 A 那条没了、B 的行不受影响", "B行", (await bubbleNow()).text);
+  await setEnabled(enabledBeforeB3);
+  await sleep(1_200);
+  r.check("B 也停用 → 完全收起（没有残留条目）", false, (await bubbleNow()).show);
+
+  // 收尾：改回原清单、撤销授权；fixture 目录与授权都不留给下一轮
+  await setEnabled(enabledBeforeB3);
+  for (const id of [STATUS_A, STATUS_B]) {
+    await revoke(id);
+  }
+  for (const id of [STATUS_A, STATUS_B]) rmSync(join(PLUGINS_DIR, id), { recursive: true, force: true });
+
   r.group("宿主页面自身未产生 CSP 违规或未捕获异常");
   // 上面的递归测试会刻意打一条 console.error，它是被测行为的证据，不该混进这里的零容忍
   r.info("导航过渡期告警（reload 切断在飞 IPC 的产物，单独归类）", String(c.transitionNoise.length));
@@ -1882,6 +2065,9 @@ export function unmount() {}
   console.error("\n验证中断: " + String(err?.message ?? err).split("\n").slice(0, 3).join(" | "));
 } finally {
   removeFixtures(PLUGINS_DIR);
+  // B3 那两个探针目录不在 removeFixtures 的名单里，.gitignore 也没覆盖 zz.status* ——
+  // 中途崩了也得清掉，别把临时插件留成待提交文件
+  for (const id of ["zz.status", "zz.status2"]) rmSync(join(PLUGINS_DIR, id), { recursive: true, force: true });
   // 探针留在宿主 realm 那条例外只服务于本套件的页面全局断言，不该活到下一轮真实使用里
   await c?.ev(`localStorage.removeItem('host:realm-plugin-host')`).catch(() => undefined);
   await c?.ev(`localStorage.removeItem('host:widget-realm-plugin-host')`).catch(() => undefined);
