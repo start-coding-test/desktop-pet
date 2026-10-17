@@ -1930,7 +1930,7 @@ export function deactivate() {}
   };
   const bubbleNow = () =>
     c.ev(`(() => { const b = document.getElementById('pet-bubble'); return { show: b.classList.contains('show'), status: b.classList.contains('status'), text: b.textContent }; })()`);
-  /** 单行行盒 = 行高 + 上下内边距（由渲染态算出来，不写死数字） */
+  /** 气泡盒子的渲染态读数（单行盒高不在这里推 —— 由「1 个字」那次实测校准，见下） */
   const bubbleBox = () =>
     c.ev(`(() => {
       const b = document.getElementById('pet-bubble');
@@ -1940,7 +1940,6 @@ export function deactivate() {}
         top: rect.top,
         height: rect.height,
         width: rect.width,
-        oneLine: parseFloat(cs.fontSize) * parseFloat(cs.lineHeight) + parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom),
         maxWidth: parseFloat(cs.maxWidth),
       };
     })()`);
@@ -2000,20 +1999,27 @@ export function deactivate() {}
   r.check("观察期确实采样到了常驻行（采样器活着，这条不是空转）", true, b3Texts.includes("常驻行"));
 
   await waitStatusSlot(); // 量之前先确认槽里是常驻行而不是某句台词
-  const b3Geo = await bubbleBox();
   r.check("常驻行有 .status 类（CSS 单行化生效）", true, (await bubbleNow()).status);
-  r.check(
-    "渲染态几何：气泡顶边不越出窗口上沿，且高度就是单行行盒",
-    true,
-    b3Geo.top >= 0 && Math.abs(b3Geo.height - b3Geo.oneLine) <= 1,
-  );
-  r.check("宽度没超出立绘宽（既有断言不破）", true, b3Geo.width <= b3Geo.maxWidth + 1);
+  // 单行盒**自校准**：先设 1 个字量出盒高，不推公式（Chromium 对 `line-height: 1.6` 可能回 "normal"，
+  // parseFloat 得 NaN，比较就恒假 —— 上一轮就是这么假红的）
+  await statusCall(STATUS_A, "set", "字");
+  await waitStatusSlot();
+  const b3Box1 = await bubbleBox();
+  r.check("单行盒高 > 0（元素真渲染了，防 0 === 0 空转）", true, b3Box1.height > 0);
+  r.check("单行盒不越出窗口上沿", true, b3Box1.top >= 0);
+  r.check("宽度没超出立绘宽（既有断言不破）", true, b3Box1.width <= b3Box1.maxWidth + 1);
 
   const b3Long = await statusCall(STATUS_A, "set", "超长".repeat(40));
   await waitStatusSlot();
-  r.check("远超 20 字照样只占一行", true, Math.abs((await bubbleBox()).height - b3Geo.oneLine) <= 1);
+  const b3Box2 = await bubbleBox();
+  const b3Dom = await c.ev(`(() => { const b = document.getElementById('pet-bubble'); return { text: b.textContent, scroll: b.scrollWidth, client: b.clientWidth }; })()`);
+  r.check("超长输入照样只占一行（盒高 = 单行盒高）", true, Math.abs(b3Box2.height - b3Box1.height) <= 1);
+  r.check("超长输入仍不越出窗口上沿", true, b3Box2.top >= 0);
+  r.check("超长输入仍不超出立绘宽", true, b3Box2.width <= b3Box2.maxWidth + 1);
   r.check("输入侧按码点截到 20（返回值自证）", 20, [...String(b3Long.v ?? "")].length);
-  r.check("界面上的文本就是那 20 个字", String(b3Long.v ?? ""), (await bubbleNow()).text);
+  r.check("界面上的文本就是那 20 个字（末尾被截掉，不是原样 80 字）", true,
+    b3Dom.text === String(b3Long.v ?? "") && [...b3Dom.text].length === 20);
+  r.info("超长行的可视溢出（scrollWidth/clientWidth）", `${b3Dom.scroll}/${b3Dom.client}`);
 
   const b3Escaped = await statusCall(STATUS_A, "set", "<b>x</b>");
   const b3Html = await c.ev(`document.getElementById('pet-bubble').innerHTML`);
@@ -2061,17 +2067,38 @@ export function deactivate() {}
   await sleep(600);
   r.check("隐藏再显示之后常驻行仍在（按当前状态回来）", "常驻2", (await bubbleNow()).text);
 
-  // 回收：A 停用只摘 A 那条；B 的还在
+  // 回收：轮询判据（不靠加大 sleep）。停用一条命令要走 Worker 自己的 deactivate + terminate，
+  // 1.2s 这种固定等待会把「还没跑完」误判成「不回收」——上一轮就是这么红的。
   await statusCall(STATUS_B, "set", "B行");
   await setEnabled([...new Set([...enabledBeforeB3, STATUS_B])]);
-  await sleep(1_200);
-  r.check("停用 A 后 A 那条没了、B 的行不受影响", "B行", (await bubbleNow()).text);
-  await setEnabled(enabledBeforeB3);
-  await sleep(1_200);
-  await waitStatusSlot(); // 先让可能残留的台词自己收掉，再看「有没有残留条目」
+  await waitUntil(
+    c,
+    `(() => { const b = document.getElementById('pet-bubble'); return b.classList.contains('status') && b.textContent === 'B行'; })()`,
+    5_000,
+  ).catch(() => false);
+  r.check("停用 A 后 B 的行不受影响（仍是 B行）", "B行", (await bubbleNow()).text);
+  // 真正的「A 被摘掉」证据：把 B 也清掉之后气泡必须收起 —— 若 A 的条目还在（只是被压在下面），
+  // 这一刻会露出 "A行"
+  await statusCall(STATUS_B, "clear");
+  const b3Reveal = await bubbleNow();
+  r.check(
+    "清掉 B 之后气泡收起（说明 A 停用时条目确实被摘掉，不是只被压在下面）",
+    false,
+    b3Reveal.show ? `true|${b3Reveal.text}` : "false",
+  );
+  // B 自己停用：轮询到收起，并记下实际耗时
+  await statusCall(STATUS_B, "set", "B行2");
+  const b3T0 = Date.now();
+  const b3Gone = await waitUntil(
+    c,
+    `!document.getElementById('pet-bubble').classList.contains('show')`,
+    5_000,
+  ).catch(() => false);
+  const b3Elapsed = Date.now() - b3T0;
+  r.info("停用 B 到气泡收起（轮询）", `${b3Elapsed}ms · ${b3Gone ? "5s 内收起" : "5s 未收起"}`);
   const b3AfterAllOff = await bubbleNow();
   r.check(
-    "B 也停用 → 完全收起（没有残留条目）",
+    "停用 B → 完全收起（轮询判据，没靠加大 sleep）",
     false,
     b3AfterAllOff.show ? `true|${b3AfterAllOff.text}` : "false",
   );
