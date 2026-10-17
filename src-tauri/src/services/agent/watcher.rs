@@ -31,6 +31,22 @@ pub(super) fn resume_offset(stored: Option<u64>, size: u64) -> u64 {
     }
 }
 
+/// 一行事件里的来源 Agent。缺 `agent` 字段的行按 `qoder` 处理：A01 及更早写的收件文件
+/// 就是这个形状，不能因为没带来源就把用户已经在跑的事件丢掉。
+/// 这一行该不该进状态机与广播：只有来源与当前联动的 Agent 一致才进。
+/// 单独成函数是为了让「一致/不一致」两种情况都能离线断言 —— 过滤反了是最致命的写法，
+/// 只靠 runner 抓等于把它留到运行时才发现。
+fn source_matches(value: &Value, current: &str) -> bool {
+    line_agent(value) == current
+}
+
+fn line_agent(value: &Value) -> &str {
+    value
+        .get("agent")
+        .and_then(Value::as_str)
+        .unwrap_or(super::phases::DEFAULT_AGENT)
+}
+
 /// 读一个 phase 文件的增量。只消费到最后一个换行，半行留给下一次。
 ///
 /// 偏移量只在真正消费掉若干整行之后才前进：原先是先写成 `size` 再读，
@@ -93,6 +109,14 @@ fn drain_file(state: &Arc<AgentState>, app: &AppHandle, path: &Path) {
         let Ok(value) = serde_json::from_slice::<Value>(line) else {
             continue;
         };
+        // 来源过滤：与当前 Agent 不一致的行不进状态机、不广播。偏移量在本函数开头
+        // 已经推进过了，所以「只推进偏移量」在这里天然成立 —— 切换那一两秒里旧 Agent
+        // 还在路上的事件、卸旧失败的残余条目、用户手拷过去的旧配置，都走这一条。
+        let source = line_agent(&value);
+        if !source_matches(&value, &super::linkage::current_agent()) {
+            log::debug!("忽略来源为 {source} 的 Agent 事件：与当前联动的 Agent 不一致");
+            continue;
+        }
         let phase = value
             .get("phase")
             .and_then(Value::as_str)
@@ -116,6 +140,8 @@ fn drain_file(state: &Arc<AgentState>, app: &AppHandle, path: &Path) {
             json!({
                 "phase": phase,
                 "sessionId": session,
+                // 来源标识：payload 只增字段，既有字段一名不改
+                "agent": source,
                 "toolName": bounded_str(&payload, "tool_name", 64),
                 // 命令/路径摘要：是否显示交给插件侧的开关
                 "detail": detail,
@@ -218,4 +244,34 @@ pub fn start_agent_ticker(app: &AppHandle) {
             state.publish(&sink, None);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{line_agent, source_matches};
+    use serde_json::json;
+
+    /// 缺字段 = qoder（旧行必须继续可用）；非字符串的 agent 值退回缺省，
+    /// 不能拿脏值当来源标识参与过滤
+    #[test]
+    fn the_source_of_a_line_falls_back_to_qoder() {
+        assert_eq!(line_agent(&json!({ "phase": "pre" })), "qoder");
+        assert_eq!(line_agent(&json!({})), "qoder");
+        assert_eq!(line_agent(&json!({ "agent": "zcode" })), "zcode");
+        assert_eq!(line_agent(&json!({ "agent": 7 })), "qoder");
+        assert_eq!(line_agent(&json!({ "agent": null })), "qoder");
+    }
+
+    /// 过滤的方向必须钉死：一致才放行。反过来的后果是把当前 Agent 的事件全丢了、
+    /// 别人的反而照单全收 —— 桌宠会「对着不存在的会话动」，而且看起来一切正常。
+    #[test]
+    fn only_the_current_source_is_accepted() {
+        assert!(source_matches(&json!({ "agent": "qoder" }), "qoder"));
+        assert!(!source_matches(&json!({ "agent": "zcode" }), "qoder"));
+        assert!(
+            source_matches(&json!({ "phase": "pre" }), "qoder"),
+            "缺 agent 的旧行按 qoder，必须仍然放行"
+        );
+        assert!(!source_matches(&json!({ "agent": "qoder" }), "zcode"));
+    }
 }

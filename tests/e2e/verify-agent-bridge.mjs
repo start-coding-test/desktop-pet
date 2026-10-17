@@ -842,7 +842,58 @@ try {
       await eventCount(),
     );
 
-    // ⑦ --pet-hook-cleanup：NSIS 卸载前那条清理分支。跑在真的 dev 实例旁边，
+    // ⑦ 来源过滤（A02）：与当前 Agent 不一致的事件只推进偏移量，不进状态机也不广播。
+    // 用真 exe 注入而不是直接写收件文件：一次跑完「--agent 参数 → JSONL → watcher」整条链。
+    r.group("来源过滤：别的 Agent 的事件不驱动桌宠");
+    const foreignSess = `verify-foreign-${Date.now()}`;
+    const eventsBeforeFilter = await eventCount();
+    const foreign = spawnSync(EXE, ["--pet-hook", "pre", "--agent", "zcode"], {
+      input: JSON.stringify({ session_id: foreignSess, tool_name: "Bash" }),
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    r.check("带 --agent zcode 的 hook 分支退出码为 0", 0, foreign.status);
+    await sleep(1_500);
+    r.check("外来来源不产生 agent:event", eventsBeforeFilter, await eventCount());
+    r.check(
+      "外来事件确实落了盘（红在这条说明是采集坏了，而不是过滤生效）",
+      true,
+      readFileSync(join(INBOX, "pre.jsonl"), "utf8").includes(foreignSess),
+    );
+    // 对照：同一 phase 换成当前来源必须照常广播 —— 没有这条，上面的绿可能只是整条链断了
+    const mine = spawnSync(EXE, ["--pet-hook", "pre", "--agent", "qoder"], {
+      input: JSON.stringify({ session_id: `verify-mine-${Date.now()}`, tool_name: "Bash" }),
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    r.check("带 --agent qoder 的 hook 分支退出码为 0", 0, mine.status);
+    r.check(
+      "当前来源照常广播，且 payload 带上 agent 字段",
+      true,
+      await waitUntil(
+        c,
+        `(window.__topics.slice().reverse().find(([k]) => k === 'host-event')?.[1]?.agent === 'qoder')`,
+        8_000,
+      ),
+    );
+    // 缺省（不带 --agent）的旧形状必须仍然可用：A01 装好的条目就是这个形状
+    const legacy = spawnSync(EXE, ["--pet-hook", "post"], {
+      input: JSON.stringify({ session_id: `verify-legacy-${Date.now()}`, tool_name: "Bash" }),
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    r.check("不带 --agent 的旧 hook 条目退出码为 0", 0, legacy.status);
+    r.check(
+      "不带 --agent 时按 qoder 处理，事件照常被采集",
+      true,
+      await waitUntil(
+        c,
+        `(window.__topics.slice().reverse().find(([k]) => k === 'host-event')?.[1]?.phase === 'post')`,
+        8_000,
+      ),
+    );
+
+    // ⑧ --pet-hook-cleanup：NSIS 卸载前那条清理分支。跑在真的 dev 实例旁边，
     // 顺带证明分流发生在单实例锁与建窗之前 —— 排错了要么条目不被清，要么现成实例被干扰。
     r.group("卸载前清理分支（起一个 exe --pet-hook-cleanup）");
     const readInboxLen = () => {
