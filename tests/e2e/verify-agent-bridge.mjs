@@ -876,6 +876,16 @@ try {
         8_000,
       ),
     );
+    r.check(
+      "agent:state 也带上 agent 字段",
+      true,
+      await waitUntil(
+        c,
+        `(window.__topics.slice().reverse().find(([k]) => k === 'host-state')?.[1]?.agent === 'qoder')`,
+        8_000,
+      ),
+    );
+
     // 缺省（不带 --agent）的旧形状必须仍然可用：A01 装好的条目就是这个形状
     const legacy = spawnSync(EXE, ["--pet-hook", "post"], {
       input: JSON.stringify({ session_id: `verify-legacy-${Date.now()}`, tool_name: "Bash" }),

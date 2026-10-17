@@ -264,7 +264,7 @@ impl AgentState {
 
 #[cfg(test)]
 mod tests {
-    use super::state_for_event;
+    use super::{state_for_event, AgentState};
 
     /// interrupt 是 A02 新增的 phase（Codex 的 Interrupt 事件），语义就是「这轮被打断、回到空闲」。
     #[test]
@@ -278,5 +278,17 @@ mod tests {
         assert_eq!(state_for_event("tool-failure", ""), Some("failed"));
         assert_eq!(state_for_event("approval-request", ""), Some("needs_input"));
         assert_eq!(state_for_event("no-such-phase", ""), None);
+    }
+    /// 切换 Agent 靠这个函数丢掉旧会话：它必须真的清空（不是只数一遍），
+    /// 并且如实回报清掉了几条 —— 「清掉了 0 条」在切换时就是要能看见的事实。
+    #[test]
+    fn clear_sessions_drops_every_session_and_reports_how_many() {
+        let state = AgentState::default();
+        assert_eq!(state.apply("pre", "s1", "", None), Some("running"));
+        assert_eq!(state.apply("pre", "s2", "", None), Some("running"));
+        assert_eq!(state.aggregate(), "running", "两条会话都在跑");
+        assert_eq!(state.clear_sessions(), 2, "两条都要清掉");
+        assert_eq!(state.aggregate(), "idle", "清空之后不该还有会话挂着");
+        assert_eq!(state.clear_sessions(), 0, "再清一次是 no-op，如实回 0");
     }
 }
