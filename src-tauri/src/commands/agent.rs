@@ -185,10 +185,16 @@ mod tests {
             ]
         };
         assert_eq!(foreign(&installed), foreign(&after));
-        assert_eq!(
-            foreign(&installed)[0],
-            "{\"command\":\"other-tool --notify\",\"timeout\":5,\"type\":\"command\"}"
-        );
+        // 键序也是「未变」的一部分，而且这条要的就是键序：样例里三个键是**故意**不按字母序
+        // 写的（type → command → timeout）。serde_json 没开 preserve_order 时这里会得到
+        // {"command":…,"timeout":…,"type":…}，等于我们替用户把他的配置重排了一遍。
+        // 装卸两个端点都钉：只钉 install 那端，「卸载时又排一次序」就看不见。
+        let untouched = vec![
+            "{\"type\":\"command\",\"command\":\"other-tool --notify\",\"timeout\":5}".to_string(),
+            "{\"type\":\"command\",\"command\":\"keep.sh\",\"timeout\":3}".to_string(),
+        ];
+        assert_eq!(foreign(&installed), untouched, "装完不能重排别人条目的键序");
+        assert_eq!(foreign(&after), untouched, "卸载往返后仍然是原键序");
 
         // 其余内容也原样：theme 还在，顶层 hooks 只少了自家条目所在的数组项
         let val: Value = serde_json::from_str(&after).unwrap();

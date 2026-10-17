@@ -464,6 +464,41 @@ mod tests {
         assert!(built.ends_with("--pet-hook pre"));
     }
 
+    /// preserve_order 的卖点落在「属于用户的那些键」上：装卸往返后，顶层键的顺序与值都不碰。
+    /// 口径说的是「除 hooks 子树外逐字节一致」，这里能真证的是「键序 + 值不变」——
+    /// 序列化走 to_string_pretty，缩进风格由宿主定，字节级一致本来就不成立，别假装证了。
+    /// 关掉 Cargo.toml 的 preserve_order，这条就该红。
+    #[test]
+    fn user_key_order_survives_an_install_uninstall_round_trip() {
+        let raw = r#"{"zeta":1,"alpha":{"nested":[3,1,2]},"hooks":{"Stop":[{"hooks":[{"type":"command","command":"keep.sh"}]}]}}"#;
+        let keys = |text: &str| -> Vec<String> {
+            serde_json::from_str::<Value>(text)
+                .expect("产出必须是合法 JSON")
+                .as_object()
+                .expect("顶层必须是对象")
+                .keys()
+                .cloned()
+                .collect()
+        };
+        let (text, _) = install_in_text(raw, cmd).unwrap();
+        assert_eq!(
+            keys(&text),
+            ["zeta", "alpha", "hooks"],
+            "顶层键序必须按用户原来那样，不是字母序"
+        );
+        let (after, removed) = uninstall_in_text(&text).unwrap().unwrap();
+        assert_eq!(removed, HOOK_PHASES.len());
+        assert_eq!(keys(&after), keys(&text), "卸载也不得重排");
+        let config = parse(&after);
+        assert_eq!(
+            config["alpha"]["nested"].to_string(),
+            "[3,1,2]",
+            "数组顺序更不是我们的事"
+        );
+        assert_eq!(config["hooks"]["Stop"][0]["hooks"][0]["command"], "keep.sh");
+        assert_eq!(managed_count(&config), 0);
+    }
+
     /// 「装成功才算用户的选择」的判据：设置页据此决定要不要往 agent-linkage.json 写 qoder。
     /// 全失败还去记，等于让下一次启用插件装一个从没成功过的 hook。
     #[test]

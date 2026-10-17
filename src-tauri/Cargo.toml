@@ -26,7 +26,10 @@ tauri-plugin-global-shortcut = "2"
 log = "0.4"
 ureq = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order 是 crate 全局生效，不只给 ZCode：serde_json::Map 从字母序变成插入序。
+# 要它是因为改用户配置文件时「只碰 hooks 子树」必须连带保住人家原来的键序，
+# 字母序会把别人的 MCP / 权限 / 插件开关那堆键整体重排一遍。
+serde_json = { version = "1", features = ["preserve_order"] }
 btleplug = "0.11"
 futures = "0.3"
 notify = "8"

@@ -661,8 +661,11 @@ try {
   if (!underTemp) {
     r.info("跳过写盘断言", "hook 配置未指向 temp/a9a（启动时未设 PET_AGENT_CONFIG_FILES）；本组不写任何文件");
   } else {
-    // 「他人条目未变」复用 verify-isolation.mjs「逐字段未变（键序由宿主归一）」的同一口径：
-    // 按键排序的规范串比较（宿主 serde_json 整文件重写会归一键序，那是既有行为、不是改动）。
+    // 「他人条目未变」沿用「逐字段未变」的同一口径：按键排序的规范串比较。
+    // 注意这个排序只是**比对手段**，不代表宿主的行为：A02 起宿主开了 serde_json 的
+    // preserve_order，整文件重写不再把键归一成字母序，而是原样保留用户自己的键序
+    // （改 ZCode 那种混着 MCP/权限开关的配置就必须这样）。键序真被改坏时，
+    // 红的是 commands/agent.rs 那条「往返后键序不变」的单测，不是这里。
     const canon = (value) => {
       if (Array.isArray(value)) return value.map(canon);
       if (value && typeof value === "object") {
