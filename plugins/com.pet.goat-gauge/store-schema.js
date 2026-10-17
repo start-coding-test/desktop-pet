@@ -3,7 +3,7 @@
 import { HISTORY_FIELDS, MAX_HISTORY_POINTS } from "./history.js";
 
 export const SCHEMA_VERSION = 2;
-export const BADGE_MODES = ["five_hour", "weekly", "monthly", "cost_today"];
+export const BADGE_MODES = ["five_hour", "weekly", "monthly", "cost_period"];
 
 export const DEFAULT_CONFIG = {
   refreshSec: 60,
@@ -48,6 +48,8 @@ function pctList(value, fallback) {
 export function sanitizeConfig(raw) {
   const source = asObject(raw);
   const thresholds = asObject(source.thresholds);
+  const rawBadgeMode =
+    source.badgeMode === "cost_today" ? "cost_period" : source.badgeMode;
   return {
     refreshSec: Math.round(finiteInRange(source.refreshSec, 30, 600, DEFAULT_CONFIG.refreshSec)),
     currency: source.currency === "CNY" ? "CNY" : "USD",
@@ -59,7 +61,7 @@ export function sanitizeConfig(raw) {
     },
     showOverlay:
       typeof source.showOverlay === "boolean" ? source.showOverlay : DEFAULT_CONFIG.showOverlay,
-    badgeMode: BADGE_MODES.includes(source.badgeMode) ? source.badgeMode : DEFAULT_CONFIG.badgeMode,
+    badgeMode: BADGE_MODES.includes(rawBadgeMode) ? rawBadgeMode : DEFAULT_CONFIG.badgeMode,
     demo: source.demo === true,
     petReact: source.petReact !== false,
     overlayX: finiteInRange(source.overlayX, -10_000, 10_000, DEFAULT_CONFIG.overlayX),
