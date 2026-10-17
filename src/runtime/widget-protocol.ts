@@ -283,13 +283,27 @@ export function isWidgetPinnedToHostRealm(pluginId: string, raw: string | null |
 }
 
 /**
- * 走不走 Worker：**默认走**，只有点名的例外留在宿主 realm。
+ * S3：`settings` 区一律进 Worker，例外名单只对 `badge` / `overlay` 生效。
+ *
+ * 逃生门是给「第三方 widget 还没照契约写」留的，而设置窗的 realm **就是宿主壳的 realm**：
+ * 设置窗那套命令门禁只认 `window.label()`，被点名留在宿主 realm 的设置页因此直接拿得到
+ * `permission_revoke` / `plugin_enabled_set` / `autostart_set` / `hotkey_set` / `pet_skin_*`
+ * 与 hook 安装这些宿主级命令。门禁粒度得从「哪扇窗」收到「谁」—— 而同一扇窗里分不出「谁」，
+ * 所以这一区不再给例外名单开门。
+ */
+export const regionForcesWorker = (region: string): boolean => region === "settings";
+
+/**
+ * 走不走 Worker：**默认走**，只有点名的例外留在宿主 realm（`settings` 区不认例外名单）。
  * 迁移期那份代码台账已经删掉 —— 四个示例插件都照契约改完、
  * 各自有运行时套件的 realm 戳断言钉住；例外名单现在只服务一种情况：
  * 第三方 widget 还没照契约写。它是逃生门，不是主路。
  */
-export const widgetUsesWorker = (pluginId: string, raw: string | null | undefined): boolean =>
-  !isWidgetPinnedToHostRealm(pluginId, raw);
+export const widgetUsesWorker = (
+  pluginId: string,
+  raw: string | null | undefined,
+  region: string,
+): boolean => regionForcesWorker(region) || !isWidgetPinnedToHostRealm(pluginId, raw);
 
 /**
  * 渲染契约对应的 manifest `apiVersion`。声明到这个版本，才表示「我的 widget 是照 ADR-0008 写的」。
@@ -301,22 +315,29 @@ export const widgetUsesWorker = (pluginId: string, raw: string | null | undefine
 export const WIDGET_CONTRACT_API_VERSION = 2;
 
 /**
- * 旧接口 widget 的拦截判定：要进 Worker（没被点名留宿主 realm）且 `apiVersion` 低于契约版本 → 给出
- * 可读原因；否则 null。纯函数，入参只要 manifest 的三个字段与例外名单原文。
+ * 旧接口 widget 的拦截判定：要进 Worker（没被点名留宿主 realm，或所在区不认例外名单）且
+ * `apiVersion` 低于契约版本 → 给出可读原因；否则 null。纯函数，入参只要 manifest 的三个字段、
+ * 例外名单原文与所在区。
+ *
+ * 逃生门的说法按区给：`settings` 区点名也不生效，写「点名这个 id」会把作者引到一条死路上。
  */
 export function legacyWidgetReason(
   manifest: { id: string; widget?: string; apiVersion?: number },
   pinnedRaw: string | null | undefined,
+  region: string,
 ): string | null {
   if (!manifest.widget) return null;
-  if (!widgetUsesWorker(manifest.id, pinnedRaw)) return null;
+  if (!widgetUsesWorker(manifest.id, pinnedRaw, region)) return null;
   const declared = manifest.apiVersion ?? 1;
   if (declared >= WIDGET_CONTRACT_API_VERSION) return null;
+  const escapeHatch = regionForcesWorker(region)
+    ? `${region} 区一律在 Worker 里运行 widget，例外名单（localStorage 的 ` +
+      `${WIDGET_HOST_REALM_FLAG}）对这一区不生效，点名这个插件也没用。`
+    : `临时出路（仅开发用）：localStorage 的 ${WIDGET_HOST_REALM_FLAG} 里点名这个插件 id。`;
   return (
     `${manifest.id} 的 widget 按旧接口（apiVersion ${declared}）编写，宿主现在默认在 Worker 里运行 widget，` +
     `它在这里跑不起来。插件作者：按渲染契约迁移（ctx.dom 建节点，见 ADR-0008）后在 manifest 写 ` +
-    `"apiVersion": ${WIDGET_CONTRACT_API_VERSION}。临时出路（仅开发用）：localStorage 的 ` +
-    `${WIDGET_HOST_REALM_FLAG} 里点名这个插件 id。`
+    `"apiVersion": ${WIDGET_CONTRACT_API_VERSION}。${escapeHatch}`
   );
 }
 
