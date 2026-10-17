@@ -1957,10 +1957,23 @@ export function deactivate() {}
     r.check(`同意框列出了 ${id} 声明的能力（含 pet:say）`, true, !!consent && consent.caps.some((x) => x.includes("pet:say")));
   }
   await c.ev(installedCollectors);
+  /**
+   * 等槽里没有台词在显示（气泡要么收起、要么带 `.status`）。
+   * 重载之后那句启动问候会亮 3.6s，而它在显示期间**按设计占着槽**（B3：不打断正在显示的台词），
+   * 这时候读气泡读到的是它、`.status` 也没挂 —— 上一轮就是这么假红的。
+   */
+  const waitStatusSlot = () =>
+    waitUntil(
+      c,
+      `(() => { const b = document.getElementById('pet-bubble'); return !b.classList.contains('show') || b.classList.contains('status'); })()`,
+      8_000,
+    ).catch(() => false);
+  await waitStatusSlot();
   // 先挂一行。**不在激活里挂**：首次启用时 pet:say 还没授权，激活里调 setStatus 会当场 reject
-  // （上一版就是这么假红的：激活时挂行失败 → 后面全崩）
+  // （这正是同意框被弹出来的原因），所以别靠激活时序
   const b3Seed = await statusCall(STATUS_A, "set", "常驻行");
   r.check("设置返回生效后的文本", "常驻行", b3Seed.v);
+  await waitStatusSlot();
   const b3SeedNow = await bubbleNow();
   r.check("挂上一行后界面显示它、且带 .status（单行化生效）", "常驻行|true", [b3SeedNow.text, b3SeedNow.status].join("|"));
   // 随机台词让路：把 Math.random 钉死，等一次闲置自言自语（45s 一拍 ⇒ 48s 窗口内必然 ≥1 拍），
@@ -1986,6 +1999,7 @@ export function deactivate() {}
   );
   r.check("观察期确实采样到了常驻行（采样器活着，这条不是空转）", true, b3Texts.includes("常驻行"));
 
+  await waitStatusSlot(); // 量之前先确认槽里是常驻行而不是某句台词
   const b3Geo = await bubbleBox();
   r.check("常驻行有 .status 类（CSS 单行化生效）", true, (await bubbleNow()).status);
   r.check(
@@ -1996,6 +2010,7 @@ export function deactivate() {}
   r.check("宽度没超出立绘宽（既有断言不破）", true, b3Geo.width <= b3Geo.maxWidth + 1);
 
   const b3Long = await statusCall(STATUS_A, "set", "超长".repeat(40));
+  await waitStatusSlot();
   r.check("远超 20 字照样只占一行", true, Math.abs((await bubbleBox()).height - b3Geo.oneLine) <= 1);
   r.check("输入侧按码点截到 20（返回值自证）", 20, [...String(b3Long.v ?? "")].length);
   r.check("界面上的文本就是那 20 个字", String(b3Long.v ?? ""), (await bubbleNow()).text);
@@ -2053,7 +2068,13 @@ export function deactivate() {}
   r.check("停用 A 后 A 那条没了、B 的行不受影响", "B行", (await bubbleNow()).text);
   await setEnabled(enabledBeforeB3);
   await sleep(1_200);
-  r.check("B 也停用 → 完全收起（没有残留条目）", false, (await bubbleNow()).show);
+  await waitStatusSlot(); // 先让可能残留的台词自己收掉，再看「有没有残留条目」
+  const b3AfterAllOff = await bubbleNow();
+  r.check(
+    "B 也停用 → 完全收起（没有残留条目）",
+    false,
+    b3AfterAllOff.show ? `true|${b3AfterAllOff.text}` : "false",
+  );
 
   // 收尾：改回原清单、撤销授权；fixture 目录与授权都不留给下一轮
   await setEnabled(enabledBeforeB3);
