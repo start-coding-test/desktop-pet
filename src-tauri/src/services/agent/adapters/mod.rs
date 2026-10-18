@@ -157,7 +157,8 @@ pub fn is_wired(id: &str) -> bool {
 pub struct Choice {
     pub id: &'static str,
     pub display_name: &'static str,
-    /// `false` = 命令行认得但宿主还没接（PR-3 的 codex / workbuddy），界面按禁选渲染
+    /// `false` = 命令行认得但宿主还没接（四家都接线之后这条路只是保险：白名单先加了取值、
+    /// 适配器还没写的那个中间状态），界面按禁选渲染
     pub wired: bool,
     pub hint: Option<&'static str>,
 }
@@ -236,10 +237,42 @@ mod tests {
     /// 客户端」和「这值本来就是脏的」，两者都不许装。
     #[test]
     fn unknown_ids_are_never_wired() {
-        assert!(is_wired("qoder"), "Qoder 是唯一从 PR-1 就接线的");
+        assert!(
+            is_wired("qoder"),
+            "Qoder 从 PR-1 就接线，不许在扩表时被顶掉"
+        );
         assert!(!is_wired(""));
         assert!(!is_wired("nope"));
         assert!(!is_wired("Qoder"), "id 是大小写敏感的，别拿显示名当 id");
+    }
+
+    /// `--agent` 白名单里的四家**现在都接了线**。这条是「扩表时漏掉一家」唯一的离线判据：
+    /// 上面那条 subset 判据在少一家时照样绿，而症状出现在用户那边 —— 设置页那一格点了没反应，
+    /// 宿主报「还不认识这个 Agent」。同时它反向钉住「白名单不许悄悄多出第五个值」：
+    /// 加了 CLI 取值却没写适配器，这条会红着提醒你把两处一起改。
+    #[test]
+    fn every_cli_agent_id_is_wired() {
+        assert_eq!(
+            wired().len(),
+            crate::services::agent::phases::AGENT_IDS.len(),
+            "--agent 白名单与已接线注册表必须一一对应"
+        );
+        for id in crate::services::agent::phases::AGENT_IDS {
+            assert!(
+                is_wired(id),
+                "{id} 在 --agent 白名单里但没有适配器，点了会拒"
+            );
+        }
+        // 事件表长度按各家事实钉住：数字本身不是重点，「谁家的表被顺手改短了」才是
+        let per_family: Vec<(&str, usize)> =
+            wired().iter().map(|a| (a.id(), a.events().len())).collect();
+        for (id, want) in [("qoder", 12), ("zcode", 7), ("codex", 10), ("workbuddy", 7)] {
+            assert_eq!(
+                per_family.iter().find(|(x, _)| *x == id).map(|(_, n)| *n),
+                Some(want),
+                "{id} 的事件表长度变成别的数了（方案 §3A/§3B 各家一张表）"
+            );
+        }
     }
 
     /// 适配器装的事件必须能被自己的解析器收回来：安装表里的 phase 不在 `PHASES`
