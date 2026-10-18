@@ -129,6 +129,10 @@ impl AgentAdapter for ZCodeAdapter {
         "ZCode"
     }
 
+    fn dir_hint(&self) -> &'static [&'static str] {
+        &[".zcode/cli"]
+    }
+
     /// `~/.zcode` 不存在 = 没装这个客户端，一个候选都不给（连文件都不造）。
     /// 存在时列出 `cli/config.json` 与 `cli/setting.json` 里**实际存在的那些**；
     /// 两个都不存在也照样不造 —— 开发机上到底哪一种对应「装过但还没生成配置」，
@@ -261,6 +265,43 @@ impl AgentAdapter for ZCodeAdapter {
     fn events(&self) -> &'static [(&'static str, &'static str)] {
         EVENTS
     }
+
+    fn post_install_hint(&self) -> Option<&'static str> {
+        // 方案 §3.6：hook 配置在会话启动时生成快照，所以装完/卸完都要新开会话
+        Some("在 ZCode 里新开一个会话才会读到新装的 hook")
+    }
+
+    /// 总开关显式关着、而用户自己配过条目 → 打开它等于把他的 hook 也一起启用，
+    /// 这句确认要由宿主问、不是我们替他决定
+    fn switch_needs_consent(&self, raw: &str) -> Option<usize> {
+        if self.switch_before(raw) != Some(json!(false)) {
+            return None;
+        }
+        let mine = user_hook_count(raw);
+        (mine > 0).then_some(mine)
+    }
+}
+
+/// 用户自己的条目数（不含我们的）——「你之前配的 N 条 hook 也会一起生效」里的那个 N。
+fn user_hook_count(raw: &str) -> usize {
+    let Ok(config) = serde_json::from_str::<Value>(raw) else {
+        return 0;
+    };
+    let Some(events) = config
+        .get("hooks")
+        .and_then(|h| h.get("events"))
+        .and_then(Value::as_object)
+    else {
+        return 0;
+    };
+    events
+        .values()
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter(|hook| !ZCodeAdapter::is_ours(hook))
+        .count()
 }
 
 /// ZCode 接线表里的单例

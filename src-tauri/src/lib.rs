@@ -129,6 +129,7 @@ pub fn run() {
             commands::agent::agent_hooks_status,
             commands::agent::agent_hooks_install,
             commands::agent::agent_hooks_uninstall,
+            commands::agent::agent_linkage_set,
             services::fullscreen::fullscreen_watch_set,
             services::fullscreen::fullscreen_watch_status,
             services::fullscreen::fullscreen_probe,

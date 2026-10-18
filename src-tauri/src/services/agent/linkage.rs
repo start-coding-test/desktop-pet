@@ -22,6 +22,7 @@ use std::sync::RwLock;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::host_error::{HostError, INTERNAL, INVALID_ARG, INVALID_STATE, NOT_FOUND};
 use crate::plugin_caps::AGENT_HOOKS;
 use crate::services::agent::adapters::{self, claude_style, AgentAdapter};
 use crate::services::agent::phases::DEFAULT_AGENT;
@@ -269,6 +270,107 @@ pub fn recorded_switches_of(app: &AppHandle) -> Value {
     }
 }
 
+/// 卸旧之后、装新的之前的判定（纯函数）。抽出来是因为 `switch_agent` 那层要 AppHandle 与真文件，
+/// 而「哪一步先、哪一步失败就停」正是这条命令最需要被跑红的部分 —— 与 `startup_sequence` 同一手法。
+#[derive(Debug, PartialEq, Eq)]
+pub enum SwitchPlan {
+    /// 卸旧失败：停在原状态，不装新的
+    StopAfterRemoveFailure,
+    /// 没找到新 Agent 的配置目录：旧的已摘，新的不装（要如实报出去）
+    NothingToInstall,
+    Install,
+}
+
+/// 确认门：**动任何文件之前**判。返回 `true` 就一条命令也不该改配置文件 ——
+/// 反过来（先摘旧的再问）会变成「用户按了取消，hook 已经没了」。
+pub fn consent_gate(consent: Option<usize>, confirm: bool) -> bool {
+    consent.is_some() && !confirm
+}
+
+/// 卸完旧的了：该装、该停、还是没地方装。三个分支都可达，所以没有兜底分支。
+pub fn plan_install(remove_failed: bool, has_targets: bool) -> SwitchPlan {
+    if remove_failed {
+        SwitchPlan::StopAfterRemoveFailure
+    } else if !has_targets {
+        SwitchPlan::NothingToInstall
+    } else {
+        SwitchPlan::Install
+    }
+}
+
+/// 设置页四选一的落点：把联动切到另一个 Agent。口径（派单 §3）：
+/// **先卸旧、成功后再装新**；卸旧失败就停在原状态。
+///
+/// 为什么顺序不能反：同一时间只挂一个 Agent 是本卡的不变量（ADR-0002 定为长期路线）。
+/// 先装新的再摘旧的，中途任何一次失败都会留下两份条目并存 —— 桌宠会同时被两家驱动，
+/// 而且下一次卸载只摘得掉其中一份。
+///
+/// 需要用户确认的那一步（ZCode 的总开关显式关着、且用户自己配过条目）必须在**动任何文件之前**
+/// 问，所以它排在卸旧之前；`confirm = false` 时一条命令也不改。
+pub fn switch_agent(
+    app: &AppHandle,
+    agent: &str,
+    confirm: bool,
+    home: &Path,
+) -> Result<Value, HostError> {
+    let Some(adapter) = adapters::by_id(agent) else {
+        return Err(HostError::new(
+            INVALID_ARG,
+            format!("还不认识这个 Agent: {agent}（codex / workbuddy 在 PR-3 接线）"),
+        ));
+    };
+    let data = app_data(app)
+        .ok_or_else(|| HostError::new(INVALID_STATE, "拿不到宿主数据目录，切换无从记录"))?;
+    let targets = adapter.targets(home);
+    let consent = agent_hooks::pending_consent(adapter, &targets);
+    if consent_gate(consent, confirm) {
+        let mine = consent.unwrap_or_default();
+        return Err(HostError::new(
+            INVALID_STATE,
+            format!(
+                "{} 的 hook 总开关现在是关的，打开以后你之前配的 {mine} 条 hook 也会一起生效。确认请再点一次。",
+                adapter.display_name()
+            ),
+        ));
+    }
+    let removed = agent_hooks::uninstall_everywhere(home, &recorded_switches(&data));
+    let first_error = removed
+        .iter()
+        .filter_map(|r| r.error.as_ref())
+        .next()
+        .cloned()
+        .unwrap_or_default();
+    match plan_install(!first_error.is_empty(), !targets.is_empty()) {
+        // 停在原状态：不装新的，但要把「哪些文件没摘干净」如实说清（已经摘掉的部分不假装没发生）
+        SwitchPlan::StopAfterRemoveFailure => Err(HostError::new(
+            INVALID_STATE,
+            format!("卸下旧的 hook 失败，未安装新的: {first_error}"),
+        )),
+        SwitchPlan::NothingToInstall => Err(HostError::new(
+            NOT_FOUND,
+            format!(
+                "没找到 {} 的配置目录；旧的 hook 已卸下（{} 条），新的未安装",
+                adapter.display_name(),
+                removed.iter().map(|r| r.managed).sum::<usize>()
+            ),
+        )),
+        SwitchPlan::Install => {
+            let exe = std::env::current_exe()
+                .map_err(|e| HostError::new(INTERNAL, format!("取不到自身路径: {e}")))?;
+            let reports = agent_hooks::install_files(adapter, &targets, &exe);
+            // 只有真装上才算用户的选择（note_installed 里判），全失败时状态文件保持「没选过」
+            note_installed(app, adapter.id(), &reports);
+            Ok(json!({
+                "agent": adapter.id(),
+                "displayName": adapter.display_name(),
+                "removed": removed.iter().map(|r| r.managed).sum::<usize>(),
+                "files": reports,
+                "hint": adapter.post_install_hint(),
+            }))
+        }
+    }
+}
+
 /// 写状态文件。**失败只记日志**：装卸本身已经落到 Agent 的配置里了，
 /// 不该因为状态文件写不进去而让命令报错、把成功的事说成失败。
 fn note_choice(app: &AppHandle, agent: Option<&str>) {
@@ -382,6 +484,17 @@ fn targets(app: &AppHandle, adapter: &dyn AgentAdapter) -> Vec<PathBuf> {
             Vec::new()
         }
     }
+}
+
+/// 状态页与命令层用的「当前该按哪家看」：直接读状态文件，不走 `CURRENT_AGENT` 缓存
+/// （缓存是给每行事件比对用的，状态查询要拿磁盘上的事实）。
+pub fn recorded_agent_of(app: &AppHandle) -> Option<String> {
+    app_data(app).and_then(|data| agent_choice(&data))
+}
+
+/// 当前联动的适配器；记录缺失或指向还没接线的槽位时退回 Qoder（与 `adapter_for` 同一条口径）。
+pub fn current_adapter(app: &AppHandle) -> &'static dyn AgentAdapter {
+    adapter_for(recorded_agent_of(app).as_deref())
 }
 
 /// 这批装卸走哪个适配器。状态文件里的选择缺失、或指向还没接线的槽位时退回 Qoder ——
@@ -860,6 +973,37 @@ mod tests {
             "没拨过开关就不该为记账新建一个状态文件"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 切换 Agent 的顺序判据（抽成纯函数就是为了让它能被跑红）：
+    /// 确认问必须在**动任何文件之前**，卸旧失败必须压住「装新的」。
+    #[test]
+    fn switching_asks_consent_before_touching_any_file() {
+        assert!(
+            consent_gate(Some(3), false),
+            "总开关关着且用户自己配过 3 条 → 先问"
+        );
+        assert!(!consent_gate(Some(3), true), "第二次点击（带确认）才放行");
+        assert!(
+            !consent_gate(None, false),
+            "没有确认问题就不该拦（Qoder 恒如此）"
+        );
+    }
+
+    #[test]
+    fn switching_never_installs_on_top_of_a_failed_removal() {
+        assert_eq!(
+            plan_install(true, true),
+            SwitchPlan::StopAfterRemoveFailure,
+            "卸旧失败时哪怕目标目录就在也不装 —— 那样会两份条目并存，「同一时间只挂一个 Agent」当场就破了"
+        );
+        assert_eq!(
+            plan_install(true, false),
+            SwitchPlan::StopAfterRemoveFailure,
+            "「失败」要报在「没地方装」之前，那是真原因"
+        );
+        assert_eq!(plan_install(false, false), SwitchPlan::NothingToInstall);
+        assert_eq!(plan_install(false, true), SwitchPlan::Install);
     }
 
     #[test]

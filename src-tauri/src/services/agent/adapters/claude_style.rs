@@ -32,6 +32,8 @@ pub struct ClaudeStyleJson {
     /// 开发/测试的覆盖入口：设了这个环境变量（`;` 分隔完整文件路径）就不再从 home 推目录。
     /// 它是「不碰真实用户配置」这条硬规则的实现，不是可选装饰。
     pub paths_env: &'static str,
+    /// 装完要用户做的事（`AgentAdapter::post_install_hint`）
+    pub hint: Option<&'static str>,
 }
 
 impl ClaudeStyleJson {
@@ -147,6 +149,10 @@ impl AgentAdapter for ClaudeStyleJson {
         self.display_name
     }
 
+    fn dir_hint(&self) -> &'static [&'static str] {
+        self.dirs
+    }
+
     fn targets(&self, home: &Path) -> Vec<PathBuf> {
         if let Ok(list) = std::env::var(self.paths_env) {
             return list
@@ -192,6 +198,10 @@ impl AgentAdapter for ClaudeStyleJson {
     fn events(&self) -> &'static [(&'static str, &'static str)] {
         self.events
     }
+
+    fn post_install_hint(&self) -> Option<&'static str> {
+        self.hint
+    }
 }
 
 /// Qoder：两个可能的配置目录，12 条事件，`timeout` 按秒。
@@ -203,6 +213,7 @@ pub static QODER: ClaudeStyleJson = ClaudeStyleJson {
     events: HOOK_PHASES,
     timeout_key: "timeout",
     paths_env: "PET_AGENT_CONFIG_FILES",
+    hint: Some("在 Qoder 里新开一次会话，新装的 hook 才会被读到"),
 };
 
 #[cfg(test)]
@@ -382,6 +393,7 @@ mod tests {
             events: HOOK_PHASES,
             timeout_key: "timeout",
             paths_env: "PET_AGENT_PROBE_UNSET_ENV",
+            hint: None,
         };
         let home = std::env::temp_dir().join(format!("pet-probe-home-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);

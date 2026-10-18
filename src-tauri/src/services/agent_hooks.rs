@@ -233,6 +233,25 @@ pub fn uninstall_files(
         .collect()
 }
 
+/// 切换 Agent 之前问一句：这个适配器在它的候选文件里需不需要用户先确认
+/// （ZCode 的总开关显式关着、且用户自己配过 hook）。多个文件要确认的条数**加总**成一个数 ——
+/// 弹两次一样的框不如一次说清「一共 N 条」。
+/// 读文件住在这一层：适配器只做文本变换。
+pub fn pending_consent(adapter: &dyn AgentAdapter, files: &[PathBuf]) -> Option<usize> {
+    let mut total = 0;
+    let mut needed = false;
+    for path in files {
+        let Ok(Some(raw)) = read_existing(path) else {
+            continue;
+        };
+        if let Some(count) = adapter.switch_needs_consent(&raw) {
+            needed = true;
+            total += count;
+        }
+    }
+    needed.then_some(total)
+}
+
 /// 卸载应用前的清理：把**每个已接线适配器**名下的自家条目都摘净。
 ///
 /// 这里不按「当前联动的那个 Agent」走：应用都没了，状态文件里写的是谁已经不重要；而留在
@@ -400,6 +419,56 @@ mod tests {
         let none_recorded = uninstall_files(&ZCODE, std::slice::from_ref(&path), &json!({}));
         assert_eq!(none_recorded[0].managed, 0, "没有自家条目就不算改动");
         assert_eq!(fs::read_to_string(&path).unwrap(), before, "一个字都不写");
+
+        std::env::remove_var("PET_AGENT_HOME");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 切换前的确认问：只有「显式关着 + 用户自己配过条目」才要问；
+    /// 多个文件要确认的条数加总成一个数（弹两次一样的框不如一次说清）。
+    #[test]
+    fn pending_consent_only_when_the_switch_is_explicitly_off() {
+        let _env = adapters::lock_test_env();
+        let dir = tmp_dir("consent");
+        std::env::set_var("PET_AGENT_HOME", &dir);
+        std::env::remove_var("PET_AGENT_CONFIG_FILES");
+        let cli = dir.join(".zcode").join("cli");
+        fs::create_dir_all(&cli).unwrap();
+        let file = cli.join("config.json");
+
+        fs::write(
+            &file,
+            r#"{"hooks":{"enabled":false,"events":{"Stop":[{"hooks":[{"type":"command","command":"keep.sh"}]}]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pending_consent(&ZCODE, &ZCODE.targets(&dir)),
+            Some(1),
+            "关着的开关 + 用户那 1 条 → 要问"
+        );
+
+        // 用户一条都没有：打开开关不会连带启用任何东西，不该拦路
+        fs::write(&file, r#"{"hooks":{"enabled":false,"events":{}}}"#).unwrap();
+        assert_eq!(pending_consent(&ZCODE, &ZCODE.targets(&dir)), None);
+
+        // 本来就开着：没什么要确认的
+        fs::write(
+            &file,
+            r#"{"hooks":{"enabled":true,"events":{"Stop":[{"hooks":[{"type":"command","command":"keep.sh"}]}]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(pending_consent(&ZCODE, &ZCODE.targets(&dir)), None);
+
+        // 没有这个键（ZCode 按关处理，但「开关现在是关的」那句文案不成立）→ 不问
+        fs::write(
+            &file,
+            r#"{"hooks":{"events":{"Stop":[{"hooks":[{"type":"command","command":"keep.sh"}]}]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(pending_consent(&ZCODE, &ZCODE.targets(&dir)), None);
+
+        // Qoder 没有总开关，永远不问
+        assert_eq!(pending_consent(&QODER, std::slice::from_ref(&file)), None);
 
         std::env::remove_var("PET_AGENT_HOME");
         let _ = fs::remove_dir_all(&dir);

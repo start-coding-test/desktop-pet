@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 
 use crate::host_error::{HostError, INTERNAL, NOT_FOUND};
-use crate::services::agent::adapters::{claude_style, AgentAdapter};
+use crate::services::agent::adapters::{self, AgentAdapter};
 use crate::services::agent::linkage;
 use crate::services::agent_hooks;
 use crate::services::permission::PermissionState;
@@ -64,7 +64,8 @@ fn exe_path_error(e: std::io::Error) -> HostError {
 }
 
 fn snapshot(app: &AppHandle) -> Result<Value, HostError> {
-    let adapter = &claude_style::QODER;
+    // 按「当前联动的那一家」查，不是写死 Qoder：设置页回显的必须就是用户选中的那个 Agent
+    let adapter = linkage::current_adapter(app);
     let files = adapter.targets(&home_dir(app)?);
     let reports = agent_hooks::status_reports(adapter, &files);
     let managed: usize = reports.iter().map(|r| r.managed).sum();
@@ -77,17 +78,21 @@ fn snapshot(app: &AppHandle) -> Result<Value, HostError> {
         "installed": managed > 0 && files.len() * expected == managed,
         // 每份文件该有几条，由适配器的事件表给，不再直接引 Qoder 那张常量表
         "expectedPerFile": expected,
+        "agent": adapter.id(),
+        "displayName": adapter.display_name(),
+        "hint": adapter.post_install_hint(),
+        // 四选一的清单（含还没接线的槽位，界面按 wired=false 禁选）
+        "options": adapters::choices(),
     }))
 }
 
 /// 安装的配置目录入口：一个候选都没有时按「资源名字不存在」拒（not-found）。
 /// 独立成函数让这条失败在单测里可达（命令体要 AppHandle 与窗口，构造不出来）。
 ///
-/// 文案由适配器给：接第二个客户端时这段不该还写着 Qoder。`dirs_hint` 是提示用的目录列表，
-/// 它是适配器结构体的字段（trait 里没有这一项，方案 §2 的接口形状不动），所以由调用方传入。
+/// 文案整个由适配器拼：接第二个客户端时不该还写着 Qoder，而 Qoder 那句要与旧文案**逐字相同**
+/// （判据是 `install_without_qoder_config_dirs_is_not_found`）。
 fn required_hook_configs(
     adapter: &dyn AgentAdapter,
-    dirs_hint: &[&str],
     home: &Path,
 ) -> Result<Vec<PathBuf>, HostError> {
     let files = adapter.targets(home);
@@ -97,7 +102,8 @@ fn required_hook_configs(
             format!(
                 "没找到 {} 的配置目录（{}）",
                 adapter.display_name(),
-                dirs_hint
+                adapter
+                    .dir_hint()
                     .iter()
                     .map(|d| format!("~/{d}"))
                     .collect::<Vec<_>>()
@@ -125,12 +131,29 @@ pub fn agent_hooks_install(
     plugin_id: Option<String>,
 ) -> Result<Value, HostError> {
     assert_caller(&app, &window, plugin_id.as_deref(), "查询或改动 Agent hook")?;
-    let adapter = &claude_style::QODER;
-    let files = required_hook_configs(adapter, adapter.dirs, &home_dir(&app)?)?;
+    // 「安装」装的是当前选中的那一家（四选一由 agent_linkage_set 负责改这个选择）
+    let adapter = linkage::current_adapter(&app);
+    let files = required_hook_configs(adapter, &home_dir(&app)?)?;
     let reports = agent_hooks::install_files(adapter, &files, &exe_path()?);
     // 只有真装上才算用户的选择；全失败不写，见 linkage::note_installed
     linkage::note_installed(&app, adapter.id(), &reports);
-    Ok(json!({ "files": reports }))
+    Ok(json!({ "files": reports, "hint": adapter.post_install_hint() }))
+}
+
+/// 切换联动的 Agent（设置页四选一）。单独一条命令的理由（PM Q1）：它要把
+/// 「卸旧失败、停在原状态」这个结果**同步**回设置页，并按调用方做权限校验 ——
+/// 复用现有方法或「写配置文件再让宿主响应」两条路都做不到。
+/// `confirm` 是 ZCode 总开关那句确认的第二次点击（见 linkage::switch_agent）。
+#[tauri::command]
+pub fn agent_linkage_set(
+    app: AppHandle,
+    window: tauri::Window,
+    plugin_id: Option<String>,
+    agent: String,
+    confirm: Option<bool>,
+) -> Result<Value, HostError> {
+    assert_caller(&app, &window, plugin_id.as_deref(), "切换联动的 Agent")?;
+    linkage::switch_agent(&app, &agent, confirm.unwrap_or(false), &home_dir(&app)?)
 }
 
 #[tauri::command]
@@ -153,7 +176,7 @@ pub fn agent_hooks_uninstall(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::agent::adapters::claude_style::QODER;
+    use crate::services::agent::adapters::claude_style::{self, QODER};
     use crate::services::agent::HOOK_PHASES;
 
     /// B2 验收 P0：含他人 hook 条目的样例配置走完 install → uninstall 后，
@@ -244,7 +267,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pet-a04-cfg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let err = required_hook_configs(&QODER, QODER.dirs, &dir).unwrap_err();
+        let err = required_hook_configs(&QODER, &dir).unwrap_err();
         assert_eq!(err.code, NOT_FOUND);
         assert_eq!(
             err.message,

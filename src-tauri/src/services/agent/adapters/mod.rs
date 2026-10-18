@@ -26,6 +26,13 @@ pub trait AgentAdapter: Sync {
     /// 给用户看的名字（设置页与错误文案用它，别再手写「Qoder」）
     fn display_name(&self) -> &'static str;
 
+    /// 「没找到 X 的配置目录（…）」括号里那份路径提示，相对 home 的目录名。
+    /// 只为文案存在：接口形状（方案 §2）里没有这一项，加的是**带默认实现**的方法，
+    /// 所以两家适配器各答一句、调用方不必按 id 分派。
+    fn dir_hint(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// 候选配置文件：所在目录不存在就不算装了这个客户端，绝不凭空造配置
     fn targets(&self, home: &Path) -> Vec<PathBuf>;
 
@@ -66,9 +73,20 @@ pub trait AgentAdapter: Sync {
     /// **(事件名, phase)** 安装表。各家的事件词表不同，所以由适配器给出；
     /// phase 本身还得过 `phases::PHASES` 白名单，两处一致才收得到。
     fn events(&self) -> &'static [(&'static str, &'static str)];
-    // 方案 §2 还列了 `post_install_hint()`（装完要用户做什么：新开会话 / 去 /hooks 信任 /
-    // 彻底重启）。它的第一批读者是 A02-4 的设置页四选一，那一段一起加，
-    // 不留一个只有实现、没人调的 trait 方法。
+
+    /// 装完之后要用户做的事（新开会话 / 去 /hooks 信任 / 彻底重启）。`None` = 什么都不用做。
+    /// 设置页原文显示这一句，别在界面里另写一份 —— 生效时机是客户端的事实，不是文案。
+    fn post_install_hint(&self) -> Option<&'static str>;
+
+    /// 「装这个客户端之前得先跟用户确认」的情况：返回 `Some(N)` 表示它的总开关现在是**显式关着**的，
+    /// 而打开会连带把用户自己配的 `N` 条 hook 一起启用。`None` = 不需要确认。
+    /// 判的是**单个文件的原文** —— 适配器不碰磁盘，读文件由 `agent_hooks::pending_consent` 负责。
+    ///
+    /// 「没有 `enabled` 这个键」不进这里：方案 §3.4 的确认框说的是「总开关现在是关的」，
+    /// 键不存在时那句文案就不成立，而这种文件里用户的条目本来也没被关着（照 §3.4 直接打开即可）。
+    fn switch_needs_consent(&self, _raw: &str) -> Option<usize> {
+        None
+    }
 }
 
 /// 已经接线的适配器。装卸、状态、卸载前清理都按这张表走 ——
@@ -87,6 +105,49 @@ pub fn by_id(id: &str) -> Option<&'static dyn AgentAdapter> {
 /// 这个 id 现在能不能真的装卸。`decide()` 用它把「用户选了谁」和「我们接了谁」分开。
 pub fn is_wired(id: &str) -> bool {
     by_id(id).is_some()
+}
+
+/// 设置页的一个槽位
+#[derive(serde::Serialize)]
+pub struct Choice {
+    pub id: &'static str,
+    pub display_name: &'static str,
+    /// `false` = 命令行认得但宿主还没接（PR-3 的 codex / workbuddy），界面按禁选渲染
+    pub wired: bool,
+    pub hint: Option<&'static str>,
+}
+
+/// 设置页四选一的清单：**`--agent` 白名单里的四个都列**，而不是只列已接线的。
+/// 只列两个的话，用户配置里残留的 `--agent codex` 条目在界面上「没有对应的选项」，
+/// 看起来就是宿主坏了；列出来并标成未接线，才是事实。
+pub fn choices() -> Vec<Choice> {
+    crate::services::agent::phases::AGENT_IDS
+        .iter()
+        .copied()
+        .map(|id| match by_id(id) {
+            Some(adapter) => Choice {
+                id,
+                display_name: adapter.display_name(),
+                wired: true,
+                hint: adapter.post_install_hint(),
+            },
+            None => Choice {
+                id,
+                display_name: label(id),
+                wired: false,
+                hint: None,
+            },
+        })
+        .collect()
+}
+
+/// 还没接线那两家的显示名；接线之后会被适配器自己的 `display_name()` 顶掉。
+fn label(id: &'static str) -> &'static str {
+    match id {
+        "codex" => "Codex",
+        "workbuddy" => "WorkBuddy",
+        other => other,
+    }
 }
 
 #[cfg(test)]
