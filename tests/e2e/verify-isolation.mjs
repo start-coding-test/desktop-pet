@@ -2191,7 +2191,7 @@ export function deactivate() { live = false; }
   // 「卸载」在宠物窗这一侧没有独立代码路径：启停清单的写入口只对设置窗开放 —— 卸载的下线回收
   // 同样走 deactivate/terminate 那条（已在上面「停用」实测），故这里只把门禁本身钉住，不另造伪路径。
   const b3ListWrite = await c.ev(`(async () => {
-    const rt = await import(/src/runtime/plugin-runtime.ts);
+    const rt = await import('/src/runtime/plugin-runtime.ts');
     try { await rt.setEnabledIds(rt.getEnabled()); return "放行"; } catch (e) { return String(e && e.message ? e.message : e); }
   })()`);
   r.check("启停清单只能由设置窗改（宠物窗写被拒，故「卸载」不在此处另造路径）", true, /只有设置窗/.test(b3ListWrite));
