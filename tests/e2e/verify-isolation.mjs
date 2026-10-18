@@ -2088,7 +2088,7 @@ export function deactivate() {}
   r.info("撤权后再设置的同意框", b3ConsentAgain ? "弹了（已拒）" : "没弹");
   r.check(
     "撤权后无权再设置常驻行：拒掉同意框就拿不到这一行",
-    "false|false",
+    "true|false",
     [b3NoGrantRes.ok === false, (await bubbleNow()).text === "偷挂行"].join("|"),
   );
 
@@ -2134,12 +2134,12 @@ export function deactivate() {}
     b3AfterAllOff.show,
   );
 
-  // 收尾：改回原清单、撤销授权；fixture 目录与授权都不留给下一轮
+  // 收尾：改回原清单、撤销授权。fixture 目录**留到 finally 再删** —— 组尾就删会让
+  // 超时调用的迟到回包变成 `bus relay failed: … 没有安装`（verify:worker 的零噪音门会红）。
   await setEnabled(enabledBeforeB3);
   for (const id of [STATUS_A, STATUS_B]) {
     await revoke(id);
   }
-  for (const id of [STATUS_A, STATUS_B]) rmSync(join(PLUGINS_DIR, id), { recursive: true, force: true });
 
   r.group("宿主页面自身未产生 CSP 违规或未捕获异常");
   // 上面的递归测试会刻意打一条 console.error，它是被测行为的证据，不该混进这里的零容忍
