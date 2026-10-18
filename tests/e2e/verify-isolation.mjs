@@ -1870,10 +1870,351 @@ export function unmount() {}
     sc.close();
   }
 
+  // ---------- B3：气泡常驻状态行（宿主侧） ----------
+  // 两个 fixture（id 不同）验「每个插件各占一条 + 回落」；同一份入口脚本靠 ctx.pluginId 区分 topic。
+  r.group("B3 常驻状态行：显示 / 单行几何 / 仲裁回落 / 台词优先 / 回收");
+  const STATUS_A = "zz.status";
+  const STATUS_B = "zz.status2";
+  const STATUS_INDEX = `let live = true;
+export async function activate(ctx) {
+  const pid = ctx.pluginId;
+  // 下线之后不再回包：否则在途/迟到的那条 :res 会在下一套件里变成
+  // 'bus relay failed: … 插件没有安装'（verify:worker 的零噪音门会红）
+  const reply = (id, body) => { if (live) ctx.bus.publish(pid + ":res", Object.assign({ id: id }, body)); };
+  ctx.bus.subscribe(pid + ":cmd", async (msg) => {
+    try {
+      if (msg.action === "set") reply(msg.id, { ok: true, v: await ctx.pet.setStatus(msg.text) });
+      else if (msg.action === "clear") reply(msg.id, { ok: true, v: await ctx.pet.setStatus(null) });
+      else if (msg.action === "say") { await ctx.pet.say(String(msg.text)); reply(msg.id, { ok: true }); }
+      else if (msg.action === "boom") { reply(msg.id, { ok: true }); setTimeout(() => { throw new Error("B3 崩溃探针：故意未捕获"); }, 0); }
+      else reply(msg.id, { ok: false, e: "未知 action" });
+    } catch (e) {
+      reply(msg.id, { ok: false, e: String(e && e.message ? e.message : e) });
+    }
+  });
+}
+export function deactivate() { live = false; }
+`;
+  const statusManifest = (id) =>
+    JSON.stringify({
+      id,
+      name: `常驻行探针 ${id}`,
+      version: "0.0.0",
+      entry: "index.js",
+      permissions: ["pet:say", "bus:publish", "bus:subscribe"],
+      description: "验证气泡常驻行的显示、仲裁与回收（B3）。",
+    });
+  for (const id of [STATUS_A, STATUS_B]) {
+    const dir = join(PLUGINS_DIR, id);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "index.js"), STATUS_INDEX);
+    writeFileSync(join(dir, "manifest.json"), statusManifest(id));
+  }
+  // 采样器必须等 reload 之后再装：window 上的东西（订阅与数组）会被那次重载整个冲掉 ——
+  // 上一版就栽在这儿，结果每条 statusCall 都等满 15s 超时
+  const installedCollectors = `(async () => {
+    const { bus } = await import('/src/runtime/event-bus.ts');
+    window.__statusRes = [];
+    for (const pid of ['${STATUS_A}', '${STATUS_B}']) bus.subscribe(pid + ':res', (p) => window.__statusRes.push(p));
+    return true;
+  })()`;
+  let statusSeq = 0;
+  /** 指令经总线投给插件入口，结果同样经总线回来（回不传就返回可读失败，而不是 TypeError） */
+  const statusCall = async (pid, action, text) => {
+    const id = ++statusSeq;
+    await c.ev(`(async () => {
+      const { bus } = await import('/src/runtime/event-bus.ts');
+      bus.inject(${JSON.stringify(pid)} + ':cmd', { id: ${id}, action: ${JSON.stringify(action)}, text: ${JSON.stringify(text ?? null)} });
+      return true;
+    })()`);
+    const hit = `((window.__statusRes || []).find((r) => r.id === ${id})) ?? null`;
+    const got = await waitUntil(c, `!!(${hit})`, 15_000).catch(() => false);
+    if (!got) return { ok: false, e: `插件没回传 ${pid} ${action} 的结果（15s）` };
+    return c.ev(hit);
+  };
+  const bubbleNow = () =>
+    c.ev(`(() => { const b = document.getElementById('pet-bubble'); return { show: b.classList.contains('show'), status: b.classList.contains('status'), text: b.textContent }; })()`);
+  /** 气泡盒子的渲染态读数（单行盒高不在这里推 —— 由「1 个字」那次实测校准，见下） */
+  const bubbleBox = () =>
+    c.ev(`(() => {
+      const b = document.getElementById('pet-bubble');
+      const cs = getComputedStyle(b);
+      const rect = b.getBoundingClientRect();
+      return {
+        top: rect.top,
+        height: rect.height,
+        width: rect.width,
+        maxWidth: parseFloat(cs.maxWidth),
+      };
+    })()`);
+
+  const enabledBeforeB3 = await readEnabledIds(invoke(c));
+  r.check("基线：没挂常驻行时气泡是收起的", false, (await bubbleNow()).show);
+  // 上面那一段结尾把设置窗关了，句柄也随窗作废：本组要写启停清单与撤授权，重开一扇
+  settings = await openSettingsInvoker(PORT, c);
+  await setEnabled([...new Set([...enabledBeforeB3, STATUS_A, STATUS_B])]);
+  await reloadAndWait(c);
+  // 激活会为两个 fixture 各弹一次同意框（声明的三项能力）
+  for (const id of [STATUS_A, STATUS_B]) {
+    const consent = await driveConsent("allow", id).catch(() => null);
+    r.check(`同意框列出了 ${id} 声明的能力（含 pet:say）`, true, !!consent && consent.caps.some((x) => x.includes("pet:say")));
+  }
+  await c.ev(installedCollectors);
+  /**
+   * 等槽里没有台词在显示（气泡要么收起、要么带 `.status`）。
+   * 重载之后那句启动问候会亮 3.6s，而它在显示期间**按设计占着槽**（B3：不打断正在显示的台词），
+   * 这时候读气泡读到的是它、`.status` 也没挂 —— 上一轮就是这么假红的。
+   */
+  const waitStatusSlot = () =>
+    waitUntil(
+      c,
+      `(() => { const b = document.getElementById('pet-bubble'); return !b.classList.contains('show') || b.classList.contains('status'); })()`,
+      8_000,
+    ).catch(() => false);
+  await waitStatusSlot();
+  // 先挂一行。**不在激活里挂**：首次启用时 pet:say 还没授权，激活里调 setStatus 会当场 reject
+  // （这正是同意框被弹出来的原因），所以别靠激活时序
+  const b3Seed = await statusCall(STATUS_A, "set", "常驻行");
+  r.check("设置返回生效后的文本", "常驻行", b3Seed.v);
+  await waitStatusSlot();
+  const b3SeedNow = await bubbleNow();
+  r.check("挂上一行后界面显示它、且带 .status（单行化生效）", "常驻行|true", [b3SeedNow.text, b3SeedNow.status].join("|"));
+  // 随机台词让路：把 Math.random 钉死，等一次闲置自言自语（45s 一拍 ⇒ 48s 窗口内必然 ≥1 拍），
+  // 全程 120ms 采样气泡文本 —— 守卫被摘掉时那一拍会弹台词并亮 3.6s，必然被抓到。
+  // 这样判不赌「激活 vs 启动台词」的时序，也只等一个固定窗口。
+  await c.ev(`(() => {
+    window.__savedRandom = Math.random;
+    Math.random = () => 0;
+    window.__bubbleSeen = [];
+    window.__bubbleTimer = setInterval(() => {
+      const b = document.getElementById('pet-bubble');
+      window.__bubbleSeen.push(b.classList.contains('show') ? b.textContent : '');
+    }, 120);
+    return true;
+  })()`);
+  await waitUntil(c, `window.__bubbleSeen.length >= 400`, 52_000).catch(() => false);
+  const b3Texts = await c.ev(`[...new Set(window.__bubbleSeen)]`);
+  await c.ev(`(() => { clearInterval(window.__bubbleTimer); Math.random = window.__savedRandom; return true; })()`);
+  r.check(
+    "有常驻行时宿主随机台词让路（整段窗口内气泡只出现过常驻行）",
+    "[]",
+    JSON.stringify(b3Texts.filter((t) => t !== "" && t !== "常驻行")),
+  );
+  r.check("观察期确实采样到了常驻行（采样器活着，这条不是空转）", true, b3Texts.includes("常驻行"));
+
+  await waitStatusSlot(); // 量之前先确认槽里是常驻行而不是某句台词
+  r.check("常驻行有 .status 类（CSS 单行化生效）", true, (await bubbleNow()).status);
+  // 单行盒**自校准**：先设 1 个字量出盒高，不推公式（Chromium 对 `line-height: 1.6` 可能回 "normal"，
+  // parseFloat 得 NaN，比较就恒假 —— 上一轮就是这么假红的）
+  await statusCall(STATUS_A, "set", "字");
+  await waitStatusSlot();
+  const b3Box1 = await bubbleBox();
+  r.check("单行盒高 > 0（元素真渲染了，防 0 === 0 空转）", true, b3Box1.height > 0);
+  r.check("单行盒不越出窗口上沿", true, b3Box1.top >= 0);
+  r.check("宽度没超出立绘宽（既有断言不破）", true, b3Box1.width <= b3Box1.maxWidth + 1);
+
+  const b3Long = await statusCall(STATUS_A, "set", "超长".repeat(40));
+  await waitStatusSlot();
+  const b3Box2 = await bubbleBox();
+  const b3Dom = await c.ev(`(() => { const b = document.getElementById('pet-bubble'); return { text: b.textContent, scroll: b.scrollWidth, client: b.clientWidth }; })()`);
+  r.check("超长输入照样只占一行（盒高 = 单行盒高）", true, Math.abs(b3Box2.height - b3Box1.height) <= 1);
+  r.check("超长输入仍不越出窗口上沿", true, b3Box2.top >= 0);
+  r.check("超长输入仍不超出立绘宽", true, b3Box2.width <= b3Box2.maxWidth + 1);
+  r.check("输入侧按码点截到 20（返回值自证）", 20, [...String(b3Long.v ?? "")].length);
+  r.check("界面上的文本就是那 20 个字（末尾被截掉，不是原样 80 字）", true,
+    b3Dom.text === String(b3Long.v ?? "") && [...b3Dom.text].length === 20);
+  r.info("超长行的可视溢出（scrollWidth/clientWidth）", `${b3Dom.scroll}/${b3Dom.client}`);
+
+  // M4 的可观测性前提：必须有一个「20 码点以内、但宽度超过气泡」的输入 —— 否则单独去掉 nowrap 不可观测
+  // （20 个全角汉字约 264px，正好卡在 266 上限内）。20 个 emoji 按全角宽排版会溢出：
+  // 带 nowrap 时它只溢出（scroll > client），去掉 nowrap 就会折行（盒高变大）。这条基线就是那个证明。
+  const b3Wide = await statusCall(STATUS_A, "set", "🐱".repeat(20));
+  await waitStatusSlot();
+  const b3BoxWide = await bubbleBox();
+  const b3WideDom = await c.ev(`(() => { const b = document.getElementById('pet-bubble'); return { scroll: b.scrollWidth, client: b.clientWidth, len: [...b.textContent].length }; })()`);
+  r.check("20 个宽字符输入：仍是单行（盒高 = 单行盒高）", true, Math.abs(b3BoxWide.height - b3Box1.height) <= 1);
+  r.check(
+    "20 个宽字符确实溢出气泡（M4「单独去掉 nowrap 会折行」的可观测性前提）",
+    true,
+    b3WideDom.scroll > b3WideDom.client,
+  );
+  r.check("宽字符输入也没被 20 码点上限截短", 20, b3WideDom.len);
+  r.check("宽字符输入的返回值也是那 20 个字符（没被截短）", "🐱".repeat(20), b3Wide.v);
+
+  const b3Escaped = await statusCall(STATUS_A, "set", "<b>x</b>");
+  const b3Html = await c.ev(`document.getElementById('pet-bubble').innerHTML`);
+  const b3AsText = await bubbleNow();
+  r.check("尖括号走 textContent（界面显示字面文本）", "<b>x</b>", b3AsText.text);
+  r.check("设置返回的就是这串字面文本（没被当成标记处理）", "<b>x</b>", b3Escaped.v);
+  r.check("没有真的建出 <b> 元素（标签被转义）", true, /&lt;b&gt;/.test(b3Html) && (await c.ev(`document.getElementById('pet-bubble').querySelector('b') === null`)));
+
+  const b3Bad = await statusCall(STATUS_A, "set", 123);
+  r.check("非字符串/非 null 直接拒", true, b3Bad.ok === false && /只接受字符串或 null/.test(String(b3Bad.e)));
+  const b3Empty = await statusCall(STATUS_A, "set", "  \n\t ");
+  r.check("清洗后为空 → 拒（不悄悄清掉）", true, b3Empty.ok === false && /非空文本内容/.test(String(b3Empty.e)));
+  const b3Folded = await statusCall(STATUS_A, "set", "a\u0007b\u0000c\td");
+  r.check("控制字符（含 BEL/NUL/制表）一律折叠成空格", "a b c d", b3Folded.v);
+
+  const b3A1 = await statusCall(STATUS_A, "set", "A行");
+  const b3B1 = await statusCall(STATUS_B, "set", "B行");
+  r.check("A 设了显示 A、B 设了显示 B（最近设置的生效）", "B行", (await bubbleNow()).text);
+  r.check("两次设置都拿到了生效值", "A行|B行", [b3A1.v, b3B1.v].join("|"));
+  const b3AgainA = await statusCall(STATUS_A, "set", "A行");
+  r.check("重复设置相同文本不改回落顺序（B 仍在上，防刷）", "B行", (await bubbleNow()).text);
+  r.check("重复设置照样返回生效值（幂等只作用在顺序上）", "A行", b3AgainA.v);
+  const b3BClear = await statusCall(STATUS_B, "clear");
+  r.check("B 清除后回落到 A 那条", "A行", (await bubbleNow()).text);
+  r.check("清除的返回值是 null（只关于自己那条）", null, b3BClear.v);
+  const b3AClear = await statusCall(STATUS_A, "clear");
+  r.check("A 清除的返回值也是 null", null, b3AClear.v);
+  r.check("A 也清掉后气泡收起", false, (await bubbleNow()).show);
+
+  // 台词优先：say 占槽 → 3.6s 后回位到常驻行；台词期间 setStatus 不打断正在显示的台词
+  await statusCall(STATUS_A, "set", "常驻1");
+  await statusCall(STATUS_A, "say", "一句台词");
+  r.check("台词插进来就占用槽（常驻行被临时替换）", "一句台词", (await bubbleNow()).text);
+  await statusCall(STATUS_A, "set", "常驻2");
+  r.check("台词显示期间状态行只是被替换，不打断这句台词", "一句台词", (await bubbleNow()).text);
+  await sleep(3_700);
+  r.check("3.6s 后台词收起、常驻行回位（回到最新那条内容）", "常驻2", (await bubbleNow()).text);
+
+  // 隐藏后恢复：状态行按当前状态回来
+  const b3Hidden = await call("set_pet_hidden", { hidden: true });
+  r.check("宠物窗能隐身（既有命令）", true, b3Hidden.ok === true);
+  await sleep(400);
+  const b3Shown = await call("set_pet_hidden", { hidden: false });
+  r.check("宠物窗能回来", true, b3Shown.ok === true);
+  await sleep(600);
+  r.check("隐藏再显示之后常驻行仍在（按当前状态回来）", "常驻2", (await bubbleNow()).text);
+
+  // 撤权：失去 pet:say 之后那条行要摘掉并**正确回落到别人那条**；别人的行一概不动
+  await statusCall(STATUS_B, "set", "B行3");
+  await statusCall(STATUS_A, "set", "A行3");
+  r.check("撤权前 A 的行在最上（A 最后设置）", "A行3", (await bubbleNow()).text);
+  await revoke(STATUS_A);
+  const b3RevokeBack = await waitUntil(
+    c,
+    `(() => { const b = document.getElementById('pet-bubble'); return b.classList.contains('show') && b.textContent === 'B行3'; })()`,
+    5_000,
+  ).catch(() => false);
+  r.info("撤权 A 后回到 B行3 的耗时", b3RevokeBack ? "5s 内" : "5s 未回落");
+  r.check("撤销 A 的授权后 A 的行被摘掉、回落到 B 的行", "B行3", (await bubbleNow()).text);
+  // 「不误删别人的行 / 撤无关权限不误清」的反面证据：B 的行既没被摘也没被改
+  r.check("撤 A 的权不动 B 的行", "B行3", (await bubbleNow()).text);
+  // 无权之后不能再设置：会重新弹同意框，拒掉就不该出现这一行（不绕过授权）
+  const b3NoGrant = statusCall(STATUS_A, "set", "偷挂行").catch((err) => ({ ok: false, e: String(err?.message ?? err) }));
+  const b3ConsentAgain = await driveConsent("deny", STATUS_A).catch(() => null);
+  const b3NoGrantRes = await b3NoGrant;
+  r.info("撤权后再设置的同意框", b3ConsentAgain ? "弹了（已拒）" : "没弹");
+  r.check(
+    "撤权后无权再设置常驻行：拒掉同意框就拿不到这一行",
+    "true|false",
+    [b3NoGrantRes.ok === false, (await bubbleNow()).text === "偷挂行"].join("|"),
+  );
+
+  // 回收：停用要走**真的下线路径**。裸写启停清单不会让宠物窗 reconcile（watchEnabled 只缓存，
+  // reconcile 只在启动与 host:plugin-toggled 时跑）—— 上一轮就是这么「停用」了个寂寞。
+  // 这里直接调运行时导出的 deactivatePlugin：它和用户点开关最终进的是同一个 doDeactivate（disposeAll 在那里）。
+  const b3Deactivate = (id) =>
+    c.ev(`(async () => { const rt = await import('/src/runtime/plugin-runtime.ts'); await rt.deactivatePlugin(${JSON.stringify(id)}); return true; })()`);
+  await statusCall(STATUS_B, "set", "B行");
+  await b3Deactivate(STATUS_A);
+  await waitUntil(
+    c,
+    `(() => { const b = document.getElementById('pet-bubble'); return b.classList.contains('status') && b.textContent === 'B行'; })()`,
+    5_000,
+  ).catch(() => false);
+  r.check("停用 A 后 B 的行不受影响（仍是 B行）", "B行", (await bubbleNow()).text);
+  // 真正的「A 被摘掉」证据：把 B 也清掉之后气泡必须收起 —— 若 A 的条目还在（只是被压在下面），
+  // 这一刻会露出 "A行"/"常驻2"
+  await statusCall(STATUS_B, "clear");
+  const b3Reveal = await bubbleNow();
+  r.info("清掉 B 后的气泡", b3Reveal.show ? `show|${b3Reveal.text}` : "hidden");
+  r.check(
+    "清掉 B 之后气泡收起（说明 A 停用时条目确实被摘掉，不是只被压在下面）",
+    false,
+    b3Reveal.show,
+  );
+  // 「只测停用回收」：这一路**全程无撤权、无 Worker 崩溃、无 setStatus(null)** —— 只有停用回收能清掉它。
+  // 停用回收有两条冗余路径（桥里 register 的兜底回收 + worker-plugin-host 的 terminate 收尾），
+  // 只破坏其中一条会被另一条掩盖（这点已由变异 M3 实测确认）；所以这条断言要能挡住「两条都断」。
+  await statusCall(STATUS_B, "set", "B行2");
+  const b3T0 = Date.now();
+  await b3Deactivate(STATUS_B);
+  const b3Gone = await waitUntil(
+    c,
+    `!document.getElementById('pet-bubble').classList.contains('show')`,
+    5_000,
+  ).catch(() => false);
+  const b3Elapsed = Date.now() - b3T0;
+  r.info("停用 B 到气泡收起（轮询）", `${b3Elapsed}ms · ${b3Gone ? "5s 内收起" : "5s 未收起"}`);
+  r.check("停用回收在 5s 内生效（只测停用这条路径，轮询判据）", true, b3Gone);
+  const b3AfterAllOff = await bubbleNow();
+  r.info("停用 B 后的气泡", b3AfterAllOff.show ? `show|${b3AfterAllOff.text}` : "hidden");
+  r.check(
+    "停用 B → 完全收起（轮询判据，没靠加大 sleep）",
+    false,
+    b3AfterAllOff.show,
+  );
+
+  // 回收不止「停用」一条路：重载 / 移出启停清单 / Worker 崩溃 都得把行摘掉（各自实测，轮询判据，不加大 sleep）
+  const b3LineGoneWithin5s = async (label) => {
+    const t0 = Date.now();
+    const gone = await waitUntil(
+      c,
+      `!document.getElementById('pet-bubble').classList.contains('show')`,
+      5_000,
+    ).catch(() => false);
+    r.info(`${label} 到气泡收起（轮询）`, `${Date.now() - t0}ms · ${gone ? "5s 内收起" : "5s 未收起"}`);
+    r.check(`${label}：常驻行在 5s 内被摘掉`, true, gone);
+  };
+  const b3Activate = (id) =>
+    c.ev(`(async () => {
+      const rt = await import('/src/runtime/plugin-runtime.ts');
+      const ms = await window.__TAURI_INTERNALS__.invoke('plugins_list');
+      await rt.activatePlugin(ms.find((m) => m.id === ${JSON.stringify(id)}));
+      return true;
+    })()`);
+
+  // ① 重载（停用 + 装回同一份 manifest）：旧行必须摘掉；装回后仍能重新挂（授权不因重载丢失）
+  await statusCall(STATUS_B, "set", "B行4");
+  await b3Deactivate(STATUS_B);
+  await b3Activate(STATUS_B);
+  await b3LineGoneWithin5s("重载 B 后（旧行）");
+  const b3ReloadedSet = await statusCall(STATUS_B, "set", "B行5");
+  r.check(
+    "重载 B 之后还能重新挂行（授权未因重载丢失）",
+    "true|B行5",
+    [b3ReloadedSet.ok === true, (await bubbleNow()).text].join("|"),
+  );
+
+  // 「卸载」在宠物窗这一侧没有独立代码路径：启停清单的写入口只对设置窗开放 —— 卸载的下线回收
+  // 同样走 deactivate/terminate 那条（已在上面「停用」实测），故这里只把门禁本身钉住，不另造伪路径。
+  const b3ListWrite = await c.ev(`(async () => {
+    const rt = await import('/src/runtime/plugin-runtime.ts');
+    try { await rt.setEnabledIds(rt.getEnabled()); return "放行"; } catch (e) { return String(e && e.message ? e.message : e); }
+  })()`);
+  r.check("启停清单只能由设置窗改（宠物窗写被拒，故「卸载」不在此处另造路径）", true, /只有设置窗/.test(b3ListWrite));
+
+  // ③ Worker 崩溃：探针主动抛未捕获错误 → 宿主 onerror 那条兜底得把行摘掉。
+  // 真崩必然产生两条 console 记录（宿主 [worker-host] + Worker 侧 Uncaught），两条都点名本探针，
+  // 故这里按探针名过滤（verify-worker.mjs 的零噪音门同口径，B03 获批）。
+  await statusCall(STATUS_B, "set", "B行6");
+  await statusCall(STATUS_B, "boom");
+  await b3LineGoneWithin5s("Worker 崩溃后");
+
+  // 收尾：改回原清单、撤销授权。fixture 目录**留到 finally 再删** —— 组尾就删会让
+  // 超时调用的迟到回包变成 `bus relay failed: … 没有安装`（verify:worker 的零噪音门会红）。
+  await setEnabled(enabledBeforeB3);
+  for (const id of [STATUS_A, STATUS_B]) {
+    await revoke(id);
+  }
+
   r.group("宿主页面自身未产生 CSP 违规或未捕获异常");
   // 上面的递归测试会刻意打一条 console.error，它是被测行为的证据，不该混进这里的零容忍
   r.info("导航过渡期告警（reload 切断在飞 IPC 的产物，单独归类）", String(c.transitionNoise.length));
-  const unexpected = c.noise.filter((n) => !n.includes("派发递归"));
+  // 本组故意打崩 Worker 的两条记录属被测行为的证据，按探针名过滤（同 verify-worker 口径）
+  const unexpected = c.noise.filter((n) => !n.includes("派发递归") && !n.includes("B3 崩溃探针"));
   r.check("无", 0, unexpected.length);
   for (const n of unexpected) console.log("   " + n);
 } catch (err) {
@@ -1882,6 +2223,9 @@ export function unmount() {}
   console.error("\n验证中断: " + String(err?.message ?? err).split("\n").slice(0, 3).join(" | "));
 } finally {
   removeFixtures(PLUGINS_DIR);
+  // B3 那两个探针目录（zz.status / zz.status2）**不在这里删**：删掉之后，插件迟到的 `:res`
+  // 会在下一套件里中继成 `bus relay failed: … 插件没有安装`（verify:worker 的零噪音门会红）。
+  // 残留由上层的「构建前后清掉残留探针插件」那一步统一收拾（e2e.yml，2026-10-18 加）。
   // 探针留在宿主 realm 那条例外只服务于本套件的页面全局断言，不该活到下一轮真实使用里
   await c?.ev(`localStorage.removeItem('host:realm-plugin-host')`).catch(() => undefined);
   await c?.ev(`localStorage.removeItem('host:widget-realm-plugin-host')`).catch(() => undefined);

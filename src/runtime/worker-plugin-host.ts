@@ -7,6 +7,7 @@
 import PluginWorker from "./plugin-worker.ts?worker";
 import type { PluginContext } from "../../packages/sdk";
 import { buildContext, createAgentHooksApi } from "./bridge";
+import { petController } from "../pet/host";
 import { asHostError } from "./host-error";
 import type { PluginManifest } from "./plugin-runtime";
 import { pluginFileUrl, pluginFileVersion } from "./plugin-url";
@@ -72,6 +73,9 @@ class WorkerPluginHost {
     // Worker 里的未捕获错误（含 terminate 之前的 reject）不该静默消失
     worker.onerror = (event: ErrorEvent) => {
       console.error(`[worker-host] ${manifest.id}:`, event.message);
+      // B3：Worker 崩了不走 deactivate，常驻行得在这儿摘掉 —— 否则宠物旁会一直挂着一行
+      // 已经没有任何代码在写的状态
+      petController()?.setStatus(manifest.id, null);
     };
 
     try {
@@ -109,6 +113,9 @@ class WorkerPluginHost {
     for (const ack of session.acks.values()) clearTimeout(ack.timer);
     session.acks.clear();
     session.worker.terminate();
+    // B3：terminate 这条收尾（停用 / 启动失败）也把常驻行兜掉。正常停用那条路上
+    // doDeactivate 的 disposeAll 会做同一件事，重复摘是幂等的
+    petController()?.setStatus(session.pluginId, null);
   }
 
   private post(session: Session, message: HostToWorker): void {
@@ -179,7 +186,7 @@ class WorkerPluginHost {
   }
 
   /**
-   * 派发表：20 个「纯参数进、纯值出」的方法逐条点名，返回类型写成 `Record<ProxiedMethod, …>`
+   * 派发表：22 个「纯参数进、纯值出」的方法逐条点名，返回类型写成 `Record<ProxiedMethod, …>`
    * —— 协议里加了方法名而这里没实现，当场编译不过。
    * bus.subscribe 与 log 不在表里：它们的参数或返回里有函数，只能特判。
    */
@@ -198,6 +205,7 @@ class WorkerPluginHost {
       "widget.update": (args) => ctx.widget.update(args[0]),
       "pet.react": (args) => ctx.pet.react(args[0] as Parameters<typeof ctx.pet.react>[0]),
       "pet.say": (args) => ctx.pet.say(String(args[0])),
+      "pet.setStatus": (args) => ctx.pet.setStatus((args[0] ?? null) as string | null),
       "http.request": (args) => ctx.http.request(String(args[0]), args[1] as never),
       "notify.show": (args) => ctx.notify.show(String(args[0]), String(args[1])),
       "overlay.show": (args) => ctx.overlay.show(args[0] as never),

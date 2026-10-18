@@ -56,14 +56,71 @@ function syncLayout(): void {
   style.setProperty("--pet-bubble-bottom", `${Math.round(window.innerHeight - top - 8)}px`);
 }
 
-/* ---------- 台词气泡（wm-pop 风格弹出） ---------- */
+/* ---------- 气泡槽：常驻状态行 + 台词（B3） ---------- */
+// 一个槽、两种内容。常驻行按 pluginId 各占一条（有序表，界面显示最近设置的那条）；台词插进来时
+// 临时占用槽，3.6s 后回位到常驻行（ADR-0003 修订）—— 台词期间常驻行只是被替换，不是被清除。
+const BUBBLE_HOLD_MS = 3600;
+/** pluginId → 该插件的常驻行。Map 的插入序就是「最近设置」的顺序：重设要 delete + set 挪到队尾 */
+const statusLines = new Map<string, string>();
+/** 正在显示的台词；null = 此刻没台词占着槽 */
+let ephemeral: string | null = null;
 let bubbleTimer: number | undefined;
-function say(text: string): void {
-  if (!text) return;
+
+/** 此刻该显示的常驻行：最近设置的那条（一条都没有就是 null） */
+function statusLine(): string | null {
+  let last: string | null = null;
+  for (const text of statusLines.values()) last = text;
+  return last;
+}
+
+/**
+ * 唯一的渲染口：槽里显示什么只有这里说了算。
+ * 一律走 `textContent`（绝不碰 innerHTML）—— 插件交上来的是文本，不是标记（传 `<b>x</b>` 就显示这几个字符）。
+ * 只有常驻行时挂 `.status`（CSS 单行化 + 省略号）：台词可以折行，常驻行不许。
+ */
+function renderBubble(): void {
+  const text = ephemeral ?? statusLine();
+  bubble.classList.toggle("status", ephemeral === null && text !== null);
+  if (text === null) {
+    bubble.textContent = "";
+    bubble.classList.remove("show");
+    return;
+  }
   bubble.textContent = text;
   bubble.classList.add("show");
+}
+
+/** 弹一句台词：临时占用槽，到点回位到常驻行 */
+function say(text: string): void {
+  if (!text) return;
+  ephemeral = text;
+  renderBubble();
   window.clearTimeout(bubbleTimer);
-  bubbleTimer = window.setTimeout(() => bubble.classList.remove("show"), 3600);
+  bubbleTimer = window.setTimeout(() => {
+    ephemeral = null;
+    renderBubble(); // 回位：常驻行还在就显示它，都清了就收起
+  }, BUBBLE_HOLD_MS);
+}
+
+/** 宿主自己的随机台词让路：挂着常驻行时不弹（用户主动触发的台词照旧走 `say`） */
+function sayRandom(text: string): void {
+  if (statusLine() !== null) return;
+  say(text);
+}
+
+/** 插件面 `ctx.pet.setStatus` 的落点：按 pluginId 增删自己那条，然后把槽重画一次 */
+function setStatus(pluginId: string, text: string | null): string | null {
+  if (text === null) {
+    statusLines.delete(pluginId);
+  } else if (statusLines.get(pluginId) !== text) {
+    // delete + set：重设要把这条挪到队尾，「最近设置的那条」才认得出来。
+    // **内容没变就不动顺序**（幂等）—— 否则插件高频重设同一个值就能一直占着队首，
+    // 把别的插件的行永久压在下面，那是刷而不是状态更新。
+    statusLines.delete(pluginId);
+    statusLines.set(pluginId, text);
+  }
+  renderBubble(); // 正在显示的台词不受影响：ephemeral 非空时它照旧占着槽
+  return text;
 }
 
 /* ---------- 交互：按住拖拽 vs 戳一戳 ---------- */
@@ -214,7 +271,7 @@ function startAux(): void {
   if (!stopThrough) stopThrough = installClickThrough({ spriteRect, isDragging: () => dragEngaged });
   if (!idleChat) {
     idleChat = window.setInterval(() => {
-      if (pet.action === "idle" && Math.random() < 0.4) say(pickLine("idle"));
+      if (pet.action === "idle" && Math.random() < 0.4) sayRandom(pickLine("idle"));
     }, 45_000);
   }
 }
@@ -266,11 +323,12 @@ async function init(): Promise<void> {
   skinUrl = await fetchActiveSkin();
   sprites = await loadSpriteSet(skinUrl ?? "");
   pet = new PetStateMachine(sprites);
-  pet.onSleep = () => say(pickLine("waiting"));
+  pet.onSleep = () => sayRandom(pickLine("waiting"));
 
   registerPetController({
     react: (action) => pet.request(action),
     say: (text) => say(text),
+    setStatus,
   });
 
   void initRuntime();
@@ -292,7 +350,7 @@ async function init(): Promise<void> {
   // dpr 变化（换显示器 / 改系统缩放）靠这条媒体查询感知，resize 事件不一定触发
   watchDpr();
   document.addEventListener("visibilitychange", () => setRunning(!document.hidden));
-  window.setTimeout(() => say(pickLine("waving")), 700);
+  window.setTimeout(() => sayRandom(pickLine("waving")), 700);
 }
 
 void init();

@@ -2,7 +2,7 @@
 
 清单第 42 项 L1 要「Web Worker 插件宿主：ADR + 原型（插件身份由宿主分配，不可伪造）」。
 **决定：把插件代码从承载窗的 realm 搬进 module Worker；插件身份由宿主在创建 Worker 时分配并绑定到那条
-`MessagePort`，Worker 侧不再有 `invoke` 可调；面向插件的 23 个方法改走宿主代理；
+`MessagePort`，Worker 侧不再有 `invoke` 可调；面向插件的 24 个方法改走宿主代理；
 widget 的容器与 Shadow DOM 仍留在宿主 realm，Worker 只发渲染指令。**
 
 **为什么算决策**：这是一次真实的换轨，不是"再优化一下"。它会推翻本仓一条写了很久的自我承认 ——
@@ -40,7 +40,7 @@ T10 数出的可伪造点里，前 6 条都源于同一个事实：**Worker 里�
 
 ## 契约（L1 原型必须遵守的形状）
 
-- **接口面 = 23 个方法**：`buildContext`（`bridge.ts:120-258`）暴露的 19 个（bus 2 / storage 3 / ble 5 / widget 1 / pet 2 /
+- **接口面 = 24 个方法**：`buildContext`（`bridge.ts:120-258`）暴露的 20 个（bus 2 / storage 3 / ble 5 / widget 1 / pet 3 /
   http 1 / notify 1 / overlay 3 / log 1）加 `createAgentHooksApi` 的 4 个（A02 为设置页四选一追加 `agentHooks.set`）。（那份表不入库：每个方法背后的命令名我逐条核过都在 `lib.rs:96` 的 49 条注册表里，缺失 0。）Worker 版桥必须覆盖这张表，不许多也不许多年。
   **追加的方法只许是「设置页需要的新方法名」**，对撞与匹配逻辑一律不动（PM 2026-10-17 的授权口径）；改这张表的顺序是
   **先改本 ADR 与 `unit-worker-host.mjs` 的文件头，再动代码**，且那条「恰好等于完整名单」的断言只许变严不许变松。
@@ -154,5 +154,21 @@ dev 用 `npm run dev:debug`（无 CSP），打包版用 `tauri build --no-bundle
   `verify-isolation` 里那批「越权尝试被拒」的断言要**新增而不是替换**——同 realm 越权用例全部被拒是 L2 的验收，本波先把判据立起来。
   拆两步的依据是 T16 取证（`reference/T16-summary.md`）：**阶段一不用改任何插件代码** ——
   四个入口闭包共 20 个文件对宿主 realm 零依赖（B=0、C=0），把 Worker 变成默认即可收口第 1/2/3/5 条；
-  **阶段二才是硬骨头** —— 338 行 DOM 全在 widget 图，缺的是渲染指令词汇表与一条反向事件通道（`el-on` 17 行在 23 表里没有对应物）。
+  **阶段二才是硬骨头** —— 338 行 DOM 全在 widget 图，缺的是渲染指令词汇表与一条反向事件通道（`el-on` 17 行在 24 表里没有对应物）。
 - L1/L2 都不改能力名单与授权模型（K3/K4 交付的那套），改的只是「谁在替插件说话」。
+
+## 增项记录（2026-10-17，B3 常驻状态行）
+
+- **方法表从 23 加到 24**（A02 先合拿了 23，B3 的 `pet.setStatus` 按 PM 口径成为第 24）：新增 `pet.setStatus`（命名空间 `pet`）。宿主侧实现落在
+  `src/runtime/bridge.ts` 的 `pet` 段（**能力仍是 `pet:say`，不新增能力**），派发表加在
+  `src/runtime/worker-plugin-host.ts`，Worker 侧代理加在 `src/runtime/plugin-worker.ts`，
+  表本体在 `src/runtime/plugin-worker-protocol.ts`。
+- **为什么**：B3（气泡常驻状态行）要让插件把一行状态长期挂在宠物旁。插件**入口默认就在 Worker 里跑**，
+  名字不进表等于 Worker 里的入口一个都调不到这个方法（A9b 的 agent 桥正是这么用）。
+- **这是明确的边界扩张，不是放宽校验**：表的闭集口径不变（「表即插件能说的全部话」），
+  `tests/unit/unit-worker-host.mjs` 照旧**逐字钉死「恰好等于这 24 个名字」**（不改成「包含」「至少」），
+  计数与文件头文案同步改成 24。
+- **本文两处计数已同步为 24**（第 5 行、第 43 行；A02 先合拿 23、B3 拿 24 的 PM 口径，2026-10-18）。原记：
+  22→23 的旧口径，rebase 到 dd715d6 后作废。
+- 其余口径不变：`pet.setStatus` 仍只能由**插件入口**调用（`WIDGET_CALL_METHODS` 不加名字，
+  widget 的渲染契约不动，见 ADR-0008）。

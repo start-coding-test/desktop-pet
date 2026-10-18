@@ -1,8 +1,8 @@
 // L1 原型（ADR-0006）的离线契约单测：Worker 通道这张表就是插件的全部发言面。
 //
 // 三层钉法：
-//   ① 表本身 —— 23 个名字逐条钉死，且每个叶子名都能在 packages/sdk/index.d.ts 里找到成员声明；
-//   ② 宿主派发表完备 —— 21 个「纯参数进纯值出」的方法在 worker-plugin-host.ts 里必须逐条点名；
+//   ① 表本身 —— 24 个名字逐条钉死，且每个叶子名都能在 packages/sdk/index.d.ts 里找到成员声明；
+//   ② 宿主派发表完备 —— 22 个「纯参数进纯值出」的方法在 worker-plugin-host.ts 里必须逐条点名；
 //   ③ 隔离前提 —— Worker 侧那两个文件里不许出现 @tauri-apps 或 host-error（一旦漏进去，
 //      裸 IPC 就跟着 bundle 进了 Worker realm，本波要收口的洞当场作废）。
 //
@@ -24,7 +24,8 @@ const workerSrc = read("../../src/runtime/plugin-worker.ts");
 const runtimeSrc = read("../../src/runtime/plugin-runtime.ts");
 const sorted = (list) => [...list].sort();
 
-/** ADR-0006 契约里那张 23 个方法的表，逐字钉死（改名、增删都要先改 ADR） */
+/** ADR-0006 契约里那张 24 个方法的表，逐字钉死（改名、增删都要先改 ADR）
+ *  —— 第 23 个是 B3 的 `pet.setStatus`，见 ADR-0006「增项记录（2026-10-17）」 */
 const EXPECTED = [
   "agentHooks.install",
   "agentHooks.set",
@@ -45,6 +46,7 @@ const EXPECTED = [
   "overlay.show",
   "pet.react",
   "pet.say",
+  "pet.setStatus",
   "storage.delete",
   "storage.get",
   "storage.set",
@@ -52,9 +54,9 @@ const EXPECTED = [
 ];
 
 group("Worker 通道方法表");
-deep("方法表恰好是既定的 23 个名字", sorted(proto.PLUGIN_WORKER_METHODS), EXPECTED);
-eq("方法表条数", proto.PLUGIN_WORKER_METHODS.length, 23);
-eq("方法表无重复", new Set(proto.PLUGIN_WORKER_METHODS).size, 23);
+deep("方法表恰好是既定的 24 个名字", sorted(proto.PLUGIN_WORKER_METHODS), EXPECTED);
+eq("方法表条数", proto.PLUGIN_WORKER_METHODS.length, 24);
+eq("方法表无重复", new Set(proto.PLUGIN_WORKER_METHODS).size, 24);
 for (const name of EXPECTED) {
   const leaf = name === "log" ? "log" : name.split(".")[1];
   check(`SDK 类型面里有 "${leaf}("`, sdkSrc.includes(`${leaf}(`), `packages/sdk/index.d.ts 里找不到 ${leaf}(`);
@@ -68,7 +70,7 @@ check(
 
 group("宿主派发表完备");
 const proxied = EXPECTED.filter((name) => name !== "bus.subscribe" && name !== "log");
-eq("表内需实现的方法数", proxied.length, 21);
+eq("表内需实现的方法数", proxied.length, 22);
 for (const name of proxied) {
   check(`worker-plugin-host.ts 点名实现了 "${name}"`, hostSrc.includes(`"${name}":`), "派发表里没有这一条");
 }

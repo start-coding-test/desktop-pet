@@ -72,7 +72,7 @@ export async function deactivate() { /* 停用/移除时调用 */ }
 | `http` | `ctx.http.request` | 出站请求，**按域名逐个再授权**（`http:<host>`，键不带默认端口：`https://x.com` 的键是 `x.com`）。`body` 按响应 Content-Type 的 charset 解码：目前支持 UTF-8 与 GBK/GB2312/GB18030（新浪、腾讯行情这类 GBK 接口能直接拿到中文），其余 charset 与不带 charset 的响应仍按 UTF-8 lossy 解 | 风险 |
 | `notify` | `ctx.notify.show` | 系统通知 | — |
 | `pet:react` | `ctx.pet.react` | 让宠物插播一个状态，参数只能是 petdex 的九个状态之一：`idle` `running-right` `running-left` `waving` `jumping` `failed` `waiting` `running` `review`（其余名字会被桥拒绝） | — |
-| `pet:say` | `ctx.pet.say` | 让宠物弹一句台词 | — |
+| `pet:say` | `ctx.pet.say` / `ctx.pet.setStatus` | `say`：弹一句台词（3.6 秒收起）。`setStatus`：宠物旁**长期**挂一行状态（B3，与台词共用同一个气泡槽：台词插进来时它被临时替换，收起后回位）—— 长度上限 20 码点、单行显示，多插件各占一条，详见 §4.1 | — |
 | `agent:hooks` | `ctx.host.agentHooks.{status,install,uninstall,set}` | 查询/安装/卸载本机编码 Agent 的 hook 配置，并在 Qoder / ZCode / Codex / WorkBuddy 之间**单选切换**（同一时间只联动一个，ADR-0002）。写的是各家自己的配置文件（Qoder `~/.qoder*/settings.json`、ZCode `~/.zcode/cli/{config,setting}.json`），增删只动自家 `--pet-hook … --agent <id>` 条目；`set` 先卸旧再装新，卸旧失败就停在原状态并 reject。**只在插件设置页（`settings` 区 widget）可用**：`badge` / `overlay` 区与宠物窗里没有 `ctx.host`。首次调用弹同意框；这是本项目第一个"能改用户其他应用配置"的能力，边界见 ADR-0001 | 风险 |
 
 ## 4. ctx API
@@ -101,8 +101,28 @@ export async function activate(ctx) {
   ctx.notify.show("同步完成", "本次 1.2k tokens");
   ctx.pet.react("jumping"); // 九状态之一：idle/running-right/running-left/waving/jumping/failed/waiting/running/review
   ctx.pet.say("同步好啦");
+
+  // 常驻状态行（B3）：长期挂在宠物旁；传 null 清除。详见 §4.1
+  await ctx.pet.setStatus("5h 63% · 1:12");
 }
 ```
+
+### 4.1 常驻状态行 `ctx.pet.setStatus`（B3）
+
+```ts
+setStatus(text: string | null): Promise<string | null>
+```
+
+- **语义**：把一行状态**长期**挂在宠物旁。与 `ctx.pet.say` 共用同一个气泡槽 —— 台词进来时它被临时替换，台词 3.6 秒收起后**回位**（不是被清除）。返回值只关于**你自己那一条**：设置时是生效后的文本（可能被截断），清除时是 `null`；界面上此刻显示的是不是它，由下面的回落规则决定。
+- **清除**：传 `null`。**别拿空串当清除** —— 清洗后为空会被拒（`setStatus 需要非空文本内容（清除请传 null）`）；非字符串、非 `null` 也被拒。宠物本体未初始化时与 `say` 一样 reject。
+- **谁能调**：只有**插件入口**（`index.js` 里的 `ctx.pet`）。widget 拿不到这个方法（渲染契约里没有它）；widget 要挂行就发自己的 `:cmd` topic 给入口，由入口调用。能力上**复用 `pet:say`**，不需要新声明、不会多弹一次同意框。
+- **长度与显示**：清洗（换行/制表以及所有控制字符折叠成空格 → 压空格 → `trim`）后按**码点**取前 **20** 个。20 只是输入侧的预防 —— **单行由宿主保证**（CSS 单行化 + 省略号），所以别把「不超过 20 字」当成一定不被截断的保证，超出立绘宽的部分在界面上显示为省略号。
+- **渲染**：一律按文本渲染（传 `<b>x</b>` 显示的就是这串字符，不会被当成标记）。
+- **多插件同时设置**：**各占一条**，界面显示**最近设置**的那条。`null` 只删你自己那条，删完回落到剩下最近的一条；都没了才收起。**重复设置相同文本不改变顺序**（幂等）—— 靠高频重设霸占队首是无效的，状态没变时也不必反复设置。
+- **频率**：宿主不做丢包式节流（丢新值比抖一下更糟）。约定：**只在状态真变时设置**，两次设置间隔建议 ≥ 1 秒。
+- **回收**：插件停用 / 卸载 / 撤销授权 / 重载 / Worker 崩溃或被收 —— 宿主都会摘掉它那条，不需要你写清理代码。
+- **随机台词让路**：你挂着常驻行时，宿主自己的随机台词（挂机打盹、闲置自言自语、启动问候）不弹；用户戳宠物这类**主动**触发的台词照旧优先占用槽，3.6 秒后回到你的常驻行。
+- **几何**：气泡永不越出立绘宽、不加高窗口、不缩字号；常驻行压成单行（台词仍可折行）。
 
 ### topic 命名空间规则
 

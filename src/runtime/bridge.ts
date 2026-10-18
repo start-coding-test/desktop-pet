@@ -43,10 +43,36 @@ interface ManifestLike {
  */
 const granted = new Map<string, Set<string>>();
 
+/** 常驻状态行的输入侧上限（码点）。20 是预防，不是「不裁切」的证据 —— 单行由 CSS 与几何断言保证。 */
+const STATUS_MAX_CHARS = 20;
+
+/** 已经为哪些插件登记过「下线时摘掉它那条常驻行」的兜底回收（回收跑过就移除，见 setStatus） */
+const statusTracked = new Set<string>();
+
 // 撤销授权后必须丢掉**本窗口**的桥缓存。运行时（宠物窗）的监听在 plugin-runtime 里，
 // 但设置窗里的插件设置页用的是本窗口的模块实例，而撤销入口就在设置窗 —— 漏了这条，
 // 缓存会一直说「已授权」，设置区插件的下一次调用要等整窗重载才会重新走能力校验。
-void listen<string>("host:permission-revoked", (e) => invalidatePermissions(e.payload)).catch(() => undefined);
+void listen<string>("host:permission-revoked", (e) => {
+  invalidatePermissions(e.payload);
+  void dropStatusIfUnauthorized(e.payload);
+});
+
+/**
+ * B3：撤权之后不许再留着常驻行 —— 但要**精确**判：只有这个插件确实**不再持有** `pet:say` 才摘它那条行。
+ * 撤的是别的权限、或撤的是别的插件，一概不动。
+ *
+ * 为什么问宿主而不是看本地缓存：撤回的是宿主的授权表这一事实，本地 `granted` 缓存刚被清掉，
+ * 拿不出「现在到底还持有什么」。查不到（命令失败）时**什么都不做** —— 宁可留一行，
+ * 也不能因为一次查询失败去误清别人的行。
+ */
+async function dropStatusIfUnauthorized(pluginId: string): Promise<void> {
+  try {
+    const held = await hostCall<boolean>("permission_check", { pluginId, capability: PET_SAY });
+    if (held !== true) petController()?.setStatus(pluginId, null);
+  } catch {
+    /* 见上：查询失败不清 */
+  }
+}
 
 export function invalidatePermissions(pluginId?: string): void {
   if (pluginId) granted.delete(pluginId);
@@ -210,6 +236,40 @@ export function buildContext(manifest: ManifestLike): PluginContext {
           .slice(0, 200);
         if (!clean) throw new Error(`[${pid}] say 需要非空文本内容`);
         requireController().say(clean);
+      }),
+      /**
+       * 常驻状态行（B3）：与 `say` 共用气泡槽，但长驻 —— 台词插进来时被临时替换，3.6s 后回位。
+       * 校验与清洗都在这一层（插件侧没有可绕过的入口，widget 也拿不到这个方法）：
+       * - 只有 `null` 表示清除；非字符串、非 null 直接拒
+       * - 换行/制表**以及其余控制字符**（C0 / C1）一律折叠成空格，再压空格、trim
+       * - 按**码点**取前 `STATUS_MAX_CHARS` 个：20 只是输入侧的预防，单行由 CSS 保证
+       * - 清洗后为空 → 拒（不悄悄清掉，免得插件传个空串就把行清了）
+       */
+      setStatus: gated(manifest, PET_SAY, async (text: unknown) => {
+        if (text !== null && typeof text !== "string") {
+          throw new Error(`[${pid}] setStatus 只接受字符串或 null（清除请传 null）`);
+        }
+        let applied: string | null = null;
+        if (text !== null) {
+          // `\p{Cc}` 就是「控制字符」那一类（C0 / DEL / C1），比手写 \u0000-\u001f 之类的区间短且不会漏
+          const clean = text
+            .replace(/\p{Cc}/gu, " ")
+            .replace(/\s{2,}/g, " ")
+            .trim();
+          const capped = Array.from(clean).slice(0, STATUS_MAX_CHARS).join("");
+          if (!capped) throw new Error(`[${pid}] setStatus 需要非空文本内容（清除请传 null）`);
+          applied = capped;
+        }
+        // 兜底回收：插件下线（停用 / 卸载 / 撤销授权 / 重载）由这里的登记摘掉它那一条。
+        // 回收跑过就把标记清掉，重新启用后再设置还能重新登记。
+        if (applied !== null && !statusTracked.has(pid)) {
+          statusTracked.add(pid);
+          register(pid, () => {
+            statusTracked.delete(pid);
+            petController()?.setStatus(pid, null);
+          });
+        }
+        return requireController().setStatus(pid, applied);
       }),
     },
 
