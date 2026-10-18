@@ -2156,9 +2156,9 @@ export function deactivate() { live = false; }
   console.error("\n验证中断: " + String(err?.message ?? err).split("\n").slice(0, 3).join(" | "));
 } finally {
   removeFixtures(PLUGINS_DIR);
-  // B3 那两个探针目录不在 removeFixtures 的名单里，.gitignore 也没覆盖 zz.status* ——
-  // 中途崩了也得清掉，别把临时插件留成待提交文件
-  for (const id of ["zz.status", "zz.status2"]) rmSync(join(PLUGINS_DIR, id), { recursive: true, force: true });
+  // B3 那两个探针目录（zz.status / zz.status2）**不在这里删**：删掉之后，插件迟到的 `:res`
+  // 会在下一套件里中继成 `bus relay failed: … 插件没有安装`（verify:worker 的零噪音门会红）。
+  // 残留由上层的「构建前后清掉残留探针插件」那一步统一收拾（e2e.yml，2026-10-18 加）。
   // 探针留在宿主 realm 那条例外只服务于本套件的页面全局断言，不该活到下一轮真实使用里
   await c?.ev(`localStorage.removeItem('host:realm-plugin-host')`).catch(() => undefined);
   await c?.ev(`localStorage.removeItem('host:widget-realm-plugin-host')`).catch(() => undefined);
