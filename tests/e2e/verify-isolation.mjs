@@ -1875,9 +1875,12 @@ export function unmount() {}
   r.group("B3 常驻状态行：显示 / 单行几何 / 仲裁回落 / 台词优先 / 回收");
   const STATUS_A = "zz.status";
   const STATUS_B = "zz.status2";
-  const STATUS_INDEX = `export async function activate(ctx) {
+  const STATUS_INDEX = `let live = true;
+export async function activate(ctx) {
   const pid = ctx.pluginId;
-  const reply = (id, body) => ctx.bus.publish(pid + ":res", Object.assign({ id: id }, body));
+  // 下线之后不再回包：否则在途/迟到的那条 :res 会在下一套件里变成
+  // 'bus relay failed: … 插件没有安装'（verify:worker 的零噪音门会红）
+  const reply = (id, body) => { if (live) ctx.bus.publish(pid + ":res", Object.assign({ id: id }, body)); };
   ctx.bus.subscribe(pid + ":cmd", async (msg) => {
     try {
       if (msg.action === "set") reply(msg.id, { ok: true, v: await ctx.pet.setStatus(msg.text) });
@@ -1889,7 +1892,7 @@ export function unmount() {}
     }
   });
 }
-export function deactivate() {}
+export function deactivate() { live = false; }
 `;
   const statusManifest = (id) =>
     JSON.stringify({
