@@ -245,7 +245,14 @@ function mountHookPanel(root, ctx) {
       b.dataset.agent = opt.id;
       b.dataset.pressed = String(opt.id === current);
       b.textContent = opt.wired ? opt.displayName : `${opt.displayName}（未接线）`;
-      if (opt.wired) b.on("click", () => void switchTo(opt.id));
+      if (opt.wired)
+        b.on("click", () => {
+          // 最早断点的探针：监听到底有没有被调到。runner 上「点了没反应」有三种可能
+          // （监听没注册 / 调了 switchTo 但宿主调用失败 / 失败后被别的渲染覆盖），
+          // 没有这个标记就只能靠猜；面板原文 + 这个标记一次就能分开。
+          st.dataset.lastSwitch = opt.id;
+          void switchTo(opt.id);
+        });
       nodes.push(b);
     }
     if (nodes.length > 0) picker.replaceChildren(...nodes);

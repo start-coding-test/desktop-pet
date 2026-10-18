@@ -1003,6 +1003,15 @@ try {
     // 真正走一遍界面：点四选一里的 ZCode → 桥 → Worker 通道 agentHooks.set → 宿主。
     // 这条链上任何一环没接上，表现都是「按了没反应」，所以判据必须是界面状态而不是 invoke 结果。
     const clickedZ = await clickShadow(".hk-agent-zcode", "四选一里有 ZCode 这个按钮");
+    // 最早断点：监听到底有没有被调到（widget 在 click 处理器第一行写这个标记）。
+    // 没有它，「点了没反应」就得分不清是监听没注册、还是宿主调用失败、还是失败被覆盖。
+    r.check(
+      "点 ZCode 的监听被调到（面板 dataset.lastSwitch）",
+      "zcode",
+      await settings.client.ev(
+        `(async () => { const rec = ${recExpr}; return rec?.shadow?.querySelector('.hk-status')?.dataset.lastSwitch ?? ""; })()`,
+      ),
+    );
     r.check(
       "第一趟停在确认门（界面 dataset.state=consent）",
       true,
