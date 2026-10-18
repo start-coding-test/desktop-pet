@@ -9,8 +9,8 @@
 //! 会和磁盘打架的事实源。
 //!
 //! 谁能写 `agent`（口径来自派单，不在此重议）：
-//!   * 写：只有用户的显式操作 —— 设置页装成功（`agent = "qoder"`）、设置页卸载或撤销授权
-//!     连带的卸载（`agent = null`）。
+//!   * 写：只有用户的显式操作 —— 设置页装成功（`agent` = 那个适配器的 id）、设置页卸载或
+//!     撤销授权连带的卸载（`agent = null`）。
 //!   * 不写：启停差异、删除插件、启动清理、`--pet-hook-cleanup`。停用导致的卸载不是退出，
 //!     重新启用时全靠这个字段把安装恢复回来。
 
@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::plugin_caps::AGENT_HOOKS;
+use crate::services::agent::adapters::{self, claude_style, AgentAdapter};
 use crate::services::agent::phases::DEFAULT_AGENT;
 use crate::services::agent::AgentState;
 use crate::services::agent_hooks::{self, FileReport};
@@ -31,8 +32,8 @@ use crate::services::permission::PermissionState;
 /// 宿主状态文件名（`<app_data>/agent-linkage.json`，原子写）
 const FILE_NAME: &str = "agent-linkage.json";
 
-/// PR-1 里唯一可写的 Agent 值。PR-2 接进适配器与四选一设置页之后，
-/// 「关→开」的判据才会从「等于 qoder」放宽成「非空」，那时这张表才长第二行。
+/// 老用户迁移的落点，也是 `--agent` 的缺省值：PR-1 之前宿主只接过 Qoder，所以状态文件
+/// 不存在而配置里有自家条目时，那位用户选的只能是它。
 pub const QODER: &str = "qoder";
 
 /// 联动开着时 watcher 才广播。默认 true：启动阶段还没算出现状之前不该把既有行为
@@ -149,13 +150,16 @@ pub fn record_choice(app_data: &Path, agent: Option<&str>) -> Result<(), String>
 /// 设置页装成功 = 用户的显式选择，记下来供「停用→再启用」恢复。
 /// 全部文件都失败时不记：否则下次启用插件会去装一个从没成功过的 hook。
 ///
+/// `agent` 由调用方给（就是它刚装的那个适配器 id），这里不猜 —— 状态文件里写的必须是
+/// 「刚才那次成功的安装属于谁」。
+///
 /// 命令体只加这一行调用 —— `check:shape` 把命令体限在 20 行且不许出现 IO 原语，
 /// 状态文件读写必须住在服务层。
-pub fn note_installed(app: &AppHandle, reports: &[FileReport]) {
+pub fn note_installed(app: &AppHandle, agent: &str, reports: &[FileReport]) {
     if !agent_hooks::any_installed(reports) {
         return;
     }
-    note_choice(app, Some(QODER));
+    note_choice(app, Some(agent));
 }
 
 /// 设置页主动卸载，或「撤销授权」连带的宿主卸载：都算用户明确退出，记成 null。
@@ -186,13 +190,16 @@ fn note_choice(app: &AppHandle, agent: Option<&str>) {
 ///
 /// **必须在清理之前调用**（顺序即判据，见 startup 的源码断言）：清理会把自家条目摘掉，
 /// 先摘就再也看不出用户装过，于是「停用摘掉、再启用恢复」对升级上来的用户永远不成立。
+///
+/// 只按 Qoder 的形状数条目，这是事实而不是偷懒：状态文件出现之前宿主只接过 Qoder，
+/// 所以「有自家条目但没有选择记录」这一种情况只可能是 Qoder。
 pub fn migrate_from_legacy(app_data: &Path, files: &[PathBuf]) -> Migrate {
     match load(app_data) {
         Loaded::Known(_) => return Migrate::AlreadyRecorded,
         Loaded::Corrupt => return Migrate::Corrupt,
         Loaded::Absent => {}
     }
-    let installed = agent_hooks::status_reports(files)
+    let installed = agent_hooks::status_reports(&claude_style::QODER, files)
         .iter()
         .map(|r| r.managed)
         .sum::<usize>()
@@ -215,12 +222,19 @@ pub fn migrate_from_legacy(app_data: &Path, files: &[PathBuf]) -> Migrate {
 ///
 /// `prev_on = None` 表示启停清单还不存在（老用户尚未迁移）。那一次写入不是用户点开关，
 /// 所以既不装也不卸 —— 否则「第一次迁移」就成了「宿主替用户悄悄装 hook」。
+///
+/// 「关→开」时 Agent 那一维的判据是**已接线的适配器 id**（`adapters::is_wired`），
+/// 不是「等于 qoder」，也不是「任意非空字符串」：
+///   * 等于 qoder 会在接第二个适配器时又要改这里；
+///   * 任意非空会把 `codex` 这种「命令行认得但还没接线」的槽位、以及脏值都当成选择，
+///     后果是宿主去装一个自己不知道怎么卸的 hook。
 pub fn decide(prev_on: Option<bool>, now_on: bool, consented: bool, agent: Option<&str>) -> Action {
     match prev_on {
         None => Action::None,
         Some(false) if now_on => {
-            // 关 → 开：同意过、且用户显式选过 Agent，才装
-            if consented && agent == Some(QODER) {
+            // 关 → 开：同意过、且用户显式选过一个已经接线的 Agent，才装
+            let chosen = agent.is_some_and(adapters::is_wired);
+            if consented && chosen {
                 Action::Install
             } else {
                 Action::None
@@ -257,20 +271,29 @@ fn app_data(app: &AppHandle) -> Option<PathBuf> {
     }
 }
 
-/// 候选配置文件。一个都没有 = 没装那个 Agent，不是失败。
-fn candidate_files(app: &AppHandle) -> Vec<PathBuf> {
+/// 某个适配器的候选配置文件。一个都没有 = 没装那个客户端，不是失败。
+fn targets(app: &AppHandle, adapter: &dyn AgentAdapter) -> Vec<PathBuf> {
     match app.path().home_dir() {
-        Ok(home) => agent_hooks::candidate_files(&home),
+        Ok(home) => adapter.targets(&home),
         Err(e) => {
-            log::warn!("拿不到用户主目录，跳过 hook 文件: {e}");
+            log::warn!("拿不到用户主目录，跳过 {} 的 hook 文件: {e}", adapter.id());
             Vec::new()
         }
     }
 }
 
-fn install(files: &[PathBuf]) -> Vec<FileReport> {
+/// 这批装卸走哪个适配器。状态文件里的选择缺失、或指向还没接线的槽位时退回 Qoder ——
+/// 与 `--agent` 的缺省同一口径，而且那是 PR-1 之前唯一存在过的形状：
+/// 配置里的陈旧条目只能按它自己的形状摘，退回 Qoder 不会摘坏别人的文件。
+fn adapter_for(agent: Option<&str>) -> &'static dyn AgentAdapter {
+    agent
+        .and_then(adapters::by_id)
+        .unwrap_or(&claude_style::QODER)
+}
+
+fn install(adapter: &dyn AgentAdapter, files: &[PathBuf]) -> Vec<FileReport> {
     if files.is_empty() {
-        log::info!("没有 Qoder 配置目录，跳过安装");
+        log::info!("没有 {} 的配置目录，跳过安装", adapter.display_name());
         return Vec::new();
     }
     let exe = match std::env::current_exe() {
@@ -283,11 +306,11 @@ fn install(files: &[PathBuf]) -> Vec<FileReport> {
             }]
         }
     };
-    agent_hooks::install_files(files, &exe)
+    agent_hooks::install_files(adapter, files, &exe)
 }
 
-fn uninstall(files: &[PathBuf]) -> Vec<FileReport> {
-    agent_hooks::uninstall_files(files)
+fn uninstall(adapter: &dyn AgentAdapter, files: &[PathBuf]) -> Vec<FileReport> {
+    agent_hooks::uninstall_files(adapter, files)
 }
 
 /// 装卸结果广播给设置页（PR-1 只发不接：agent 桥设置页的消费端在 PR-2）。
@@ -307,13 +330,19 @@ fn apply(app: &AppHandle, prev_on: Option<bool>, now_on: bool, ids: &[String]) {
     let agent = sync_current_agent(&data);
     let action = decide(prev_on, now_on, any_consented(app, ids), agent.as_deref());
     if action == Action::None {
+        // 「选了但没接线」与「没选过」在 decide 里都是 None，日志要分开：
+        // 前者是用户看得见的一次点击没生效，必须能被追查
+        if let Some(unknown) = agent.as_deref().filter(|a| !adapters::is_wired(a)) {
+            log::info!("联动记录里的 Agent 是 {unknown}，但它还没接线，配置文件保持原样");
+        }
         return;
     }
+    let adapter = adapter_for(agent.as_deref());
     let name = action.report_name();
-    let files = candidate_files(app);
+    let files = targets(app, adapter);
     let reports = match action {
-        Action::Install => install(&files),
-        _ => uninstall(&files),
+        Action::Install => install(adapter, &files),
+        _ => uninstall(adapter, &files),
     };
     for r in &reports {
         if let Some(e) = &r.error {
@@ -367,13 +396,15 @@ fn apply_startup_broadcast(ids: Option<&[String]>, linkage_on: bool) {
 /// AppHandle，单测能真的把顺序跑红；这里只负责把路径与现状凑出来。
 pub fn startup(app: &AppHandle) {
     let Some(data) = app_data(app) else { return };
-    let files = candidate_files(app);
+    // 迁移的证据只可能是 Qoder 形状的条目（见 migrate_from_legacy），所以这一步按 Qoder 取文件
+    let files = targets(app, &claude_style::QODER);
     let ids = crate::services::enabled::list_ids(app);
     // 清单还不存在（尚未迁移）= 说不出现状：既不拨广播闸门，也不动手清理
     let on = ids.as_ref().is_some_and(|v| linkage_on(app, v));
     apply_startup_broadcast(ids.as_deref(), on);
+    let adapter = adapter_for(agent_choice(&data).as_deref());
     let migrated = startup_sequence(&data, &files, ids.as_deref(), on, &mut |files| {
-        let reports = uninstall(files);
+        let reports = uninstall(adapter, files);
         for r in &reports {
             if let Some(e) = &r.error {
                 log::warn!("启动清理失败: {e} (path: {})", r.path);
@@ -411,6 +442,9 @@ pub fn startup_sequence(
 /// 的约定自己解析。**任何失败都只打印，退出码恒为 0** —— 清理不能拦住卸载。
 /// 与启动清理同一条口径：只读 `agent`，不写。
 ///
+/// 摘的范围是**每个已接线适配器**的候选文件（`uninstall_everywhere`），不是「当前联动的那个」：
+/// 应用都没了，状态文件里写的是谁已经不重要，留着指向不存在 exe 的条目就是每次事件失败一次。
+///
 /// 输出是 ASCII 的 `key=value`：它要么被 NSIS 的 ExecWait 吞掉，要么在 e2e 里被解析，
 /// 两种场合都不该依赖控制台代码页 —— 中文文案一旦变 mojibake，套件断言就红得没道理。
 pub fn run_cleanup_cli() {
@@ -418,12 +452,11 @@ pub fn run_cleanup_cli() {
         eprintln!("desktop-pet: hook cleanup result=skipped reason=no-home");
         return;
     };
-    let files = agent_hooks::candidate_files(&home);
-    if files.is_empty() {
+    let reports = agent_hooks::uninstall_everywhere(&home);
+    if reports.is_empty() {
         println!("desktop-pet: hook cleanup result=nothing-to-do files=0 stripped=0");
         return;
     }
-    let reports = uninstall(&files);
     let stripped: usize = reports.iter().map(|r| r.managed).sum();
     let failed = reports.iter().filter(|r| r.error.is_some()).count();
     println!(
@@ -496,11 +529,42 @@ mod tests {
             Action::None,
             "agent 为空（从没从设置页装过）不装"
         );
-        assert_eq!(
-            decide(Some(false), true, true, Some("zcode")),
-            Action::None,
-            "PR-1 只认 qoder：状态文件里的别的值说明它被改坏了，不能拿它去装 Qoder 的 hook"
-        );
+        // 已知的 CLI 取值但还没接线的槽位不许装（接线之后这里自动放行，判据不用再改，
+        // 见 every_wired_adapter_id_can_trigger_install…）
+        for slot in ["zcode", "codex", "workbuddy"] {
+            if adapters::is_wired(slot) {
+                continue;
+            }
+            assert_eq!(
+                decide(Some(false), true, true, Some(slot)),
+                Action::None,
+                "{slot} 还没接线：拿它去装 Qoder 形状的 hook，会写出一条我们不知道怎么卸的条目"
+            );
+        }
+    }
+
+    /// Q3 的正面判据：**能装的集合就是已接线的适配器**，逐个真跑一遍 ——
+    /// 而不是把 qoder 写死在这条断言里。反面判据同一条：任何未接线的值都不许装。
+    #[test]
+    fn every_wired_adapter_id_can_trigger_install_and_nothing_else_can() {
+        for adapter in adapters::wired() {
+            assert_eq!(
+                decide(Some(false), true, true, Some(adapter.id())),
+                Action::Install,
+                "{} 已接线，关→开就该装",
+                adapter.id()
+            );
+        }
+        // 「放宽成任意非空字符串」这个变异必须由下面这几条打死：空串、带空格的、
+        // 大小写不对的显示名、以及根本不在 `--agent` 白名单里的值
+        for not_wired in ["", " ", "qoder ", "Qoder", "nope", "qoder,zcode"] {
+            assert_eq!(
+                decide(Some(false), true, true, Some(not_wired)),
+                Action::None,
+                "「{not_wired}」不是已接线的适配器 id，不能装"
+            );
+        }
+        assert_eq!(decide(Some(false), true, true, None), Action::None);
     }
 
     #[test]
@@ -623,7 +687,7 @@ mod tests {
         });
         fs::write(&cfg, before.to_string()).unwrap();
 
-        let reports = uninstall(std::slice::from_ref(&cfg));
+        let reports = uninstall(&claude_style::QODER, std::slice::from_ref(&cfg));
         assert_eq!(reports.iter().map(|r| r.managed).sum::<usize>(), 2);
         assert!(reports.iter().all(|r| r.error.is_none()));
         let after: Value = serde_json::from_str(&fs::read_to_string(&cfg).unwrap()).unwrap();
@@ -641,7 +705,7 @@ mod tests {
         let cfg = dir.join("settings.json");
         fs::write(&cfg, "{ 半截 JSON").unwrap();
         // 卸载应用时撞到坏配置也必须走完：清理失败不能拦住卸载，所以只出报告不抛错
-        let reports = uninstall(std::slice::from_ref(&cfg));
+        let reports = uninstall(&claude_style::QODER, std::slice::from_ref(&cfg));
         assert_eq!(reports.len(), 1);
         assert!(reports[0].error.is_some(), "坏文件要在报告里留痕");
         assert_eq!(
@@ -689,16 +753,16 @@ mod tests {
 
         let install = function_body(agent_cmd, "pub fn agent_hooks_install(");
         let written = install
-            .find("install_files(&files, &exe_path()?)")
+            .find("install_files(adapter, &files, &exe_path()?)")
             .expect("找不到安装调用点");
         let noted = install
-            .find("linkage::note_installed(&app, &reports)")
+            .find("linkage::note_installed(&app, adapter.id(), &reports)")
             .expect("安装成功后没记录用户的选择");
         assert!(written < noted, "记录必须晚于真的装完");
 
         let uninstall = function_body(agent_cmd, "pub fn agent_hooks_uninstall(");
         let removed = uninstall
-            .find("uninstall_files(&files)")
+            .find("uninstall_files(adapter, &files)")
             .expect("找不到卸载调用点");
         let cleared = uninstall
             .find("linkage::note_uninstalled(&app)")
@@ -743,7 +807,10 @@ mod tests {
             Some(&[]),
             false,
             &mut |files| {
-                stripped += uninstall(files).iter().map(|r| r.managed).sum::<usize>();
+                stripped += uninstall(&claude_style::QODER, files)
+                    .iter()
+                    .map(|r| r.managed)
+                    .sum::<usize>();
             },
         );
         assert_eq!(migrated, Migrate::Wrote(Some(QODER.to_string())));
