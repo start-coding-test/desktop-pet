@@ -68,7 +68,10 @@ mod tests {
     fn workbuddy_installs_the_seven_measured_events_with_whitelisted_phases() {
         assert_eq!(WORKBUDDY.events().len(), 7, "只挂实测会触发的那 7 条");
         for (event, phase) in WORKBUDDY.events() {
-            assert!(PHASES.contains(phase), "{event} → {phase} 不在 phase 白名单里");
+            assert!(
+                PHASES.contains(phase),
+                "{event} → {phase} 不在 phase 白名单里"
+            );
         }
         assert!(
             !WORKBUDDY.events().iter().any(|(e, _)| *e == "SessionEnd"),
