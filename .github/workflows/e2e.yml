@@ -79,6 +79,16 @@ jobs:
           # 留着 src-tauri/target，不然每次都要从头编 debug
           clean: false
 
+      # 上一轮套件中途崩溃时，plugins/ 里的探针插件（zz.probe / zz.net / com.zz.spoof 等）
+      # 不会被清掉；checkout 又是 clean:false，下一轮 `npm run build` 里的
+      # `tsc -p tsconfig.plugins.json` 会把它们当源码检查而在 40 秒内判红，
+      # 不论是哪个分支触发的（run 39111941677）。所以构建之前先清一遍。
+      # run 块里只许 ASCII（见下面 Windows PowerShell 5.1 的说明）。
+      - name: 清理上一轮残留的探针插件
+        shell: powershell
+        run: |
+          Get-ChildItem -Path plugins -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "zz.*" -or $_.Name -like "com.zz.*" } | ForEach-Object { Write-Host "Removing stale fixture plugin: $($_.Name)"; Remove-Item -LiteralPath $_.FullName -Recurse -Force }
+
       - name: 装 Rust 工具链（rust-toolchain.toml 钉 1.98.1）
         run: |
           rustup set profile minimal
@@ -175,3 +185,10 @@ jobs:
           Get-CimInstance Win32_Process -Filter "Name='desktop-pet.exe'" |
             Where-Object { $_.ExecutablePath -like "$env:GITHUB_WORKSPACE*" } |
             ForEach-Object { Write-Host "Killing leftover PID $($_.ProcessId)"; Stop-Process -Id $_.ProcessId -Force }
+
+      # 收尾再清一次：本轮崩溃留下的探针插件不要留给下一个分支
+      - name: 收尾清理探针插件
+        if: always()
+        shell: powershell
+        run: |
+          Get-ChildItem -Path plugins -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "zz.*" -or $_.Name -like "com.zz.*" } | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
