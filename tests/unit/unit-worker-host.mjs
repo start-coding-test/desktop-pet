@@ -2,7 +2,7 @@
 //
 // 三层钉法：
 //   ① 表本身 —— 24 个名字逐条钉死，且每个叶子名都能在 packages/sdk/index.d.ts 里找到成员声明；
-//   ② 宿主派发表完备 —— 21 个「纯参数进纯值出」的方法在 worker-plugin-host.ts 里必须逐条点名；
+//   ② 宿主派发表完备 —— 22 个「纯参数进纯值出」的方法在 worker-plugin-host.ts 里必须逐条点名；
 //   ③ 隔离前提 —— Worker 侧那两个文件里不许出现 @tauri-apps 或 host-error（一旦漏进去，
 //      裸 IPC 就跟着 bundle 进了 Worker realm，本波要收口的洞当场作废）。
 //
@@ -70,7 +70,7 @@ check(
 
 group("宿主派发表完备");
 const proxied = EXPECTED.filter((name) => name !== "bus.subscribe" && name !== "log");
-eq("表内需实现的方法数", proxied.length, 21);
+eq("表内需实现的方法数", proxied.length, 22);
 for (const name of proxied) {
   check(`worker-plugin-host.ts 点名实现了 "${name}"`, hostSrc.includes(`"${name}":`), "派发表里没有这一条");
 }

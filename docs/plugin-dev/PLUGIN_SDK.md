@@ -73,7 +73,7 @@ export async function deactivate() { /* 停用/移除时调用 */ }
 | `notify` | `ctx.notify.show` | 系统通知 | — |
 | `pet:react` | `ctx.pet.react` | 让宠物插播一个状态，参数只能是 petdex 的九个状态之一：`idle` `running-right` `running-left` `waving` `jumping` `failed` `waiting` `running` `review`（其余名字会被桥拒绝） | — |
 | `pet:say` | `ctx.pet.say` / `ctx.pet.setStatus` | `say`：弹一句台词（3.6 秒收起）。`setStatus`：宠物旁**长期**挂一行状态（B3，与台词共用同一个气泡槽：台词插进来时它被临时替换，收起后回位）—— 长度上限 20 码点、单行显示，多插件各占一条，详见 §4.1 | — |
-| `agent:hooks` | `ctx.host.agentHooks.{status,install,uninstall}` | 查询/安装/卸载本机编码 Agent（Qoder）的 hook 配置（`~/.qoder*/settings.json` 里自家 `--pet-hook` 条目，增删只动自己的）。**只在插件设置页（`settings` 区 widget）可用**：`badge` / `overlay` 区与宠物窗里没有 `ctx.host`。首次调用弹同意框；这是本项目第一个"能改用户其他应用配置"的能力，边界见 ADR-0001 | 风险 |
+| `agent:hooks` | `ctx.host.agentHooks.{status,install,uninstall,set}` | 查询/安装/卸载本机编码 Agent 的 hook 配置，并在 Qoder / ZCode / Codex / WorkBuddy 之间**单选切换**（同一时间只联动一个，ADR-0002）。写的是各家自己的配置文件（Qoder `~/.qoder*/settings.json`、ZCode `~/.zcode/cli/{config,setting}.json`），增删只动自家 `--pet-hook … --agent <id>` 条目；`set` 先卸旧再装新，卸旧失败就停在原状态并 reject。**只在插件设置页（`settings` 区 widget）可用**：`badge` / `overlay` 区与宠物窗里没有 `ctx.host`。首次调用弹同意框；这是本项目第一个"能改用户其他应用配置"的能力，边界见 ADR-0001 | 风险 |
 
 ## 4. ctx API
 

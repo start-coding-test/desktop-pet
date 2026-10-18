@@ -40,7 +40,7 @@ T10 数出的可伪造点里，前 6 条都源于同一个事实：**Worker 里�
 
 ## 契约（L1 原型必须遵守的形状）
 
-- **接口面 = 24 个方法**：`buildContext`（`bridge.ts:120-258`）暴露的 19 个（bus 2 / storage 3 / ble 5 / widget 1 / pet 3 /
+- **接口面 = 24 个方法**：`buildContext`（`bridge.ts:120-258`）暴露的 20 个（bus 2 / storage 3 / ble 5 / widget 1 / pet 3 /
   http 1 / notify 1 / overlay 3 / log 1）加 `createAgentHooksApi` 的 3 个。（那份表不入库：每个方法背后的命令名我逐条核过都在 `lib.rs:96` 的 48 条注册表里，缺失 0。）Worker 版桥必须覆盖这张表，不许多也不许多年。
 - **渲染层留在宿主 realm**：widget 的容器与 Shadow DOM 由宿主持有（`widget-host.ts`），Worker 只发渲染指令。
   四个插件对主文档 realm 的依赖共 84 处，分级是 **W 可做 6 / 需宿主代理 78 / 做不到 0**——
