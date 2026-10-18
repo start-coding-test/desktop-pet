@@ -407,10 +407,17 @@ describe("调用面比入口的 23 表窄：不借搬迁扩权", () => {
     }
   });
 
-  it("agentHooks.* 只有 settings 区算合法", () => {
-    assert.equal(isWidgetCallAllowed("agentHooks.status", "settings"), true);
-    assert.equal(isWidgetCallAllowed("agentHooks.status", "badge"), false);
-    assert.equal(isWidgetCallAllowed("agentHooks.status", "overlay"), false);
+  // 名单从表里取而不是手写死：A02 加了 agentHooks.set，写死「三个方法」的那条判据
+  // 会安安静静地漏掉新名字 —— 边界判据覆盖不全，正是「按了没反应」这类红最难归因的地方。
+  it("agentHooks.* 只有 settings 区算合法（逐个名字判）", () => {
+    const names = [...WIDGET_CALL_METHODS].filter((m) => m.startsWith("agentHooks."));
+    assert.ok(names.length >= 4, `agentHooks 面至少该有 4 个名字，实得 ${names.length}`);
+    for (const name of names) {
+      assert.equal(isWidgetCallAllowed(name, "settings"), true, `${name} 在 settings 区被拒`);
+      for (const region of ["badge", "overlay", "pet"]) {
+        assert.equal(isWidgetCallAllowed(name, region), false, `${name} 在 ${region} 区被放行`);
+      }
+    }
   });
 
   it("非方法名与未知字符串一律拒", () => {
