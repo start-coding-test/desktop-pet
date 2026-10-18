@@ -11,8 +11,11 @@
 //! 缓存住一份 home 根目录的探测结果就会往已经不存在的目录里写配置。
 
 pub mod claude_style;
+pub mod zcode;
 
 use std::path::{Path, PathBuf};
+
+use serde_json::Value;
 
 /// 一种 Agent 的 hook 接入方式。实现者负责读写配置文件里的文本，
 /// **不碰磁盘** —— 读原文、备份、原子替换都住在 `services/agent_hooks.rs`。
@@ -33,6 +36,30 @@ pub trait AgentAdapter: Sync {
     /// 卸：没有自家条目时返回 `None`，表示「这个文件不必改动」
     fn uninstall_in_text(&self, raw: &str) -> Result<Option<(String, usize)>, String>;
 
+    /// 卸载时顺带把「装之前抄下来的总开关旧值」恢复回去。`before = None` 表示这个文件的
+    /// 开关当初没被我们动过（或这个客户端压根没有开关），默认实现就是原样卸载。
+    /// ZCode 的 `hooks.enabled` 走这条 —— 方案 §3.4：「如果当初是我们把它打开的，就恢复原值」，
+    /// 插件停用自动卸载与卸载应用清理都算「卸载」。
+    fn uninstall_restoring_switch(
+        &self,
+        raw: &str,
+        before: Option<&Value>,
+    ) -> Result<Option<(String, usize)>, String> {
+        let _ = before;
+        self.uninstall_in_text(raw)
+    }
+
+    /// 这个客户端有没有「一个开关关掉整段 hooks」的总开关。默认没有（Qoder）。
+    fn has_switch(&self) -> bool {
+        false
+    }
+
+    /// 装之前总开关的原值（`None` = 原文没这个键）。配合 `has_switch` 用：
+    /// 安装流水线在动手之前抄下它，才谈得上卸载时如实恢复。
+    fn switch_before(&self, _raw: &str) -> Option<Value> {
+        None
+    }
+
     /// 这份文本里自家条目有几条
     fn managed_count(&self, raw: &str) -> usize;
 
@@ -46,7 +73,7 @@ pub trait AgentAdapter: Sync {
 
 /// 已经接线的适配器。装卸、状态、卸载前清理都按这张表走 ——
 /// 没在这里出现的 id 就算过了 `--agent` 的白名单（那是命令行校验用的），宿主也不动配置文件。
-static WIRED: &[&dyn AgentAdapter] = &[&claude_style::QODER];
+static WIRED: &[&dyn AgentAdapter] = &[&claude_style::QODER, &zcode::ZCODE];
 
 pub fn wired() -> &'static [&'static dyn AgentAdapter] {
     WIRED
@@ -60,6 +87,18 @@ pub fn by_id(id: &str) -> Option<&'static dyn AgentAdapter> {
 /// 这个 id 现在能不能真的装卸。`decide()` 用它把「用户选了谁」和「我们接了谁」分开。
 pub fn is_wired(id: &str) -> bool {
     by_id(id).is_some()
+}
+
+#[cfg(test)]
+pub static TEST_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 会读或写 `PET_AGENT_CONFIG_FILES` / `PET_AGENT_HOME` 的用例共用的串行锁（`TEST_ENV`）。
+/// 环境变量是进程级的，`cargo test` 默认多线程：不锁就是「A 测试设的变量改了 B 测试里
+/// `targets()` 的结果」这种随机红。锁中毒时照旧用 —— 持锁的测试 panic 了，下一个测试
+/// 不该因此永远跑不起来。
+#[cfg(test)]
+pub(crate) fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
+    TEST_ENV.lock().unwrap_or_else(|p| p.into_inner())
 }
 
 #[cfg(test)]

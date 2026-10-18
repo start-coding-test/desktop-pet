@@ -140,11 +140,96 @@ pub fn agent_choice(app_data: &Path) -> Option<String> {
     }
 }
 
-pub fn record_choice(app_data: &Path, agent: Option<&str>) -> Result<(), String> {
-    let text = serde_json::to_string_pretty(&json!({ "schema": 1, "agent": agent }))
-        .map_err(|e| e.to_string())?;
+/// 状态文件里的整份对象。`None` = 文件不存在，或读不出对象（后者绝不写回，见 `update_state`）。
+fn read_state(app_data: &Path) -> Option<Value> {
+    let raw = fs::read_to_string(state_path(app_data)).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    value.is_object().then_some(value)
+}
+
+/// 状态文件唯一的写入口：读出来 → 用闭包改 → 原子写回。
+///
+/// 为什么合并而不是整份重写：除了 `agent`，这里还住着 `hooksEnabled`（装 ZCode 时抄的
+/// 总开关旧值）。谁写自己那一段、别的全留着，才不会「记录用户选择」顺手抹掉恢复所需的证据。
+///
+/// `overwrite_unreadable` 分两种态度，这条不对称是故意的：
+///   * 记账（写或清 `hooksEnabled`）遇到读不出的文件就不写 —— 抹掉一个读不懂的文件没意义；
+///   * 用户的显式选择必须写得进去，否则状态文件一旦坏掉，设置页永远再也记不下选择。
+///     判据在 `corrupt_state_file_is_never_overwritten`：迁移那步不覆盖，显式那步覆盖。
+fn update_state(
+    app_data: &Path,
+    overwrite_unreadable: bool,
+    patch: &dyn Fn(&mut serde_json::Map<String, Value>),
+) -> Result<(), String> {
+    let mut object = match read_state(app_data) {
+        Some(value) => value,
+        None if state_path(app_data).exists() && !overwrite_unreadable => {
+            return Err("状态文件读不出对象，未改动".into())
+        }
+        None => json!({}),
+    };
+    patch(object.as_object_mut().expect("上面判过是对象"));
+    let text = serde_json::to_string_pretty(&object).map_err(|e| e.to_string())?;
     crate::fsutil::write_atomic(&state_path(app_data), text.as_bytes())
         .map_err(|e| e.message.clone())
+}
+
+/// 写「用户显式选了哪个 Agent」这一段（`agent` 与 `schema`）。其他键原样保留。
+pub fn record_choice(app_data: &Path, agent: Option<&str>) -> Result<(), String> {
+    update_state(app_data, true, &|map| {
+        map.insert("schema".into(), json!(1));
+        map.insert(
+            "agent".into(),
+            match agent {
+                Some(a) => json!(a),
+                None => Value::Null,
+            },
+        );
+    })
+}
+
+/// 装之前各文件的总开关旧值（`{"<路径>": false}`；`null` = 原来根本没这个键）。
+/// 读不出来或没记过就回空对象 —— 空对象意味着「一个开关都不许动」，是安全方向。
+pub fn recorded_switches(app_data: &Path) -> Value {
+    read_state(app_data)
+        .and_then(|value| value.get("hooksEnabled").cloned())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}))
+}
+
+/// 把这次安装真正拨开过的开关抄进状态文件。一条都没拨（Qoder 恒如此）就不写，
+/// 免得给只装 Qoder 的用户多出一个空键。
+pub fn record_switches(app_data: &Path, reports: &[FileReport]) {
+    let mut additions = serde_json::Map::new();
+    for report in reports {
+        if let Some(value) = &report.switch_before {
+            additions.insert(report.path.clone(), value.clone());
+        }
+    }
+    if additions.is_empty() {
+        return;
+    }
+    if let Err(e) = update_state(app_data, false, &|map| {
+        let table = map.entry("hooksEnabled").or_insert_with(|| json!({}));
+        let Some(table) = table.as_object_mut() else {
+            return;
+        };
+        for (path, value) in additions.iter() {
+            table.insert(path.clone(), value.clone());
+        }
+    }) {
+        log::warn!("写入总开关记录失败: {e}");
+    }
+}
+
+/// 卸载把开关恢复回去之后清掉这份记录：它是**一次性**的，留着下次卸载会照着
+/// 早已不相关的旧值再改一次用户的配置。
+fn clear_switches(app_data: &Path) {
+    if let Err(e) = update_state(app_data, false, &|map| {
+        map.remove("hooksEnabled");
+    }) {
+        log::warn!("清理总开关记录失败: {e}");
+    }
 }
 
 /// 设置页装成功 = 用户的显式选择，记下来供「停用→再启用」恢复。
@@ -160,11 +245,28 @@ pub fn note_installed(app: &AppHandle, agent: &str, reports: &[FileReport]) {
         return;
     }
     note_choice(app, Some(agent));
+    // 顺手把「装之前我们拨动过的总开关」抄进同一个状态文件：ZCode 的 hooks.enabled
+    // 没有这条记录，卸载时就恢复不回去（方案 §3.4）
+    if let Some(data) = app_data(app) {
+        record_switches(&data, reports);
+    }
 }
 
 /// 设置页主动卸载，或「撤销授权」连带的宿主卸载：都算用户明确退出，记成 null。
 pub fn note_uninstalled(app: &AppHandle) {
     note_choice(app, None);
+    // 恢复已经发生（或本来就没记过），这份一次性凭证就不该留着
+    if let Some(data) = app_data(app) {
+        clear_switches(&data);
+    }
+}
+
+/// 命令层卸载前要拿的那份旧值记录（`app_data` 的解析失败按「没记过」处理）。
+pub fn recorded_switches_of(app: &AppHandle) -> Value {
+    match app_data(app) {
+        Some(data) => recorded_switches(&data),
+        None => json!({}),
+    }
 }
 
 /// 写状态文件。**失败只记日志**：装卸本身已经落到 Agent 的配置里了，
@@ -303,14 +405,15 @@ fn install(adapter: &dyn AgentAdapter, files: &[PathBuf]) -> Vec<FileReport> {
                 path: String::new(),
                 managed: 0,
                 error: Some(format!("取不到自身路径: {e}")),
+                switch_before: None,
             }]
         }
     };
     agent_hooks::install_files(adapter, files, &exe)
 }
 
-fn uninstall(adapter: &dyn AgentAdapter, files: &[PathBuf]) -> Vec<FileReport> {
-    agent_hooks::uninstall_files(adapter, files)
+fn uninstall(adapter: &dyn AgentAdapter, files: &[PathBuf], switches: &Value) -> Vec<FileReport> {
+    agent_hooks::uninstall_files(adapter, files, switches)
 }
 
 /// 装卸结果广播给设置页（PR-1 只发不接：agent 桥设置页的消费端在 PR-2）。
@@ -341,8 +444,20 @@ fn apply(app: &AppHandle, prev_on: Option<bool>, now_on: bool, ids: &[String]) {
     let name = action.report_name();
     let files = targets(app, adapter);
     let reports = match action {
-        Action::Install => install(adapter, &files),
-        _ => uninstall(adapter, &files),
+        Action::Install => {
+            let reports = install(adapter, &files);
+            // 拨过的总开关要立刻记下来：这条路径是「停用→再启用」自动装的，没有设置页
+            // 帮忙记，漏记就等于卸载时把用户的开关留在开着的状态
+            record_switches(&data, &reports);
+            reports
+        }
+        _ => {
+            let reports = uninstall(adapter, &files, &recorded_switches(&data));
+            if reports.iter().any(|r| r.managed > 0) {
+                clear_switches(&data);
+            }
+            reports
+        }
     };
     for r in &reports {
         if let Some(e) = &r.error {
@@ -403,12 +518,16 @@ pub fn startup(app: &AppHandle) {
     let on = ids.as_ref().is_some_and(|v| linkage_on(app, v));
     apply_startup_broadcast(ids.as_deref(), on);
     let adapter = adapter_for(agent_choice(&data).as_deref());
+    let switches = recorded_switches(&data);
     let migrated = startup_sequence(&data, &files, ids.as_deref(), on, &mut |files| {
-        let reports = uninstall(adapter, files);
+        let reports = uninstall(adapter, files, &switches);
         for r in &reports {
             if let Some(e) = &r.error {
                 log::warn!("启动清理失败: {e} (path: {})", r.path);
             }
+        }
+        if reports.iter().any(|r| r.managed > 0) {
+            clear_switches(&data);
         }
         report(app, "startup-cleanup", &reports);
     });
@@ -452,7 +571,10 @@ pub fn run_cleanup_cli() {
         eprintln!("desktop-pet: hook cleanup result=skipped reason=no-home");
         return;
     };
-    let reports = agent_hooks::uninstall_everywhere(&home);
+    let switches = app_data_standalone()
+        .map(|dir| recorded_switches(&dir))
+        .unwrap_or_else(|| json!({}));
+    let reports = agent_hooks::uninstall_everywhere(&home, &switches);
     if reports.is_empty() {
         println!("desktop-pet: hook cleanup result=nothing-to-do files=0 stripped=0");
         return;
@@ -467,6 +589,14 @@ pub fn run_cleanup_cli() {
     for r in reports.iter().filter_map(|r| r.error.as_ref()) {
         eprintln!("desktop-pet: hook cleanup error: {r}");
     }
+}
+
+/// 状态文件在 hook/cleanup 分支里的落点：`%APPDATA%\<identifier>`。
+/// 与 `inbox.rs` 里那份 `app_data_dir_standalone` 是同一条 Windows 约定 —— 那份是私有的，
+/// 而 `inbox.rs` 的获批改动只限 `hook_ingest`，所以这里重复一次而不是去改它。
+fn app_data_standalone() -> Option<PathBuf> {
+    let base = std::env::var("APPDATA").ok()?;
+    Some(PathBuf::from(base).join(super::state::identifier()))
 }
 
 /// hook 分支与清理分支都在建窗之前，拿不到 `app.path().home_dir()`，
@@ -673,6 +803,65 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// 两段记录住同一个文件，谁也不许抹掉谁：`record_choice` 从前是整份重写，
+    /// 接 ZCode 之后那一步会顺手抹掉恢复总开关所需的凭证 —— 症状是卸载后
+    /// 用户的 `hooks.enabled` 永远留在开着。
+    #[test]
+    fn the_choice_record_and_the_switch_record_do_not_clobber_each_other() {
+        let dir = tmp_dir("two-records");
+        let report = |path: &str, switch: Option<Value>| FileReport {
+            path: path.to_string(),
+            managed: 7,
+            error: None,
+            switch_before: switch,
+        };
+
+        record_switches(&dir, &[report(r"C:\cfg\config.json", Some(json!(false)))]);
+        assert_eq!(
+            recorded_switches(&dir)[r"C:\cfg\config.json"],
+            json!(false),
+            "抄下来的旧值得按路径存住"
+        );
+
+        // 关键一步：写用户的选择，不能把上面那段抹掉
+        record_choice(&dir, Some("zcode")).unwrap();
+        assert_eq!(agent_choice(&dir).as_deref(), Some("zcode"));
+        assert_eq!(
+            recorded_switches(&dir)[r"C:\cfg\config.json"],
+            json!(false),
+            "记录选择之后开关凭证还在"
+        );
+
+        // 恢复完就清掉：它是**一次性**的，留着下次卸载会照着早已不相关的旧值再改一次配置
+        clear_switches(&dir);
+        assert_eq!(recorded_switches(&dir), json!({}));
+        assert_eq!(
+            agent_choice(&dir).as_deref(),
+            Some("zcode"),
+            "清开关记录不能连带清了用户的选择"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Qoder 没有总开关，一次成功的安装不该在状态文件里多出任何东西
+    #[test]
+    fn record_switches_writes_nothing_when_no_switch_was_flipped() {
+        let dir = tmp_dir("no-switch");
+        let report = FileReport {
+            path: r"C:\cfg\settings.json".to_string(),
+            managed: 12,
+            error: None,
+            switch_before: None,
+        };
+        record_switches(&dir, std::slice::from_ref(&report));
+        assert!(
+            !state_path(&dir).exists(),
+            "没拨过开关就不该为记账新建一个状态文件"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn cleanup_strips_only_ours_and_keeps_everything_else() {
         let dir = tmp_dir("cleanup");
@@ -687,7 +876,7 @@ mod tests {
         });
         fs::write(&cfg, before.to_string()).unwrap();
 
-        let reports = uninstall(&claude_style::QODER, std::slice::from_ref(&cfg));
+        let reports = uninstall(&claude_style::QODER, std::slice::from_ref(&cfg), &json!({}));
         assert_eq!(reports.iter().map(|r| r.managed).sum::<usize>(), 2);
         assert!(reports.iter().all(|r| r.error.is_none()));
         let after: Value = serde_json::from_str(&fs::read_to_string(&cfg).unwrap()).unwrap();
@@ -705,7 +894,7 @@ mod tests {
         let cfg = dir.join("settings.json");
         fs::write(&cfg, "{ 半截 JSON").unwrap();
         // 卸载应用时撞到坏配置也必须走完：清理失败不能拦住卸载，所以只出报告不抛错
-        let reports = uninstall(&claude_style::QODER, std::slice::from_ref(&cfg));
+        let reports = uninstall(&claude_style::QODER, std::slice::from_ref(&cfg), &json!({}));
         assert_eq!(reports.len(), 1);
         assert!(reports[0].error.is_some(), "坏文件要在报告里留痕");
         assert_eq!(
@@ -762,7 +951,7 @@ mod tests {
 
         let uninstall = function_body(agent_cmd, "pub fn agent_hooks_uninstall(");
         let removed = uninstall
-            .find("uninstall_files(adapter, &files)")
+            .find("uninstall_everywhere(")
             .expect("找不到卸载调用点");
         let cleared = uninstall
             .find("linkage::note_uninstalled(&app)")
@@ -807,7 +996,7 @@ mod tests {
             Some(&[]),
             false,
             &mut |files| {
-                stripped += uninstall(&claude_style::QODER, files)
+                stripped += uninstall(&claude_style::QODER, files, &json!({}))
                     .iter()
                     .map(|r| r.managed)
                     .sum::<usize>();

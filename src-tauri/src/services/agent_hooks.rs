@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::services::agent::adapters::{self, AgentAdapter};
 use crate::services::agent::phases::AGENT_FLAG;
@@ -51,6 +51,11 @@ pub struct FileReport {
     pub path: String,
     pub managed: usize,
     pub error: Option<String>,
+    /// 装之前这个文件的「总开关」原值（JSON `null` = 原来根本没这个键）。
+    /// 只有在我们确实把它拨开了的时候才有值 —— 状态文件按路径存它，卸载时照单恢复。
+    /// 没有总开关的客户端（Qoder）永远是 `None`，也不进序列化结果。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switch_before: Option<Value>,
 }
 
 impl FileReport {
@@ -59,6 +64,7 @@ impl FileReport {
             path: path.display().to_string(),
             managed: 0,
             error: Some(error.into()),
+            switch_before: None,
         }
     }
 }
@@ -120,20 +126,20 @@ pub fn status_reports(adapter: &dyn AgentAdapter, files: &[PathBuf]) -> Vec<File
                 path: path.display().to_string(),
                 managed: 0,
                 error: None,
+                switch_before: None,
             },
-            Ok(Some(raw)) => {
+            Ok(Some(raw)) => match serde_json::from_str::<Value>(&raw) {
                 // 先自己解析一遍只为「读不出来要报错误」这条：适配器的 managed_count 对
-                // 坏文本只会数出 0，状态页据此显示「未安装」，用户以为摘干净了其实没有。
+                // 坏文本只数出 0，状态页据此显示「未安装」，用户以为摘干净了其实没有。
                 // 计数仍然交给适配器 —— 它才懂自己那种形状里哪几条是自家的。
-                match serde_json::from_str::<Value>(&raw) {
-                    Ok(_) => FileReport {
-                        path: path.display().to_string(),
-                        managed: adapter.managed_count(&raw),
-                        error: None,
-                    },
-                    Err(e) => FileReport::failed(path, format!("配置解析失败: {e}")),
-                }
-            }
+                Ok(_) => FileReport {
+                    path: path.display().to_string(),
+                    managed: adapter.managed_count(&raw),
+                    error: None,
+                    switch_before: None,
+                },
+                Err(e) => FileReport::failed(path, format!("配置解析失败: {e}")),
+            },
             Err(e) => FileReport::failed(path, e.to_string()),
         })
         .collect()
@@ -167,6 +173,11 @@ pub fn install_files(adapter: &dyn AgentAdapter, files: &[PathBuf], exe: &Path) 
                         // 磁盘上的事实才是状态页与「停用→再启用」恢复要相信的
                         managed: adapter.managed_count(&text),
                         error: None,
+                        // 「原来不是开着」才算我们拨的：原本 true 的话卸载时不该动它
+                        switch_before: adapter
+                            .switch_before(&raw)
+                            .filter(|was| was != &json!(true))
+                            .filter(|_| adapter.has_switch()),
                     },
                     Err(e) => FileReport::failed(path, e),
                 },
@@ -176,7 +187,14 @@ pub fn install_files(adapter: &dyn AgentAdapter, files: &[PathBuf], exe: &Path) 
         .collect()
 }
 
-pub fn uninstall_files(adapter: &dyn AgentAdapter, files: &[PathBuf]) -> Vec<FileReport> {
+/// 卸载。`switches` 是状态文件里记的那份「装之前每个文件的总开关原值」：
+/// 键是路径、值是原值（JSON `null` = 原来没这个键，恢复=删掉）；**没有这条记录就完全不碰开关**
+/// —— 不是我们拨开的，就没资格关。
+pub fn uninstall_files(
+    adapter: &dyn AgentAdapter,
+    files: &[PathBuf],
+    switches: &Value,
+) -> Vec<FileReport> {
     let _io = lock_hook_io();
     files
         .iter()
@@ -189,19 +207,23 @@ pub fn uninstall_files(adapter: &dyn AgentAdapter, files: &[PathBuf]) -> Vec<Fil
                     path: path.display().to_string(),
                     managed: 0,
                     error: None,
+                    switch_before: None,
                 };
             };
-            match adapter.uninstall_in_text(&raw) {
+            let before = switches.get(path.display().to_string());
+            match adapter.uninstall_restoring_switch(&raw, before) {
                 Ok(None) => FileReport {
                     path: path.display().to_string(),
                     managed: 0,
                     error: None,
+                    switch_before: None,
                 },
                 Ok(Some((text, removed))) => match apply_text(path, &text) {
                     Ok(()) => FileReport {
                         path: path.display().to_string(),
                         managed: removed,
                         error: None,
+                        switch_before: before.cloned(),
                     },
                     Err(e) => FileReport::failed(path, e),
                 },
@@ -215,11 +237,11 @@ pub fn uninstall_files(adapter: &dyn AgentAdapter, files: &[PathBuf]) -> Vec<Fil
 ///
 /// 这里不按「当前联动的那个 Agent」走：应用都没了，状态文件里写的是谁已经不重要；而留在
 /// 别人配置里的 `--pet-hook` 条目指向一个不存在的 exe，每来一次事件就失败一次。
-/// 每个适配器只摘自己那种形状里的条目，摘不到就返回 `None`（那个文件不改）。
-pub fn uninstall_everywhere(home: &Path) -> Vec<FileReport> {
+/// 每个适配器只摘自己那种形状里的条目，摘不到就不改那个文件。
+pub fn uninstall_everywhere(home: &Path, switches: &Value) -> Vec<FileReport> {
     adapters::wired()
         .iter()
-        .flat_map(|adapter| uninstall_files(*adapter, &adapter.targets(home)))
+        .flat_map(|adapter| uninstall_files(*adapter, &adapter.targets(home), switches))
         .collect()
 }
 
@@ -227,6 +249,7 @@ pub fn uninstall_everywhere(home: &Path) -> Vec<FileReport> {
 mod tests {
     use super::*;
     use crate::services::agent::adapters::claude_style::QODER;
+    use crate::services::agent::adapters::zcode::ZCODE;
     use crate::services::agent::HOOK_PHASES;
 
     fn tmp_dir(name: &str) -> PathBuf {
@@ -300,10 +323,14 @@ mod tests {
     /// 改 `PET_AGENT_CONFIG_FILES` 的测试，别的测试都不读它，所以不会互相串。
     #[test]
     fn uninstall_everywhere_reports_each_targets_list_once_and_keeps_user_keys() {
+        let _env = adapters::lock_test_env();
         let dir = tmp_dir("everywhere");
         let path = dir.join("settings.json");
         let exe = Path::new(r"C:\app\desktop-pet.exe");
         std::env::set_var("PET_AGENT_CONFIG_FILES", &path);
+        // ZCode 那份候选表也要钉成空的：不清这个变量，另一个测试设的目录会让它冒出候选，
+        // 报告条数就不是这条能算准的了
+        std::env::set_var("PET_AGENT_HOME", dir.join("no-agent-home"));
         // 环境里那两个样例文件的父目录存在才算候选；不存在时上面这条等于「一个候选都没有」
         fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
 
@@ -313,8 +340,13 @@ mod tests {
             exe
         )));
 
-        let cleaned = uninstall_everywhere(&dir);
-        assert_eq!(cleaned.len(), adapters::wired().len());
+        let cleaned = uninstall_everywhere(&dir, &json!({}));
+        // 报告数 = 各适配器**实际存在**的候选文件数（没有装的那个出 0 份，不是 1 份空报告）
+        let expected: usize = adapters::wired()
+            .iter()
+            .map(|a| a.targets(&dir).len())
+            .sum();
+        assert_eq!(cleaned.len(), expected);
         assert_eq!(cleaned[0].managed, HOOK_PHASES.len());
         let after = fs::read_to_string(&path).unwrap();
         assert!(!after.contains(HOOK_MARKER), "自家条目该摘净");
@@ -322,6 +354,54 @@ mod tests {
         assert_eq!(config["theme"], "dark", "用户的键一个不少");
 
         std::env::remove_var("PET_AGENT_CONFIG_FILES");
+        std::env::remove_var("PET_AGENT_HOME");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 总开关的「抄旧值 → 恢复」whole 走的是这条流水线（适配器单测只证文本变换）。
+    /// 两个方向都要钉：装的时候把原值抄进报告（状态文件才有东西可存），
+    /// 卸的时候**没有记录就绝不碰开关** —— 不是我们拨开的，就没资格关。
+    #[test]
+    fn switch_state_is_captured_on_install_and_restored_on_uninstall() {
+        let _env = adapters::lock_test_env();
+        let dir = tmp_dir("switch");
+        let cli = dir.join(".zcode").join("cli");
+        fs::create_dir_all(&cli).unwrap();
+        let path = cli.join("config.json");
+        fs::write(&path, r#"{"hooks":{"enabled":false,"events":{}}}"#).unwrap();
+        std::env::set_var("PET_AGENT_HOME", &dir);
+        let exe = Path::new(r"C:\app\desktop-pet.exe");
+
+        let reports = install_files(&ZCODE, &ZCODE.targets(&dir), exe);
+        assert!(any_installed(&reports), "{:?}", reports[0].error);
+        assert_eq!(
+            reports[0].switch_before,
+            Some(json!(false)),
+            "装之前是关着的，必须记下来"
+        );
+        let after_install: Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after_install["hooks"]["enabled"], true);
+
+        let switches = json!({ path.display().to_string(): false });
+        let cleaned = uninstall_files(&ZCODE, &ZCODE.targets(&dir), &switches);
+        assert_eq!(cleaned[0].managed, ZCODE.events().len());
+        let after_uninstall: Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            after_uninstall,
+            serde_json::from_str::<Value>(r#"{"hooks":{"enabled":false}}"#).unwrap(),
+            "恢复到装之前：值写回 false，events 摘空后整个键一起删"
+        );
+
+        // 没有记录 = 不是我们拨的：一条都不该改
+        fs::write(&path, r#"{"hooks":{"enabled":true,"events":{}}}"#).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        let none_recorded = uninstall_files(&ZCODE, std::slice::from_ref(&path), &json!({}));
+        assert_eq!(none_recorded[0].managed, 0, "没有自家条目就不算改动");
+        assert_eq!(fs::read_to_string(&path).unwrap(), before, "一个字都不写");
+
+        std::env::remove_var("PET_AGENT_HOME");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -333,6 +413,7 @@ mod tests {
             path: "x".into(),
             managed,
             error: error.map(str::to_string),
+            switch_before: None,
         };
         assert!(any_installed(&[ok(12, None)]));
         assert!(

@@ -140,9 +140,11 @@ pub fn agent_hooks_uninstall(
     plugin_id: Option<String>,
 ) -> Result<Value, HostError> {
     assert_caller(&app, &window, plugin_id.as_deref(), "查询或改动 Agent hook")?;
-    let adapter = &claude_style::QODER;
-    let files = adapter.targets(&home_dir(&app)?);
-    let reports = agent_hooks::uninstall_files(adapter, &files);
+    // 卸载按「摘净每个已接线适配器」走，不是只摘 Qoder：设置页的卸载与「撤销授权」连带的
+    // 宿主卸载都意味着用户退出联动，留着别家的条目和一个已经被我们拨开的总开关没有道理。
+    // （`note_uninstalled` 会清掉总开关记录，所以只摘一家的话那笔账就丢了。）
+    let reports =
+        agent_hooks::uninstall_everywhere(&home_dir(&app)?, &linkage::recorded_switches_of(&app));
     // 卸载（含「撤销授权」连带的宿主卸载）算明确退出：记 null，别再自动装回来
     linkage::note_uninstalled(&app);
     Ok(json!({ "files": reports }))
@@ -191,7 +193,8 @@ mod tests {
         assert!(installed.contains("keep.sh"));
         assert!(!installed.contains("D:\\\\old\\\\desktop-pet.exe"));
 
-        let reports2 = agent_hooks::uninstall_files(&QODER, std::slice::from_ref(&path));
+        let reports2 =
+            agent_hooks::uninstall_files(&QODER, std::slice::from_ref(&path), &json!({}));
         assert_eq!(reports2[0].managed, HOOK_PHASES.len());
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(!after.contains("--pet-hook"));
