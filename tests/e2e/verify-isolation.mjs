@@ -2024,6 +2024,21 @@ export function deactivate() { live = false; }
     b3Dom.text === String(b3Long.v ?? "") && [...b3Dom.text].length === 20);
   r.info("超长行的可视溢出（scrollWidth/clientWidth）", `${b3Dom.scroll}/${b3Dom.client}`);
 
+  // M4 的可观测性前提：必须有一个「20 码点以内、但宽度超过气泡」的输入 —— 否则单独去掉 nowrap 不可观测
+  // （20 个全角汉字约 264px，正好卡在 266 上限内）。20 个 emoji 按全角宽排版会溢出：
+  // 带 nowrap 时它只溢出（scroll > client），去掉 nowrap 就会折行（盒高变大）。这条基线就是那个证明。
+  const b3Wide = await statusCall(STATUS_A, "set", "🐱".repeat(20));
+  await waitStatusSlot();
+  const b3BoxWide = await bubbleBox();
+  const b3WideDom = await c.ev(`(() => { const b = document.getElementById('pet-bubble'); return { scroll: b.scrollWidth, client: b.clientWidth, len: [...b.textContent].length }; })()`);
+  r.check("20 个宽字符输入：仍是单行（盒高 = 单行盒高）", true, Math.abs(b3BoxWide.height - b3Box1.height) <= 1);
+  r.check(
+    "20 个宽字符确实溢出气泡（M4「单独去掉 nowrap 会折行」的可观测性前提）",
+    true,
+    b3WideDom.scroll > b3WideDom.client,
+  );
+  r.check("宽字符输入也没被 20 码点上限截短", 20, b3WideDom.len);
+
   const b3Escaped = await statusCall(STATUS_A, "set", "<b>x</b>");
   const b3Html = await c.ev(`document.getElementById('pet-bubble').innerHTML`);
   const b3AsText = await bubbleNow();
