@@ -767,6 +767,17 @@ try {
     for (const f of stAfterInstall?.files ?? []) {
       r.check("安装后样例文件恰好 expectedPerFile 条", stAfterInstall.expectedPerFile, readFileSync(f.path, "utf8").split("--pet-hook").length - 1);
     }
+    // 装出来的条目必须带来源字段：不带的话，收件侧只能靠「缺省按 qoder」兜底 ——
+    // 接线第二个 Agent 之后，那个兜底就是「桌宠对着别人的会话演」。
+    // files.length 也钉住，否则空数组的 every() 恒真是条假绿。
+    r.check(
+      "装好的条目带 --agent qoder",
+      true,
+      (stAfterInstall?.files?.length ?? 0) > 0 &&
+        (stAfterInstall?.files ?? []).every((f) =>
+          readFileSync(f.path, "utf8").includes("--pet-hook pre --agent qoder"),
+        ),
+    );
     r.check("安装不改别人条目（复用按键排序规范串口径）", expectForeign, `${foreignOf(cfgA)}|${foreignOf(cfgB)}`);
     const shownInstall = String(await statusText());
     r.check("回显条数与随后一次 status() 一致", true, shownInstall.includes(`共 ${stAfterInstall.managed} 条`));
