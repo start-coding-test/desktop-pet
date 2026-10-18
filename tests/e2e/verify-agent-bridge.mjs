@@ -631,6 +631,31 @@ try {
   r.check("宿主路径（设置窗、不带 pluginId）照旧可用", true, hostStatus.ok === true);
   r.check("宿主 status 回显含配置文件列表", true, Array.isArray(hostStatus.v?.files));
 
+  // closed Shadow DOM 里的元素从外面查不到：按 verify-astock 的既有做法，从 widgetHost.mounted
+  // 取挂载记录、用它捕获的 shadow 引用操作（都在页面内求值，走真实点击路径）。
+  // 定义在外层：④ 那组（安装/卸载/启停）和 ⑨ 的「四选一」都要用，抄两份就会各漂各的。
+  const recExpr = `((await import('/src/runtime/widget-host.ts')).widgetHost.mounted.get(${JSON.stringify(AGENT_ID)}) ?? []).find((r) => r.host.dataset.region === "settings")`;
+  const stateExpr = (want) =>
+    `(async () => { const rec = ${recExpr}; return !!rec && rec.shadow.querySelector('.hk-status')?.dataset.state === ${JSON.stringify(want)}; })()`;
+  const clickShadow = async (selector, label) => {
+    const ok = await waitUntil(
+      settings.client,
+      `(async () => { const rec = ${recExpr}; return !!rec?.shadow?.querySelector(${JSON.stringify(selector)}); })()`,
+      15_000,
+    );
+    r.check(label, true, ok);
+    if (ok) {
+      await settings.client.ev(`(async () => {
+        const rec = ${recExpr};
+        rec.shadow.querySelector(${JSON.stringify(selector)}).click();
+        return true;
+      })()`);
+    }
+    return ok;
+  };
+  const statusText = () =>
+    settings.client.ev(`(async () => { const rec = ${recExpr}; return rec ? rec.shadow.querySelector('.hk-status')?.textContent ?? '' : ''; })()`);
+
   r.group("插件页：Qoder hook 接入（端到端，只碰 temp 样例）");
   // A9a：入口在 agent 桥自己的设置页（settings 区 widget）。写盘类断言一律只碰
   // PET_AGENT_CONFIG_FILES 指到的 temp/a9a 样例；不满足就整组跳过并说清原因。
@@ -687,29 +712,6 @@ try {
       }
       return JSON.stringify(out);
     };
-    // closed Shadow DOM 里的元素从外面查不到：按 verify-astock 的既有做法，从 widgetHost.mounted
-    // 取挂载记录、用它捕获的 shadow 引用操作（都在页面内求值，走真实点击路径）。
-    const recExpr = `((await import('/src/runtime/widget-host.ts')).widgetHost.mounted.get(${JSON.stringify(AGENT_ID)}) ?? []).find((r) => r.host.dataset.region === "settings")`;
-    const stateExpr = (want) =>
-      `(async () => { const rec = ${recExpr}; return !!rec && rec.shadow.querySelector('.hk-status')?.dataset.state === ${JSON.stringify(want)}; })()`;
-    const clickShadow = async (selector, label) => {
-      const ok = await waitUntil(
-        settings.client,
-        `(async () => { const rec = ${recExpr}; return !!rec?.shadow?.querySelector(${JSON.stringify(selector)}); })()`,
-        15_000,
-      );
-      r.check(label, true, ok);
-      if (ok) {
-        await settings.client.ev(`(async () => {
-          const rec = ${recExpr};
-          rec.shadow.querySelector(${JSON.stringify(selector)}).click();
-          return true;
-        })()`);
-      }
-      return ok;
-    };
-    const statusText = () =>
-      settings.client.ev(`(async () => { const rec = ${recExpr}; return rec ? rec.shadow.querySelector('.hk-status')?.textContent ?? '' : ''; })()`);
 
     // 打开 agent 桥的插件页（套件前面已把它加进启用清单；没加上就补一次开关，与用户点开关同一条路径）
     await settings.client.ev(`document.querySelector('#nav-plugins .nav-item[data-view=${JSON.stringify(AGENT_ID)}]')?.click(); true`);
@@ -961,10 +963,12 @@ try {
   // 只跑 ZCode —— codex / workbuddy 的适配器在 PR-3 接线，那时按同一形状各加一组。
   r.group("ZCode 切换：确认门、双文件、总开关恢复（只碰 PET_AGENT_HOME 下的夹具）");
   const ZHOME = String(env.PET_AGENT_HOME ?? "");
-  const zhomeOk = ZHOME !== "" && resolve(ZHOME).startsWith(TEMP_ROOT + sep);
-  r.check("PET_AGENT_HOME 指向 temp 下（否则真实用户的 ~/.zcode 会被写）", true, zhomeOk);
+  // 两组前置都要满足：PET_AGENT_HOME 在 temp 下（写盘安全），且④那组真的把设置页开起来了
+  // （本组的切换走界面 —— 设置区 widget 没挂载就没有按钮可点，那是前置不成立而不是行为坏了）
+  const zhomeOk = ZHOME !== "" && resolve(ZHOME).startsWith(TEMP_ROOT + sep) && underTemp;
+  r.check("前置齐备：PET_AGENT_HOME 在 temp 下 + 设置页已挂载", true, zhomeOk);
   if (!zhomeOk) {
-    r.info("跳过 ZCode 组", "PET_AGENT_HOME 未设或不在 temp 根下；本组一个文件都不写");
+    r.info("跳过 ZCode 组", "PET_AGENT_HOME 未设/不在 temp 下，或设置页没打开；本组一个文件都不写");
   } else {
     const zcli = join(ZHOME, ".zcode", "cli");
     rmSync(zcli, { recursive: true, force: true });
@@ -991,8 +995,21 @@ try {
     r.check("被拦下时一个文件都没动", zBefore, readFileSync(zcfg, "utf8"));
     r.check("未知来源的 agent 值直接被拒（不是任意非空字符串）", false, (await settings.invoke("agent_linkage_set", { agent: "nope" })).ok);
 
-    const ok1 = await settings.invoke("agent_linkage_set", { agent: "zcode", confirm: true });
-    r.check("确认后切换成功", true, ok1.ok);
+    // 真正走一遍界面：点四选一里的 ZCode → 桥 → Worker 通道 agentHooks.set → 宿主。
+    // 这条链上任何一环没接上，表现都是「按了没反应」，所以判据必须是界面状态而不是 invoke 结果。
+    const clickedZ = await clickShadow(".hk-agent-zcode", "四选一里有 ZCode 这个按钮");
+    r.check(
+      "第一趟停在确认门（界面 dataset.state=consent）",
+      true,
+      clickedZ && (await waitUntil(settings.client, stateExpr("consent"), 12_000)),
+    );
+    r.check("确认提示没改写宿主原话", true, /1 条/.test(String(await statusText())));
+    const clickedConsent = await clickShadow(".hk-consent", "「仍要打开」按钮出现了");
+    r.check(
+      "点「仍要打开」之后装上（界面 state=installed）",
+      true,
+      clickedConsent && (await waitUntil(settings.client, stateExpr("installed"), 20_000)),
+    );
     const zText = readFileSync(zcfg, "utf8");
     r.check("装了 7 个事件（ZCode 没有 SessionEnd/Notification/Subagent）", 7, zText.split("--pet-hook").length - 1);
     r.check("条目带 --agent zcode", true, zText.includes("--pet-hook pre --agent zcode"));
@@ -1031,9 +1048,14 @@ try {
     });
     r.check("切到 ZCode 后自己的事件照常广播", true, await waitUntil(c, `(window.__topics.slice().reverse().find(([k]) => k === 'host-event')?.[1]?.agent === 'zcode')`, 8_000));
 
-    // 切回 Qoder：ZCode 的条目摘净，并且**总开关回到装之前的 false**（hooksEnabled 记录的端到端证据）
-    const back = await settings.invoke("agent_linkage_set", { agent: "qoder" });
-    r.check("切回 Qoder 成功", true, back.ok);
+    // 切回 Qoder：走界面（点四选一里的 Qoder），ZCode 的条目摘净，并且**总开关回到装之前的
+    // false**（hooksEnabled 记录的端到端证据）
+    const clickedBack = await clickShadow(".hk-agent-qoder", "四选一里 Qoder 是选中态、也能点");
+    r.check(
+      "切回 Qoder 后界面回到已安装",
+      true,
+      clickedBack && (await waitUntil(settings.client, stateExpr("installed"), 20_000)),
+    );
     const zAfter = readFileSync(zcfg, "utf8");
     r.check("ZCode 的条目摘净", 0, zAfter.split("--pet-hook").length - 1);
     r.check("总开关恢复成装之前的 false", true, JSON.parse(zAfter).hooks.enabled === false);
