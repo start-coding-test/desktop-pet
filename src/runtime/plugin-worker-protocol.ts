@@ -9,7 +9,7 @@
 import catalog from "../../packages/sdk/error-codes.json" with { type: "json" };
 
 /** 面向插件的 24 个方法（点号命名空间）。`log` 不占能力，但同样只能走这条通道。
- *  23 而不是 22：B3 加了 `pet.setStatus`，见 ADR-0006 的「增项记录（2026-10-17）」。 */
+ *  24 = 22 的底座 + A02 的 `agentHooks.set`（第 23）+ B3 的 `pet.setStatus`（第 24），见 ADR-0006 增项记录。 */
 export const PLUGIN_WORKER_METHODS = [
   "bus.publish",
   "bus.subscribe",

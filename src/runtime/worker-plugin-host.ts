@@ -186,7 +186,7 @@ class WorkerPluginHost {
   }
 
   /**
-   * 派发表：20 个「纯参数进、纯值出」的方法逐条点名，返回类型写成 `Record<ProxiedMethod, …>`
+   * 派发表：22 个「纯参数进、纯值出」的方法逐条点名，返回类型写成 `Record<ProxiedMethod, …>`
    * —— 协议里加了方法名而这里没实现，当场编译不过。
    * bus.subscribe 与 log 不在表里：它们的参数或返回里有函数，只能特判。
    */

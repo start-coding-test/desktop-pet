@@ -2,7 +2,7 @@
 //   ① realm 事实（没有 window/document/localStorage、__TAURI_INTERNALS__ 不可达、裸说明符解析不了）
 //   ② 入口的相对子模块在 Worker 里能否解析（todo 的 ./todo-txt.js、探针的 ./leaf.js）
 //   ③ petplugin 的 `?v=` 与 no-store 在 Worker 的取回路径上是否仍成立
-//   ④ 协议层伪造（不在 22 个方法表里的调用、跨插件读存储）是否被宿主挡下
+//   ④ 协议层伪造（不在 24 个方法表里的调用、跨插件读存储）是否被宿主挡下
 //   ⑤ 退出条件：com.pet.todo 在 Worker 里真的跑得动
 // 取证方式是本仓唯一合法姿势：读页面/Worker 自己写下的副作用，不用 CDP 求值判 CSP。
 //   终端 1: npm run dev:debug      终端 2: npm run verify:worker
