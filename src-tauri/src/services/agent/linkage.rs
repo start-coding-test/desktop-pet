@@ -295,12 +295,12 @@ pub const NEED_CONFIRM: &str = "[need-confirm]";
 
 /// 确认框那句话。抽成函数是为了让「前缀在、条数在」这条契约能被离线钉住
 /// （`switch_agent` 那层要 AppHandle 与真文件，跑不了）。
-pub fn confirm_prompt(display_name: &str, user_hooks: usize) -> HostError {
+/// 正文交给适配器（`AgentAdapter::consent_prompt`）：ZCode 的开关是我们去打开的，
+/// WorkBuddy 的 `disableAllHooks` 我们**不动**，两句话不能共用一个模板，否则界面会在骗用户。
+pub fn confirm_prompt(adapter: &dyn AgentAdapter, user_hooks: usize) -> HostError {
     HostError::new(
         INVALID_STATE,
-        format!(
-            "{NEED_CONFIRM} {display_name} 的 hook 总开关现在是关的，打开以后你之前配的 {user_hooks} 条 hook 也会一起生效。确认请再点一次。"
-        ),
+        format!("{NEED_CONFIRM} {}", adapter.consent_prompt(user_hooks)),
     )
 }
 
@@ -331,9 +331,13 @@ pub fn switch_agent(
     home: &Path,
 ) -> Result<Value, HostError> {
     let Some(adapter) = adapters::by_id(agent) else {
+        let wired: Vec<&str> = adapters::wired().iter().map(|a| a.id()).collect();
         return Err(HostError::new(
             INVALID_ARG,
-            format!("还不认识这个 Agent: {agent}（codex / workbuddy 在 PR-3 接线）"),
+            format!(
+                "还不认识这个 Agent: {agent}（已接线的只有 {}）",
+                wired.join(" / ")
+            ),
         ));
     };
     let data = app_data(app)
@@ -341,10 +345,7 @@ pub fn switch_agent(
     let targets = adapter.targets(home);
     let consent = agent_hooks::pending_consent(adapter, &targets);
     if consent_gate(consent, confirm) {
-        return Err(confirm_prompt(
-            adapter.display_name(),
-            consent.unwrap_or_default(),
-        ));
+        return Err(confirm_prompt(adapter, consent.unwrap_or_default()));
     }
     let removed = agent_hooks::uninstall_everywhere(home, &recorded_switches(&data));
     let first_error = removed
@@ -1018,13 +1019,40 @@ mod tests {
     /// 少了条数它说不清「打开会连带启用几条」—— 那正是这句确认存在的理由。
     #[test]
     fn the_confirm_prompt_carries_the_machine_token_and_the_count() {
-        let e = confirm_prompt("ZCode", 3);
+        let e = confirm_prompt(&zcode::ZCODE, 3);
         assert_eq!(e.code, INVALID_STATE);
         assert!(e.message.starts_with(NEED_CONFIRM), "{}", e.message);
         assert!(
             e.message.contains("3 条"),
             "条数是确认的依据：{}",
             e.message
+        );
+    }
+
+    /// 四家都接线之后，确认框这句话**只能由适配器给**：WorkBuddy 的 `disableAllHooks` 我们不动，
+    /// 照 ZCode 那句「打开以后……」讲就是在骗用户。这条判据钉的是「话说得跟做的事一致」。
+    #[test]
+    fn each_adapter_wording_its_own_consent_prompt() {
+        use crate::services::agent::adapters::{codex, workbuddy};
+        // 有总开关且由我们去打开的那家（ZCode）保留原句
+        assert!(
+            zcode::ZCODE
+                .consent_prompt(2)
+                .contains("打开以后你之前配的 2 条"),
+            "{}",
+            zcode::ZCODE.consent_prompt(2)
+        );
+        // WorkBuddy 反过来：说清我们不改那个键
+        let wb = workbuddy::WORKBUDDY.consent_prompt(1);
+        assert!(wb.contains("disableAllHooks"), "要点名是哪个开关：{wb}");
+        assert!(
+            !wb.contains("打开以后你之前配的"),
+            "不能谎称由我们去打开：{wb}"
+        );
+        // Codex 没有总开关：走适配器默认，不该由 linkage 再拼一份文案
+        assert_eq!(
+            codex::CODEX.consent_prompt(0),
+            "Codex 需要你先确认才会改动配置文件。确认请再点一次。"
         );
     }
 

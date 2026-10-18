@@ -11,6 +11,8 @@
 //! 缓存住一份 home 根目录的探测结果就会往已经不存在的目录里写配置。
 
 pub mod claude_style;
+pub mod codex;
+pub mod workbuddy;
 pub mod zcode;
 
 use std::path::{Path, PathBuf};
@@ -87,11 +89,30 @@ pub trait AgentAdapter: Sync {
     fn switch_needs_consent(&self, _raw: &str) -> Option<usize> {
         None
     }
+
+    /// 「要用户拍板」时说的那句话（**不带** `[need-confirm]` 前缀，前缀由 `linkage::confirm_prompt` 加，
+    /// 那个前缀是界面判「这是确认还是失败」的机器可读契约）。
+    ///
+    /// 默认讲的是 ZCode 那种开关：显式关着，打开会连带把用户自己配的 N 条一起启用，而且**是我们将要去打开它**。
+    /// 开关语义相反的家必须自己说一句：WorkBuddy 的 `disableAllHooks` 我们**不替用户改**，
+    /// 照默认措辞显示就是在骗人 —— 用户以为点一下就会打开，实际那个键一动不动，装完还是不触发。
+    fn consent_prompt(&self, user_hooks: usize) -> String {
+        format!(
+            "{} 的 hook 总开关现在是关的，打开以后你之前配的 {} 条 hook 也会一起生效。确认请再点一次。",
+            self.display_name(),
+            user_hooks
+        )
+    }
 }
 
 /// 已经接线的适配器。装卸、状态、卸载前清理都按这张表走 ——
 /// 没在这里出现的 id 就算过了 `--agent` 的白名单（那是命令行校验用的），宿主也不动配置文件。
-static WIRED: &[&dyn AgentAdapter] = &[&claude_style::QODER, &zcode::ZCODE];
+static WIRED: &[&dyn AgentAdapter] = &[
+    &claude_style::QODER,
+    &zcode::ZCODE,
+    &codex::CODEX,
+    &workbuddy::WORKBUDDY,
+];
 
 pub fn wired() -> &'static [&'static dyn AgentAdapter] {
     WIRED

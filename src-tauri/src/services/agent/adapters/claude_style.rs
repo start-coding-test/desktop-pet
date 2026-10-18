@@ -31,9 +31,18 @@ pub struct ClaudeStyleJson {
     pub timeout_key: &'static str,
     /// 开发/测试的覆盖入口：设了这个环境变量（`;` 分隔完整文件路径）就不再从 home 推目录。
     /// 它是「不碰真实用户配置」这条硬规则的实现，不是可选装饰。
+    /// **每家一个变量名**：共用一个变量的话，给 Qoder 设的覆盖清单会同时变成 Codex 的目标文件，
+    /// 于是「往 Codex 的配置里装 Qoder 条目」这种事故在测试里就发生了。
     pub paths_env: &'static str,
     /// 装完要用户做的事（`AgentAdapter::post_install_hint`）
     pub hint: Option<&'static str>,
+    /// 需要在外层分组上写 `"matcher": ".*"` 的事件（WorkBuddy 的实测口径：工具类事件要写，
+    /// 其余不写）。Qoder 与 Codex 是空表 —— 它们一个条目都没多，输出与迁移前逐字节相同。
+    pub matcher_events: &'static [&'static str],
+    /// 「一个键关掉整户 hooks」那个键的名字，**语义与 ZCode 的 `hooks.enabled` 相反**：
+    /// `true` = 全关。WorkBuddy 是 `disableAllHooks`。`None` = 没有这种键（Qoder / Codex）。
+    /// 只读不写：这一家我们不替用户改开关，所以它不进 `switch_before` / 恢复那条路径。
+    pub disable_switch_key: Option<&'static str>,
 }
 
 impl ClaudeStyleJson {
@@ -100,7 +109,12 @@ impl ClaudeStyleJson {
             // 键名由适配器决定（Qoder 是 timeout、ZCode 是 timeoutMs），json! 里不能拼变量，
             // 所以在这一步补上
             hook[self.timeout_key] = json!(HOOK_TIMEOUT);
-            list.push(json!({ "hooks": [hook] }));
+            let mut group = json!({ "hooks": [hook] });
+            // matcher 挂在外层分组上，不在 hook 里：WorkBuddy 的实测写法是这个形状
+            if self.matcher_events.contains(event) {
+                group["matcher"] = json!(".*");
+            }
+            list.push(group);
             added += 1;
         }
         added
@@ -163,9 +177,15 @@ impl AgentAdapter for ClaudeStyleJson {
                 .filter(|p| p.parent().is_some_and(|dir| dir.exists()))
                 .collect();
         }
+        // 没有逐项覆盖时，home 根也可以整体换掉（与 ZCode 同一条隔离口径）：runner 上
+        // `PET_AGENT_HOME` 指到 temp，四家的夹具目录都在那下面。生产不设这个变量，走的还是真 home。
+        let root = match std::env::var("PET_AGENT_HOME") {
+            Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
+            _ => home.to_path_buf(),
+        };
         self.dirs
             .iter()
-            .map(|leaf| home.join(leaf).join(self.file))
+            .map(|leaf| root.join(leaf).join(self.file))
             .filter(|p| p.parent().is_some_and(|dir| dir.exists()))
             .collect()
     }
@@ -202,6 +222,49 @@ impl AgentAdapter for ClaudeStyleJson {
     fn post_install_hint(&self) -> Option<&'static str> {
         self.hint
     }
+
+    /// `disableAllHooks: true` 就是「这家现在整体不收 hook」。我们不动这个键，所以确认框问的是
+    /// 「装了也不生效，你要自己去开」，而不是像 ZCode 那样由我们去打开它。
+    /// 条数为 0 也照样要问：那时候用户至少知道装完为什么不动。
+    fn switch_needs_consent(&self, raw: &str) -> Option<usize> {
+        let key = self.disable_switch_key?;
+        let config = parse_object(raw).ok()?;
+        if config.get(key).and_then(Value::as_bool) != Some(true) {
+            return None;
+        }
+        Some(user_hook_count(&config))
+    }
+
+    fn consent_prompt(&self, user_hooks: usize) -> String {
+        match self.disable_switch_key {
+            Some(key) => format!(
+                "{} 现在把 hook 整体关着（`{key}` 为 true）。我们不会替你改这个开关：确认之后只写我们自己的条目，\
+                 你要自己在 {} 里把 `{key}` 关掉并彻底退出重开，hook 才会跑；你之前配的 {} 条也会跟着开始生效。确认请再点一次。",
+                self.display_name(),
+                self.display_name(),
+                user_hooks
+            ),
+            // 没有总开关的家（Qoder / Codex）压根不会走到这里：上面那条 `switch_needs_consent`
+            // 在第一行就返回 None。留一句不撒谎的话，别让这条分支变成第二个真相来源。
+            None => format!("{} 需要你先确认才会改动配置文件。确认请再点一次。", self.display_name()),
+        }
+    }
+}
+
+/// 用户自己配的 hook 条数（不含我们那些）。确认框要说清「打开会连带启用几条」，
+/// 这个数只有适配器算得出：它才知道自家条目的标记长什么样。
+fn user_hook_count(config: &Value) -> usize {
+    let Some(hooks) = config.get("hooks").and_then(Value::as_object) else {
+        return 0;
+    };
+    hooks
+        .values()
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter(|hook| !is_managed(hook))
+        .count()
 }
 
 /// Qoder：两个可能的配置目录，12 条事件，`timeout` 按秒。
@@ -214,6 +277,9 @@ pub static QODER: ClaudeStyleJson = ClaudeStyleJson {
     timeout_key: "timeout",
     paths_env: "PET_AGENT_CONFIG_FILES",
     hint: Some("在 Qoder 里新开一次会话，新装的 hook 才会被读到"),
+    // 下面两项是 Codex / WorkBuddy 需要的差异，Qoder 一个都不要：留空 = 输出与迁移前逐字节相同
+    matcher_events: &[],
+    disable_switch_key: None,
 };
 
 #[cfg(test)]
@@ -385,6 +451,10 @@ mod tests {
     /// （那个覆盖分支由 `agent_hooks::tests` 里唯一改这个变量的那条测试负责）。
     #[test]
     fn targets_only_count_directories_that_exist() {
+        // `targets()` 现在也读 `PET_AGENT_HOME`（与 ZCode 同一条隔离口径），所以这条必须锁 env：
+        // 别的测试设着它的时候，这里就会去探另一个根目录，红得毫无道理。
+        let _env = crate::services::agent::adapters::lock_test_env();
+        std::env::remove_var("PET_AGENT_HOME");
         let probe = ClaudeStyleJson {
             id: "probe",
             display_name: "探针",
@@ -394,6 +464,8 @@ mod tests {
             timeout_key: "timeout",
             paths_env: "PET_AGENT_PROBE_UNSET_ENV",
             hint: None,
+            matcher_events: &[],
+            disable_switch_key: None,
         };
         let home = std::env::temp_dir().join(format!("pet-probe-home-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
