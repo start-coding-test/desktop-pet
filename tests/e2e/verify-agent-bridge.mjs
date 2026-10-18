@@ -1008,8 +1008,17 @@ try {
       true,
       clickedZ && (await waitUntil(settings.client, stateExpr("consent"), 12_000)),
     );
+    // 上一轮这条判据红但看不出红在哪一步：把面板原文打出来，日志里就能直接读到
+    // 界面收到的那句（是宿主的拒绝、还是别的），不用再猜。
+    r.info("点 ZCode 之后面板原文", String(await statusText()));
     r.check("确认提示没改写宿主原话", true, /1 条/.test(String(await statusText())));
-    const clickedConsent = await clickShadow(".hk-consent", "「仍要打开」按钮出现了");
+    // 「按钮出现了」以前只查 .hk-consent 在不在 —— 那个按钮是常驻 DOM、靠 class 显隐的，
+    // 所以那条判据永远真，等于没判。改成查槽位的 class 是不是亮着。
+    const slotOn = await settings.client.ev(
+      `(async () => { const rec = ${recExpr}; return String(rec?.shadow?.querySelector('.hk-consent-slot')?.className ?? '').includes("on"); })()`,
+    );
+    r.check("确认槽位亮着（不是「元素在就等于按钮在」）", true, slotOn);
+    const clickedConsent = await clickShadow(".hk-consent", "「仍要打开」点得到");
     r.check(
       "点「仍要打开」之后装上（界面 state=installed）",
       true,
