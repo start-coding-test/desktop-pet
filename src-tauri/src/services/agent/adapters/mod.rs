@@ -103,6 +103,30 @@ pub trait AgentAdapter: Sync {
             user_hooks
         )
     }
+
+    /// 装完之后宿主能自己去读的日志（方案 §3.5 的「装后自检」）。`None` = 这一家没有可查的日志。
+    ///
+    /// 为什么它是接口的一部分而不是 `agent_hooks` 里的一句 `if id == zcode`：接线第三家时，
+    /// 那句硬编码会**静默**沿用 ZCode 的日志路径 —— 症状是新那家的自检永远报「没找到日志」，
+    /// 而读代码的人以为它压根没做自检。路径、文件名形状和「什么算坏行」都只有适配器知道。
+    fn log_watch(&self, _home: &Path) -> Option<LogWatch> {
+        None
+    }
+
+    /// 在「安装之后新写入的那些行」里找第一条能归责到我们头上的行；`Some(原文)` = 查出问题。
+    /// 只有实现了 `log_watch` 的适配器会被调到（调用方先看 `log_watch` 是不是 `None`）。
+    fn scan_log_tail(&self, _new_text: &str, _our_command: &str) -> Option<String> {
+        None
+    }
+}
+
+/// 装后自检要盯的那份日志：哪个目录、文件名什么形状。
+/// 前缀后缀带着走是因为日期格式是我们不确定的事实（ZCode 是 `zcode-<日期>.jsonl`），
+/// 所以调用方按 mtime 挑最新的一份，而不是自己拼一个可能拼错的文件名。
+pub struct LogWatch {
+    pub dir: PathBuf,
+    pub prefix: &'static str,
+    pub suffix: &'static str,
 }
 
 /// 已经接线的适配器。装卸、状态、卸载前清理都按这张表走 ——

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
-use super::AgentAdapter;
+use super::{AgentAdapter, LogWatch};
 use crate::services::agent::phases::AGENT_FLAG;
 use crate::services::agent_hooks::HOOK_MARKER;
 
@@ -279,6 +279,25 @@ impl AgentAdapter for ZCodeAdapter {
         }
         let mine = user_hook_count(raw);
         (mine > 0).then_some(mine)
+    }
+
+    /// ZCode 会把读配置的失败写进 `<root>/.zcode/cli/log/zcode-*.jsonl`（方案 §3.5）。
+    /// root 与 `targets()` 用同一个口径（`PET_AGENT_HOME` 能整体换根），否则开发机上
+    /// 「装到 temp、自检去读真 home」就是两条不相干的路径。
+    fn log_watch(&self, home: &Path) -> Option<LogWatch> {
+        let root = match std::env::var("PET_AGENT_HOME") {
+            Ok(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
+            _ => home.to_path_buf(),
+        };
+        Some(LogWatch {
+            dir: root.join(".zcode").join("cli").join("log"),
+            prefix: "zcode-",
+            suffix: ".jsonl",
+        })
+    }
+
+    fn scan_log_tail(&self, new_text: &str, our_command: &str) -> Option<String> {
+        scan_new_log_lines(new_text, our_command)
     }
 }
 

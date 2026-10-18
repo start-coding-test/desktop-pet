@@ -24,7 +24,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::host_error::{HostError, INTERNAL, INVALID_ARG, INVALID_STATE, NOT_FOUND};
 use crate::plugin_caps::AGENT_HOOKS;
-use crate::services::agent::adapters::{self, claude_style, zcode, AgentAdapter};
+use crate::services::agent::adapters::{self, claude_style, AgentAdapter};
 use crate::services::agent::phases::{AGENT_FLAG, DEFAULT_AGENT};
 use crate::services::agent::AgentState;
 use crate::services::agent_hooks::{self, FileReport};
@@ -371,15 +371,17 @@ pub fn switch_agent(
         SwitchPlan::Install => {
             let exe = std::env::current_exe()
                 .map_err(|e| HostError::new(INTERNAL, format!("取不到自身路径: {e}")))?;
-            // 装之前先记下 ZCode 日志写到哪了 —— 装后自检只看这之后的行（方案 §3.5）。
-            // 别的客户端没有这份日志，所以 selfCheck 直接给 null，不假装「查过且没问题」。
-            let mark = (adapter.id() == zcode::ZCODE.id())
-                .then(|| agent_hooks::mark_zcode_log(home))
-                .flatten();
+            // 装之前先记下日志写到哪了 —— 装后自检只看这之后的行（方案 §3.5）。
+            // 「这家有没有可查的日志」由适配器自己答（`log_watch`），不在这里按 id 分派：
+            // 接线第三家时那种 `if id == zcode` 会静默沿用 ZCode 的日志路径。
+            let mark = agent_hooks::mark_log(adapter, home);
             let reports = agent_hooks::install_files(adapter, &targets, &exe);
-            let self_check = (adapter.id() == zcode::ZCODE.id()).then(|| {
-                agent_hooks::zcode_self_check(mark.as_ref(), home, &format!("{} zcode", AGENT_FLAG))
-            });
+            let self_check = agent_hooks::log_self_check(
+                adapter,
+                mark.as_ref(),
+                home,
+                &format!("{} {}", AGENT_FLAG, adapter.id()),
+            );
             // 只有真装上才算用户的选择（note_installed 里判），全失败时状态文件保持「没选过」
             note_installed(app, adapter.id(), &reports);
             Ok(json!({
@@ -1019,7 +1021,7 @@ mod tests {
     /// 少了条数它说不清「打开会连带启用几条」—— 那正是这句确认存在的理由。
     #[test]
     fn the_confirm_prompt_carries_the_machine_token_and_the_count() {
-        let e = confirm_prompt(&zcode::ZCODE, 3);
+        let e = confirm_prompt(&adapters::zcode::ZCODE, 3);
         assert_eq!(e.code, INVALID_STATE);
         assert!(e.message.starts_with(NEED_CONFIRM), "{}", e.message);
         assert!(
@@ -1036,11 +1038,11 @@ mod tests {
         use crate::services::agent::adapters::{codex, workbuddy};
         // 有总开关且由我们去打开的那家（ZCode）保留原句
         assert!(
-            zcode::ZCODE
+            adapters::zcode::ZCODE
                 .consent_prompt(2)
                 .contains("打开以后你之前配的 2 条"),
             "{}",
-            zcode::ZCODE.consent_prompt(2)
+            adapters::zcode::ZCODE.consent_prompt(2)
         );
         // WorkBuddy 反过来：说清我们不改那个键
         let wb = workbuddy::WORKBUDDY.consent_prompt(1);
