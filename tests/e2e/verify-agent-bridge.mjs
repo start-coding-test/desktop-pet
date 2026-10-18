@@ -1244,7 +1244,11 @@ try {
     );
     const wBefore = readFileSync(wf, "utf8");
     const st0 = (await settings.invoke("agent_hooks_status")).v;
-    r.check("前置：当前是 Qoder 且装着 12 条", ["qoder", 12], [st0?.agent, st0?.managed]);
+    // 这里比的是「当前那家是谁 + 每文件应有几条」；`managed` 是所有目标文件加起来的条数，
+    // runner 上 Qoder 有两个样例文件（cfg-a / cfg-b），装满是 24 不是 12 —— 别拿它当每文件的数。
+    r.check("前置：当前是 Qoder", "qoder", st0?.agent);
+    r.check("前置：Qoder 装满了条目", [12, true], [st0?.expectedPerFile, (st0?.managed ?? 0) > 0]);
+    const qManagedBefore = st0?.managed;
 
     const clickedW = await clickShadow(".hk-agent-workbuddy", "四选一里有 WorkBuddy 这个按钮");
     r.check(
@@ -1270,7 +1274,11 @@ try {
     r.check("确认文案带上用户自己的条数", true, /1 条/.test(panel));
     // 本组的核心一条：预检若排在卸旧之后，症状是 Qoder 已被摘干净、WorkBuddy 又没装上，桌宠从此两边都不动。
     const keptQ = (await settings.invoke("agent_hooks_status")).v;
-    r.check("被拦下时旧的那家一条没卸（预检排在卸旧之前）", ["qoder", 12], [keptQ?.agent, keptQ?.managed]);
+    r.check(
+      "被拦下时旧的那家一条没卸（预检排在卸旧之前）",
+      [keptQ?.agent, qManagedBefore],
+      ["qoder", keptQ?.managed],
+    );
     r.check("被拦下时 WorkBuddy 的文件一个字节没动", wBefore, readFileSync(wf, "utf8"));
 
     const clickedYesW = await clickShadow(".hk-consent", "「仍要打开」点得到");
@@ -1322,7 +1330,9 @@ try {
       [stW?.agent, stW?.expectedPerFile, stW?.managed],
     );
     r.check("装完提示由适配器给（彻底退出 + 实验性）", true, /退出/.test(String(stW?.hint)) && /实验性/.test(String(stW?.hint)));
-    r.check("WorkBuddy 没有可查日志，自检是 null 而不是 ok", true, stW?.selfCheck == null);
+    // 自检字段只在 `agent_linkage_set` 的返回里（status 没有这个键，比它等于没比）。
+    const setW = await settings.invoke("agent_linkage_set", { agent: "workbuddy", confirm: true });
+    r.check("WorkBuddy 没有可查日志，set 返回的 selfCheck 是 null 而不是 ok", true, setW.ok === true && setW.v?.selfCheck == null);
 
     const evCountW = async () => (await c.ev(`window.__topics.filter(([k]) => k === 'host-event').length`));
     const evBeforeW = await evCountW();
