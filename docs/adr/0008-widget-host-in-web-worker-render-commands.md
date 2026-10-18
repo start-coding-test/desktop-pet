@@ -66,7 +66,7 @@ widget 今天是宿主 realm 直接 `mount(shadowRoot, ctx)` 拿到真的 Shadow
 
 ### 3. 反向事件：白名单事件名 + 净化后的标量载荷
 
-`el-on` 是 22 表里完全没有对应物的那条通道。形状定死：
+`el-on` 是当时那张 22 方法表里完全没有对应物的那条通道。形状定死：
 
 - Worker 侧 `node.on(event, handler)` → 发一条 `sub` op；宿主在该节点上 `addEventListener`；
 - 事件回流：`{t:"widget-event", nodeId, event, value}`；`value` 只允许**标量或纯对象快照**
@@ -146,12 +146,12 @@ localStorage 例外名单。这把键**连名带义一起换**：新的 `host:wi
 
 ## 后果
 
-- **widget 的调用面比入口的 22 表窄**：只有 `bus.publish` / `bus.subscribe`，加上 settings 区的 `agentHooks.{status,install,uninstall}`。`storage` / `http` / `pet.*` / `notify.*` 一概不开 —— widget 今天在宿主 realm 里也拿不到它们，借搬迁扩权不接受；要开得先改本 ADR。
+- **widget 的调用面比入口的 23 表窄**：只有 `bus.publish` / `bus.subscribe`，加上 settings 区的 `agentHooks.{status,install,uninstall,set}`（`set` 由 A02 为设置页四选一追加）。`storage` / `http` / `pet.*` / `notify.*` 一概不开 —— widget 今天在宿主 realm 里也拿不到它们，借搬迁扩权不接受；要开得先改本 ADR。
 - **宿主对每一次 `call` 都必须回一个 `result`**（含它不认的方法名，回 `ok:false`）。`boot` 会 await 插件的 `mount()`，插件在 mount 里发出的调用没人回包，这个 widget 就永远起不来 —— 这条由 `tests/unit/unit-widget-worker.mjs` 钉住，不靠实现者记得。
 
 - 契约实现落在 `src/runtime/` 目录下新增的三个文件与一处接缝：widget-protocol.ts（消息形状 + op 词表，
   和 plugin-worker-protocol.ts 一样**不许 import host-error 与 @tauri-apps**）、widget-node.ts（Worker 侧虚拟节点）、
-  widget-renderer.ts（宿主侧 apply），接缝是 widget-host.ts 的 doMount()。22 个方法表**不动**——它管能力调用，widget 渲染走的是新通道。
+  widget-renderer.ts（宿主侧 apply），接缝是 widget-host.ts 的 doMount()。那张能力方法表（写本 ADR 时 22 条）**不动**——它管能力调用，widget 渲染走的是新通道。（后来 A02 为设置页四选一给它加了第 23 条 `agentHooks.set`，与本 ADR 的渲染通道无关，见 ADR-0006。）
 - 四个插件的 widget 图已迁移完毕（A10–A13，2026-10-15）：待办 1 文件 / agent 桥 1 / 心率 1 /
   盯盘 **19 个文件**（按 `widget.js` 的 import 闭包算，含 `market.js` 与 `sources/*` ——
   数据模块也会一起被 Worker 加载）。四张卡白名单不重叠，真并行。

@@ -3,9 +3,9 @@
 # **已证明：首次跑绿是 run 38776535438**（2026-10-16，开发机自托管 runner CHEN，套件 verify + verify:agent）。
 # 后续（2026-10-16，runner chen_work）：verify:game 15/0 是 run 38832007396；
 # 更早的 verify:agent 77/0 是 run 38832924368，跑的时候 Qoder 一直在调工具，证明 PET_AGENT_INBOX 隔离生效。
-# verify:agent 的**当期基线是 113/0**（run 39104215835，A02 加了「来源过滤」一组与
-# 「装好的条目带 --agent qoder」「agent:state 也带 agent」两条断言）。
-# 上一版 104/0 是 run 39030477943（PR #9 的启停联动与 --pet-hook-cleanup 两组）。
+# verify:agent 的**当期基线是 148/0**（run 39117381226，A02 加的：「ZCode 切换」整组真实点击判据 +
+# 「来源过滤」一组 + 「装好的条目带 --agent qoder」「agent:state 也带 agent」两条）。
+# 上一版 113/0 是 run 39104215835；再上一版 104/0 是 run 39030477943（PR #9 的启停联动与 --pet-hook-cleanup 两组）。
 #
 # 托管 runner 已证否（run 38757735230，2026-10-15，windows-latest）：编译、起 dev 实例都过，
 # 之后每个进程（含 node 与 actions 的 post 步）都以 -1073741502 = 0xC0000142（DLL 初始化失败）退出，
