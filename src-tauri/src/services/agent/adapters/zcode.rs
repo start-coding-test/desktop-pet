@@ -304,6 +304,31 @@ fn user_hook_count(raw: &str) -> usize {
         .count()
 }
 
+/// 装后自检要认的三种坏味道（方案 §3.5）。字段名只有文档里这三个，所以判的是
+/// 「这一行里出现了这个标记」而不是解析日志的 JSON 结构 —— ZCode 一改日志形状，
+/// 解析式实现会静默变成「永远查不出问题」，那种假绿比误报更坏。
+const BAD_MARKERS: [&str; 2] = ["config_file_invalid", "config.file.invalid"];
+
+/// 在「安装之后新写入的那些行」里找第一条说得通的坏行。
+///
+/// `hook.run.failed` 只有**行里带着我们的命令**才算我们的问题：ZCode 的日志里同一个事件
+/// 也会为用户自己的 hook 失败而写，把那条报成「你写的配置坏了」是栽赃。
+/// 而 `config_file_invalid` 不需要这个条件 —— 配置文件是我们刚改过的。
+pub fn scan_new_log_lines(new_text: &str, our_command: &str) -> Option<String> {
+    for line in new_text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if BAD_MARKERS.iter().any(|m| line.contains(m)) {
+            return Some(line.to_string());
+        }
+        if line.contains("hook.run.failed") && line.contains(our_command) {
+            return Some(line.to_string());
+        }
+    }
+    None
+}
+
 /// ZCode 接线表里的单例
 pub static ZCODE: ZCodeAdapter = ZCodeAdapter;
 
@@ -528,6 +553,33 @@ mod tests {
             "原来根本没这个键，恢复就是把它删掉"
         );
         assert_eq!(config["hooks"]["events"], json!({}), "别的键不动");
+    }
+
+    /// 装后自检的判据（`hook.run.failed` 那条要指向我们才算我们的）。
+    /// 这里喂的都是「安装之后新增的行」—— 旧行由调用方按字节偏移切掉，见
+    /// `agent_hooks::zcode_self_check`。
+    #[test]
+    fn post_install_scan_blames_us_only_where_the_evidence_points_at_us() {
+        let ours = "--agent zcode";
+        assert_eq!(
+            scan_new_log_lines(r#"{"level":"info","msg":"boot"}"#, ours),
+            None
+        );
+        let invalid = r#"{"event":"config_file_invalid","path":"config.json"}"#;
+        assert_eq!(scan_new_log_lines(invalid, ours).as_deref(), Some(invalid));
+        let dotted = r#"{"error":"config.file.invalid"}"#;
+        assert_eq!(scan_new_log_lines(dotted, ours).as_deref(), Some(dotted));
+        let theirs = r#"{"event":"hook.run.failed","command":"user-hook.sh"}"#;
+        assert_eq!(
+            scan_new_log_lines(theirs, ours),
+            None,
+            "用户自己的 hook 失败不能栽给我们"
+        );
+        let mine = r#"{"event":"hook.run.failed","command":"desktop-pet.exe --pet-hook pre --agent zcode"}"#;
+        assert_eq!(scan_new_log_lines(mine, ours).as_deref(), Some(mine));
+        // 多条坏行取第一条（那是最早出现的那次失败，最能说明问题）
+        let two = format!("{invalid}\n{mine}\n");
+        assert_eq!(scan_new_log_lines(&two, ours).as_deref(), Some(invalid));
     }
 
     /// `~/.zcode` 不存在 = 没装这个客户端：一个候选都不给

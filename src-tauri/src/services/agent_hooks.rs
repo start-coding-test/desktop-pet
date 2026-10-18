@@ -15,7 +15,7 @@ use std::sync::Mutex;
 
 use serde_json::{json, Value};
 
-use crate::services::agent::adapters::{self, AgentAdapter};
+use crate::services::agent::adapters::{self, zcode, AgentAdapter};
 use crate::services::agent::phases::AGENT_FLAG;
 
 /// 自家条目的识别标记。它同时是 hook 分支的 CLI 参数，两边共用这一个常量
@@ -231,6 +231,78 @@ pub fn uninstall_files(
             }
         })
         .collect()
+}
+
+/// ZCode 的日志目录（`<root>/.zcode/cli/log`），root 同样受 `PET_AGENT_HOME` 覆盖。
+fn zcode_log_dir(home: &Path) -> PathBuf {
+    let root = match std::env::var("PET_AGENT_HOME") {
+        Ok(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
+        _ => home.to_path_buf(),
+    };
+    root.join(".zcode").join("cli").join("log")
+}
+
+/// 目录里那个 `zcode-*.jsonl` 中**最后被写过**的一份。文件名里的日期格式我们不确定，
+/// 所以按 mtime 挑而不是自己拼日期 —— 拼错的表现是「永远查不出问题」，那种假绿最坏。
+fn newest_zcode_log(dir: &Path) -> Option<(PathBuf, u64)> {
+    let entries = fs::read_dir(dir).ok()?;
+    let mut best: Option<(std::time::SystemTime, PathBuf, u64)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        if !name.starts_with("zcode-") || !name.ends_with(".jsonl") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(mtime) = meta.modified() else { continue };
+        if best.as_ref().is_none_or(|(t, _, _)| mtime >= *t) {
+            best = Some((mtime, path, meta.len()));
+        }
+    }
+    best.map(|(_, path, len)| (path, len))
+}
+
+/// 装之前的日志「记号」：那份日志已经写到哪了。`None` = 当时还没有这份日志
+/// （没有日志目录，或目录里还没有文件）；装之后若冒出新文件，就整份当新增来读。
+#[derive(Debug)]
+pub struct LogMark {
+    pub path: PathBuf,
+    pub len: u64,
+}
+
+pub fn mark_zcode_log(home: &Path) -> Option<LogMark> {
+    let (path, len) = newest_zcode_log(&zcode_log_dir(home))?;
+    Some(LogMark { path, len })
+}
+
+/// 装后自检（方案 §3.5）：只读安装之后新增的那些行，判据住在 `zcode::scan_new_log_lines`。
+/// 三种结果必须分开报：查过没问题 / 查出问题（附原文）/ **没日志可读所以没查**。
+/// 把第三种说成第一种，等于给用户一张「一切正常」的假条。
+pub fn zcode_self_check(mark: Option<&LogMark>, home: &Path, our_command: &str) -> Value {
+    let Some((path, len)) = newest_zcode_log(&zcode_log_dir(home)) else {
+        return json!({ "status": "unavailable", "detail": "没找到 ZCode 的日志文件，装后自检没做成" });
+    };
+    // 还是那份文件就只看新增的一段；冒出新文件（跨天，或装之前根本没有日志）就整份算新增
+    let start = mark.filter(|m| m.path == path).map_or(0, |m| m.len);
+    if len <= start {
+        return json!({ "status": "ok", "detail": "装完到自检之间没有新日志行" });
+    }
+    let Ok(all) = fs::read(&path) else {
+        return json!({ "status": "unavailable", "detail": "日志读不出来，装后自检没做成" });
+    };
+    let end = (len as usize).min(all.len());
+    let tail = String::from_utf8_lossy(&all[start as usize..end]).to_string();
+    match zcode::scan_new_log_lines(&tail, our_command) {
+        Some(line) => json!({
+            "status": "problem",
+            "detail": "ZCode 读完新配置后报了错，下面这行是日志原文",
+            "logPath": path.display().to_string(),
+            "line": line,
+        }),
+        None => json!({ "status": "ok", "detail": "日志里没有指向我们的坏行" }),
+    }
 }
 
 /// 切换 Agent 之前问一句：这个适配器在它的候选文件里需不需要用户先确认
@@ -469,6 +541,60 @@ mod tests {
 
         // Qoder 没有总开关，永远不问
         assert_eq!(pending_consent(&QODER, std::slice::from_ref(&file)), None);
+
+        std::env::remove_var("PET_AGENT_HOME");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 装后自检的三种结果要能分开：新增坏行 / 没新行 / **没日志可读所以没查**。
+    /// 第三种最要紧：它不能长得像「查过了、一切正常」。
+    #[test]
+    fn self_check_separates_problem_from_ok_from_not_checked() {
+        let _env = adapters::lock_test_env();
+        let dir = tmp_dir("selfcheck");
+        std::env::set_var("PET_AGENT_HOME", &dir);
+        let log = dir.join(".zcode").join("cli").join("log");
+        let bad_line = r#"{"event":"config_file_invalid","path":"config.json"}"#;
+
+        // 1) 还没有日志目录 = 没查
+        assert_eq!(
+            zcode_self_check(mark_zcode_log(&dir).as_ref(), &dir, "--agent zcode")["status"],
+            "unavailable",
+            "没日志时必须说「没查」，不是「查过且没问题」"
+        );
+
+        // 2) 装之前就有的坏行按字节偏移切掉，不算我们引入的
+        fs::create_dir_all(&log).unwrap();
+        let file = log.join("zcode-2026-10-18.jsonl");
+        fs::write(&file, format!("{bad_line}\n")).unwrap();
+        let mark = mark_zcode_log(&dir).expect("该能挑出这份日志");
+        fs::write(&file, format!("{bad_line}\n{{\"level\":\"info\"}}\n")).unwrap();
+        let ok = zcode_self_check(Some(&mark), &dir, "--agent zcode");
+        assert_eq!(ok["status"], "ok", "新增的那行不是坏行：{ok}");
+
+        // 3) 装之后追加坏行 → problem，并把原文交出去
+        fs::write(
+            &file,
+            format!("{bad_line}\n{{\"level\":\"info\"}}\n{bad_line}2\n"),
+        )
+        .unwrap();
+        let problem = zcode_self_check(Some(&mark), &dir, "--agent zcode");
+        assert_eq!(problem["status"], "problem");
+        assert!(
+            String::from(problem["line"].as_str().unwrap_or_default())
+                .contains("config_file_invalid"),
+            "设置页要能附上日志原文：{problem}"
+        );
+
+        // 4) 跨天冒出的新文件整份都算新增：记号对不上路径，不能当成「没新行」。
+        //    先删掉旧的那份，免得「挑最新日志」按 mtime 比较时两份同刻、结果不稳定。
+        fs::remove_file(&file).unwrap();
+        fs::write(log.join("zcode-2026-10-19.jsonl"), format!("{bad_line}\n")).unwrap();
+        assert_eq!(
+            zcode_self_check(Some(&mark), &dir, "--agent zcode")["status"],
+            "problem",
+            "新日志文件里的坏行也是我们的责任范围"
+        );
 
         std::env::remove_var("PET_AGENT_HOME");
         let _ = fs::remove_dir_all(&dir);

@@ -24,8 +24,8 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::host_error::{HostError, INTERNAL, INVALID_ARG, INVALID_STATE, NOT_FOUND};
 use crate::plugin_caps::AGENT_HOOKS;
-use crate::services::agent::adapters::{self, claude_style, AgentAdapter};
-use crate::services::agent::phases::DEFAULT_AGENT;
+use crate::services::agent::adapters::{self, claude_style, zcode, AgentAdapter};
+use crate::services::agent::phases::{AGENT_FLAG, DEFAULT_AGENT};
 use crate::services::agent::AgentState;
 use crate::services::agent_hooks::{self, FileReport};
 use crate::services::permission::PermissionState;
@@ -357,7 +357,15 @@ pub fn switch_agent(
         SwitchPlan::Install => {
             let exe = std::env::current_exe()
                 .map_err(|e| HostError::new(INTERNAL, format!("取不到自身路径: {e}")))?;
+            // 装之前先记下 ZCode 日志写到哪了 —— 装后自检只看这之后的行（方案 §3.5）。
+            // 别的客户端没有这份日志，所以 selfCheck 直接给 null，不假装「查过且没问题」。
+            let mark = (adapter.id() == zcode::ZCODE.id())
+                .then(|| agent_hooks::mark_zcode_log(home))
+                .flatten();
             let reports = agent_hooks::install_files(adapter, &targets, &exe);
+            let self_check = (adapter.id() == zcode::ZCODE.id()).then(|| {
+                agent_hooks::zcode_self_check(mark.as_ref(), home, &format!("{} zcode", AGENT_FLAG))
+            });
             // 只有真装上才算用户的选择（note_installed 里判），全失败时状态文件保持「没选过」
             note_installed(app, adapter.id(), &reports);
             Ok(json!({
@@ -366,6 +374,8 @@ pub fn switch_agent(
                 "removed": removed.iter().map(|r| r.managed).sum::<usize>(),
                 "files": reports,
                 "hint": adapter.post_install_hint(),
+                // null = 这个客户端没有「装后读日志自检」这回事，不是「查过且干净」
+                "selfCheck": self_check,
             }))
         }
     }
