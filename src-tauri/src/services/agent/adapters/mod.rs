@@ -11,6 +11,8 @@
 //! 缓存住一份 home 根目录的探测结果就会往已经不存在的目录里写配置。
 
 pub mod claude_style;
+pub mod codex;
+pub mod workbuddy;
 pub mod zcode;
 
 use std::path::{Path, PathBuf};
@@ -87,11 +89,54 @@ pub trait AgentAdapter: Sync {
     fn switch_needs_consent(&self, _raw: &str) -> Option<usize> {
         None
     }
+
+    /// 「要用户拍板」时说的那句话（**不带** `[need-confirm]` 前缀，前缀由 `linkage::confirm_prompt` 加，
+    /// 那个前缀是界面判「这是确认还是失败」的机器可读契约）。
+    ///
+    /// 默认讲的是 ZCode 那种开关：显式关着，打开会连带把用户自己配的 N 条一起启用，而且**是我们将要去打开它**。
+    /// 开关语义相反的家必须自己说一句：WorkBuddy 的 `disableAllHooks` 我们**不替用户改**，
+    /// 照默认措辞显示就是在骗人 —— 用户以为点一下就会打开，实际那个键一动不动，装完还是不触发。
+    fn consent_prompt(&self, user_hooks: usize) -> String {
+        format!(
+            "{} 的 hook 总开关现在是关的，打开以后你之前配的 {} 条 hook 也会一起生效。确认请再点一次。",
+            self.display_name(),
+            user_hooks
+        )
+    }
+
+    /// 装完之后宿主能自己去读的日志（方案 §3.5 的「装后自检」）。`None` = 这一家没有可查的日志。
+    ///
+    /// 为什么它是接口的一部分而不是 `agent_hooks` 里的一句 `if id == zcode`：接线第三家时，
+    /// 那句硬编码会**静默**沿用 ZCode 的日志路径 —— 症状是新那家的自检永远报「没找到日志」，
+    /// 而读代码的人以为它压根没做自检。路径、文件名形状和「什么算坏行」都只有适配器知道。
+    fn log_watch(&self, _home: &Path) -> Option<LogWatch> {
+        None
+    }
+
+    /// 在「安装之后新写入的那些行」里找第一条能归责到我们头上的行；`Some(原文)` = 查出问题。
+    /// 只有实现了 `log_watch` 的适配器会被调到（调用方先看 `log_watch` 是不是 `None`）。
+    fn scan_log_tail(&self, _new_text: &str, _our_command: &str) -> Option<String> {
+        None
+    }
+}
+
+/// 装后自检要盯的那份日志：哪个目录、文件名什么形状。
+/// 前缀后缀带着走是因为日期格式是我们不确定的事实（ZCode 是 `zcode-<日期>.jsonl`），
+/// 所以调用方按 mtime 挑最新的一份，而不是自己拼一个可能拼错的文件名。
+pub struct LogWatch {
+    pub dir: PathBuf,
+    pub prefix: &'static str,
+    pub suffix: &'static str,
 }
 
 /// 已经接线的适配器。装卸、状态、卸载前清理都按这张表走 ——
 /// 没在这里出现的 id 就算过了 `--agent` 的白名单（那是命令行校验用的），宿主也不动配置文件。
-static WIRED: &[&dyn AgentAdapter] = &[&claude_style::QODER, &zcode::ZCODE];
+static WIRED: &[&dyn AgentAdapter] = &[
+    &claude_style::QODER,
+    &zcode::ZCODE,
+    &codex::CODEX,
+    &workbuddy::WORKBUDDY,
+];
 
 pub fn wired() -> &'static [&'static dyn AgentAdapter] {
     WIRED
@@ -112,7 +157,8 @@ pub fn is_wired(id: &str) -> bool {
 pub struct Choice {
     pub id: &'static str,
     pub display_name: &'static str,
-    /// `false` = 命令行认得但宿主还没接（PR-3 的 codex / workbuddy），界面按禁选渲染
+    /// `false` = 命令行认得但宿主还没接（四家都接线之后这条路只是保险：白名单先加了取值、
+    /// 适配器还没写的那个中间状态），界面按禁选渲染
     pub wired: bool,
     pub hint: Option<&'static str>,
 }
@@ -191,10 +237,42 @@ mod tests {
     /// 客户端」和「这值本来就是脏的」，两者都不许装。
     #[test]
     fn unknown_ids_are_never_wired() {
-        assert!(is_wired("qoder"), "Qoder 是唯一从 PR-1 就接线的");
+        assert!(
+            is_wired("qoder"),
+            "Qoder 从 PR-1 就接线，不许在扩表时被顶掉"
+        );
         assert!(!is_wired(""));
         assert!(!is_wired("nope"));
         assert!(!is_wired("Qoder"), "id 是大小写敏感的，别拿显示名当 id");
+    }
+
+    /// `--agent` 白名单里的四家**现在都接了线**。这条是「扩表时漏掉一家」唯一的离线判据：
+    /// 上面那条 subset 判据在少一家时照样绿，而症状出现在用户那边 —— 设置页那一格点了没反应，
+    /// 宿主报「还不认识这个 Agent」。同时它反向钉住「白名单不许悄悄多出第五个值」：
+    /// 加了 CLI 取值却没写适配器，这条会红着提醒你把两处一起改。
+    #[test]
+    fn every_cli_agent_id_is_wired() {
+        assert_eq!(
+            wired().len(),
+            crate::services::agent::phases::AGENT_IDS.len(),
+            "--agent 白名单与已接线注册表必须一一对应"
+        );
+        for id in crate::services::agent::phases::AGENT_IDS {
+            assert!(
+                is_wired(id),
+                "{id} 在 --agent 白名单里但没有适配器，点了会拒"
+            );
+        }
+        // 事件表长度按各家事实钉住：数字本身不是重点，「谁家的表被顺手改短了」才是
+        let per_family: Vec<(&str, usize)> =
+            wired().iter().map(|a| (a.id(), a.events().len())).collect();
+        for (id, want) in [("qoder", 12), ("zcode", 7), ("codex", 10), ("workbuddy", 7)] {
+            assert_eq!(
+                per_family.iter().find(|(x, _)| *x == id).map(|(_, n)| *n),
+                Some(want),
+                "{id} 的事件表长度变成别的数了（方案 §3A/§3B 各家一张表）"
+            );
+        }
     }
 
     /// 适配器装的事件必须能被自己的解析器收回来：安装表里的 phase 不在 `PHASES`

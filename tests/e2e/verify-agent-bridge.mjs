@@ -960,7 +960,7 @@ try {
   }
 
   // ⑨ ZCode 切换（A02-4）：夹具目录由本套件自建自删，工作流不负责预置。
-  // 只跑 ZCode —— codex / workbuddy 的适配器在 PR-3 接线，那时按同一形状各加一组。
+  // 本组只跑 ZCode；Codex 与 WorkBuddy 各有自己的组在下面（A03），三组共用这套夹具目录与界面判据。
   r.group("ZCode 切换：确认门、双文件、总开关恢复（只碰 PET_AGENT_HOME 下的夹具）");
   const ZHOME = String(env.PET_AGENT_HOME ?? "");
   // 两组前置都要满足：PET_AGENT_HOME 在 temp 下（写盘安全），且④那组真的把设置页开起来了
@@ -1049,8 +1049,10 @@ try {
 
     const stZ = (await settings.invoke("agent_hooks_status")).v;
     r.check("状态页按当前那一家报（agent=zcode，每文件 7 条）", ["zcode", 7, 7], [stZ?.agent, stZ?.expectedPerFile, stZ?.managed]);
-    r.check("四选一清单列全四个槽位（含未接线的 codex/workbuddy）", ["codex", "qoder", "workbuddy", "zcode"], (stZ?.options ?? []).map((o) => o.id).sort());
-    r.check("未接线的槽位标成 wired=false", false, (stZ?.options ?? []).find((o) => o.id === "codex")?.wired);
+    r.check("四选一清单列全四个槽位", ["codex", "qoder", "workbuddy", "zcode"], (stZ?.options ?? []).map((o) => o.id).sort());
+    // A02 时这里是「codex/workbuddy 标 wired=false」。A03 把两家接上线之后事实变了，
+    // 判据跟着变严而不是删掉：四家全 true，且清单仍由宿主的 options 给（界面不自己养名单）。
+    r.check("四家都已接线（不再有禁选槽位）", [true, true, true, true], (stZ?.options ?? []).map((o) => o.wired).sort());
     r.check("装完提示由适配器给（新开会话才生效）", true, /新开/.test(String(stZ?.hint)));
 
     // 来源过滤在真实切换之后仍只对当前那一家放行：注入 qoder 事件不该动桌宠，zcode 事件该动
@@ -1090,6 +1092,292 @@ try {
     // 夹具目录自己删：工作流不负责预置，也不能把它留给下一轮
     rmSync(join(ZHOME, ".zcode"), { recursive: true, force: true });
     r.check("夹具目录已自删", false, existsSync(zcli));
+  }
+
+  // ⑩ Codex 切换（A03）：`~/.codex/hooks.json`，与 Qoder 同构，**没有总开关**。
+  // 夹具目录由本组自建自删；`PET_AGENT_HOME` 已被 claude_style 的 targets() 认作 home 根，
+  // 所以真实用户目录一个都不会被碰到。
+  r.group("Codex 切换：目录在就建文件、10 个事件、timeout 按秒、不谎称查过自检");
+  if (!zhomeOk) {
+    r.info("跳过 Codex 组", "前置不成立（PET_AGENT_HOME 不在 temp 下或设置页没挂载），本组一个文件都不写");
+  } else {
+    const cdir = join(ZHOME, ".codex");
+    const cf = join(cdir, "hooks.json");
+    rmSync(cdir, { recursive: true, force: true });
+    mkdirSync(cdir, { recursive: true });
+    // Qoder 那侧的条目数直接从它的文件读：status() 只按「当前那家」报，切换之后看不到上一家的残局
+    const qfiles = String(env.PET_AGENT_CONFIG_FILES ?? "")
+      .split(";")
+      .map((x) => String(x).trim())
+      .filter(Boolean);
+    const qMine = () =>
+      qfiles.reduce((n, f) => n + (existsSync(f) ? readFileSync(f, "utf8").split("--pet-hook").length - 1 : 0), 0);
+
+    r.check("前置：.codex 在但 hooks.json 不在", false, existsSync(cf));
+    r.check("前置：Qoder 那侧有条目可摘（切换才有东西要卸）", true, qMine() > 0);
+
+    const clickedC = await clickShadow(".hk-agent-codex", "四选一里有 Codex 这个按钮");
+    r.check(
+      "点 Codex 的监听被调到（面板 dataset.lastSwitch）",
+      "codex",
+      await settings.client.ev(
+        `(async () => { const rec = ${recExpr}; return rec?.shadow?.querySelector('.hk-status')?.dataset.lastSwitch ?? ""; })()`,
+      ),
+    );
+    // Codex 没有 disableAllHooks 那种键：走到确认门就是错的（它会拦住一次本来不需要问的切换）
+    r.check(
+      "Codex 没有总开关 → 不该出现确认门，直接装上（界面 state=installed）",
+      true,
+      clickedC && (await waitUntil(settings.client, stateExpr("installed"), 20_000)),
+    );
+    r.check("目录在而文件不在时把 hooks.json 建出来", true, existsSync(cf));
+    const cText = readFileSync(cf, "utf8");
+    r.check("装了 10 个事件（含 Interrupt，不含 PostToolUseFailure）", 10, cText.split("--pet-hook").length - 1);
+    r.check("条目带 --agent codex", true, cText.includes("--pet-hook pre --agent codex"));
+    r.check(
+      "timeout 用秒的那个键名（不是 ZCode 的 timeoutMs）",
+      true,
+      /"timeout": 2/.test(cText) && !cText.includes("timeoutMs"),
+    );
+    r.check("与 Qoder 同构：一个 matcher 都不写", false, /"matcher"/.test(cText));
+    const cj = JSON.parse(cText);
+    r.check("形状是 hooks.<事件>[].hooks[]", true, Array.isArray(cj.hooks?.PreToolUse?.[0]?.hooks));
+    r.check("切走 Qoder 时把它的条目摘净（同一时间只联动一个）", 0, qMine());
+
+    const stC = (await settings.invoke("agent_hooks_status")).v;
+    r.check(
+      "状态页按 Codex 报（agent=codex，每文件 10 条）",
+      ["codex", 10, 10],
+      [stC?.agent, stC?.expectedPerFile, stC?.managed],
+    );
+    r.check("装完提示由适配器给（要去 /hooks 信任）", true, /\/hooks/.test(String(stC?.hint)));
+
+    // 再点一次：幂等，且 selfCheck 必须是「这一家没这回事」而不是「查过且没问题」
+    const reC = await settings.invoke("agent_linkage_set", { agent: "codex" });
+    r.check("重复切换不越装越多（还是 10 条）", 10, readFileSync(cf, "utf8").split("--pet-hook").length - 1);
+    r.check("Codex 的装后自检是 null，不是 ok", true, reC.ok === true && reC.v?.selfCheck == null);
+
+    // 用户在同一个文件里配过东西：重装只动我们那些，别的键与条一个都不许碰
+    const withUser = JSON.parse(readFileSync(cf, "utf8"));
+    withUser.model = "gpt-5-codex";
+    withUser.hooks.PreToolUse.push({ hooks: [{ type: "command", command: "user-codex-hook.sh", timeout: 5 }] });
+    writeFileSync(cf, JSON.stringify(withUser, null, 2));
+    const reC2 = await settings.invoke("agent_linkage_set", { agent: "codex" });
+    const cAfter = JSON.parse(readFileSync(cf, "utf8"));
+    r.check(
+      "用户自己那条 hook 没被摘掉",
+      true,
+      (cAfter.hooks.PreToolUse ?? []).some((g) => (g.hooks ?? []).some((h) => h.command === "user-codex-hook.sh")),
+    );
+    r.check("我们那些仍是 10 条", 10, reC2.v?.files?.reduce((n, f) => n + (f.managed ?? 0), 0));
+    r.check("没写过的顶层键原样留着（model）", "gpt-5-codex", cAfter.model);
+
+    // 来源过滤：当前是 Codex 时，qoder 的事件不该驱动桌宠，codex 的事件要能
+    const evCountC = async () => (await c.ev(`window.__topics.filter(([k]) => k === 'host-event').length`));
+    const evBeforeC = await evCountC();
+    spawnSync(EXE, ["--pet-hook", "pre", "--agent", "qoder"], {
+      input: JSON.stringify({ session_id: `verify-back-codex-${Date.now()}`, tool_name: "Bash" }),
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    await sleep(1_500);
+    r.check("当前是 Codex 时，注入 qoder 事件不广播", evBeforeC, await evCountC());
+    spawnSync(EXE, ["--pet-hook", "pre", "--agent", "codex"], {
+      input: JSON.stringify({ session_id: `verify-codex-live-${Date.now()}`, tool_name: "Bash" }),
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    r.check(
+      "切到 Codex 后自己的事件照常广播",
+      true,
+      await waitUntil(
+        c,
+        `(window.__topics.slice().reverse().find(([k]) => k === 'host-event')?.[1]?.agent === 'codex')`,
+        8_000,
+      ),
+    );
+
+    // 中途把客户端目录删掉：查状态要按「没装」报，而且不许凭空造回目录（每次装卸都重新检测的端到端证据）
+    rmSync(cdir, { recursive: true, force: true });
+    const stGone = (await settings.invoke("agent_hooks_status")).v;
+    r.check("目录被删掉之后一个候选都不给（按未安装报）", 0, (stGone?.files ?? []).length);
+    r.check("查状态不会凭空造出 .codex 目录", false, existsSync(cdir));
+
+    const clickedBackC = await clickShadow(".hk-agent-qoder", "四选一里 Qoder 可点（切回）");
+    r.check(
+      "切回 Qoder 后界面回到已安装",
+      true,
+      clickedBackC && (await waitUntil(settings.client, stateExpr("installed"), 20_000)),
+    );
+    const stQ2 = (await settings.invoke("agent_hooks_status")).v;
+    r.check("状态页跟着回到 Qoder", ["qoder", 12], [stQ2?.agent, stQ2?.expectedPerFile]);
+    r.check("切回之后 .codex 仍然不存在（没被顺手建出来）", false, existsSync(cdir));
+
+    rmSync(cdir, { recursive: true, force: true });
+    r.check("Codex 夹具目录已自删", false, existsSync(cdir));
+  }
+
+  // ⑪ WorkBuddy 切换（A03）：`~/.workbuddy/settings.json`，总开关是**反向**的 disableAllHooks，
+  // 而且我们不替用户改它 —— 所以确认门必须排在卸旧之前，否则会出现「旧的已摘、新的没装」那种两边都不动的状态。
+  r.group("WorkBuddy 切换：卸旧之前的预检、7 个事件、matcher 只给工具类、不动用户的开关");
+  if (!zhomeOk) {
+    r.info("跳过 WorkBuddy 组", "前置不成立，本组一个文件都不写");
+  } else {
+    const wdir = join(ZHOME, ".workbuddy");
+    const wf = join(wdir, "settings.json");
+    rmSync(wdir, { recursive: true, force: true });
+    mkdirSync(wdir, { recursive: true });
+    const wfiles = String(env.PET_AGENT_CONFIG_FILES ?? "")
+      .split(";")
+      .map((x) => String(x).trim())
+      .filter(Boolean);
+    const wMine = () =>
+      wfiles.reduce((n, f) => n + (existsSync(f) ? readFileSync(f, "utf8").split("--pet-hook").length - 1 : 0), 0);
+    const userGroup = { matcher: "Bash", hooks: [{ type: "command", command: "user-wb-hook.sh", timeout: 5 }] };
+    writeFileSync(
+      wf,
+      JSON.stringify(
+        { theme: "dark", disableAllHooks: true, hooks: { PreToolUse: [userGroup] }, model: "wb-sonnet" },
+        null,
+        2,
+      ),
+    );
+    const wBefore = readFileSync(wf, "utf8");
+    const st0 = (await settings.invoke("agent_hooks_status")).v;
+    // 这里比的是「当前那家是谁 + 每文件应有几条」；`managed` 是所有目标文件加起来的条数，
+    // runner 上 Qoder 有两个样例文件（cfg-a / cfg-b），装满是 24 不是 12 —— 别拿它当每文件的数。
+    r.check("前置：当前是 Qoder", "qoder", st0?.agent);
+    r.check("前置：Qoder 装满了条目", [12, true], [st0?.expectedPerFile, (st0?.managed ?? 0) > 0]);
+    const qManagedBefore = st0?.managed;
+
+    const clickedW = await clickShadow(".hk-agent-workbuddy", "四选一里有 WorkBuddy 这个按钮");
+    r.check(
+      "点 WorkBuddy 的监听被调到（面板 dataset.lastSwitch）",
+      "workbuddy",
+      await settings.client.ev(
+        `(async () => { const rec = ${recExpr}; return rec?.shadow?.querySelector('.hk-status')?.dataset.lastSwitch ?? ""; })()`,
+      ),
+    );
+    r.check(
+      "disableAllHooks 为 true → 第一趟停在确认门",
+      true,
+      clickedW && (await waitUntil(settings.client, stateExpr("consent"), 12_000)),
+    );
+    r.info("点 WorkBuddy 之后面板原文", String(await statusText()));
+    const panel = String(await statusText());
+    r.check("确认文案点名是哪个开关", true, panel.includes("disableAllHooks"));
+    r.check(
+      "确认文案说清我们不替用户改（照 ZCode 那句讲就是在骗人）",
+      true,
+      panel.includes("不会替你改") && !panel.includes("打开以后你之前配的"),
+    );
+    r.check("确认文案带上用户自己的条数", true, /1 条/.test(panel));
+    // 本组的核心一条：预检若排在卸旧之后，症状是 Qoder 已被摘干净、WorkBuddy 又没装上，桌宠从此两边都不动。
+    const keptQ = (await settings.invoke("agent_hooks_status")).v;
+    r.check(
+      "被拦下时旧的那家一条没卸（预检排在卸旧之前）",
+      ["qoder", qManagedBefore],
+      [keptQ?.agent, keptQ?.managed],
+    );
+    r.check("被拦下时 WorkBuddy 的文件一个字节没动", wBefore, readFileSync(wf, "utf8"));
+
+    const clickedYesW = await clickShadow(".hk-consent", "「仍要打开」点得到");
+    r.check(
+      "点「仍要打开」之后装上（界面 state=installed）",
+      true,
+      clickedYesW && (await waitUntil(settings.client, stateExpr("installed"), 20_000)),
+    );
+    const wText = readFileSync(wf, "utf8");
+    r.check("装了 7 个事件（实测会触发的那 7 条）", 7, wText.split("--pet-hook").length - 1);
+    r.check("条目带 --agent workbuddy", true, wText.includes("--pet-hook pre --agent workbuddy"));
+    const wj = JSON.parse(wText);
+    const ourGroupOf = (ev) =>
+      (wj.hooks?.[ev] ?? []).find((g) => (g.hooks ?? []).some((h) => String(h.command).includes("--pet-hook")));
+    r.check(
+      "工具类事件（PreToolUse / PostToolUse）带 matcher",
+      true,
+      ["PreToolUse", "PostToolUse"].every((ev) => ourGroupOf(ev)?.matcher === ".*"),
+    );
+    r.check(
+      "其余五个事件不写 matcher",
+      true,
+      ["SessionStart", "UserPromptSubmit", "PermissionRequest", "Notification", "Stop"].every(
+        (ev) => ourGroupOf(ev) !== undefined && !("matcher" in ourGroupOf(ev)),
+      ),
+    );
+    r.check(
+      "timeout 按秒（CodeBuddy 文档口径）",
+      true,
+      JSON.stringify(ourGroupOf("Stop").hooks).includes('"timeout":2'),
+    );
+    r.check("disableAllHooks 没被我们改动（仍是 true）", true, wj.disableAllHooks === true);
+    r.check(
+      "用户自己那条与它的 matcher 原样还在",
+      true,
+      (wj.hooks.PreToolUse ?? []).some((g) => g.matcher === "Bash" && g.hooks?.[0]?.command === "user-wb-hook.sh"),
+    );
+    r.check(
+      "其他顶层键一个不少，且键序原样",
+      ["theme", "disableAllHooks", "hooks", "model"],
+      Object.keys(wj),
+    );
+    r.check("确认之后旧的那家才被摘净", 0, wMine());
+
+    const stW = (await settings.invoke("agent_hooks_status")).v;
+    r.check(
+      "状态页按 WorkBuddy 报（agent=workbuddy，每文件 7 条）",
+      ["workbuddy", 7, 7],
+      [stW?.agent, stW?.expectedPerFile, stW?.managed],
+    );
+    r.check("装完提示由适配器给（彻底退出 + 实验性）", true, /退出/.test(String(stW?.hint)) && /实验性/.test(String(stW?.hint)));
+    // 自检字段只在 `agent_linkage_set` 的返回里（status 没有这个键，比它等于没比）。
+    const setW = await settings.invoke("agent_linkage_set", { agent: "workbuddy", confirm: true });
+    r.check("WorkBuddy 没有可查日志，set 返回的 selfCheck 是 null 而不是 ok", true, setW.ok === true && setW.v?.selfCheck == null);
+
+    const evCountW = async () => (await c.ev(`window.__topics.filter(([k]) => k === 'host-event').length`));
+    const evBeforeW = await evCountW();
+    spawnSync(EXE, ["--pet-hook", "pre", "--agent", "zcode"], {
+      input: JSON.stringify({ session_id: `verify-back-wb-${Date.now()}`, tool_name: "Bash" }),
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    await sleep(1_500);
+    r.check("当前是 WorkBuddy 时，别家（zcode）的事件不广播", evBeforeW, await evCountW());
+    spawnSync(EXE, ["--pet-hook", "pre", "--agent", "workbuddy"], {
+      input: JSON.stringify({ session_id: `verify-wb-live-${Date.now()}`, tool_name: "Bash" }),
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    r.check(
+      "切到 WorkBuddy 后自己的事件照常广播",
+      true,
+      await waitUntil(
+        c,
+        `(window.__topics.slice().reverse().find(([k]) => k === 'host-event')?.[1]?.agent === 'workbuddy')`,
+        8_000,
+      ),
+    );
+
+    const clickedBackW = await clickShadow(".hk-agent-qoder", "切回 Qoder 的按钮可点");
+    r.check(
+      "切回 Qoder 后界面回到已安装",
+      true,
+      clickedBackW && (await waitUntil(settings.client, stateExpr("installed"), 20_000)),
+    );
+    const wAfter = JSON.parse(readFileSync(wf, "utf8"));
+    r.check("WorkBuddy 的条目摘净", 0, readFileSync(wf, "utf8").split("--pet-hook").length - 1);
+    r.check("摘完也不碰用户的开关（disableAllHooks 仍是 true）", true, wAfter.disableAllHooks === true);
+    r.check(
+      "用户自己那条还在",
+      true,
+      (wAfter.hooks?.PreToolUse ?? []).some((g) => g.hooks?.[0]?.command === "user-wb-hook.sh"),
+    );
+    r.check("摘完之后键序与其余内容回到原样", ["theme", "disableAllHooks", "hooks", "model"], Object.keys(wAfter));
+    const stQ3 = (await settings.invoke("agent_hooks_status")).v;
+    r.check("状态页跟着回到 Qoder", ["qoder", 12], [stQ3?.agent, stQ3?.expectedPerFile]);
+
+    rmSync(wdir, { recursive: true, force: true });
+    r.check("WorkBuddy 夹具目录已自删", false, existsSync(wdir));
   }
 
   r.group("收尾前的完整性");
