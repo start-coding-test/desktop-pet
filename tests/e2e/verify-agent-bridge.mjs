@@ -1276,8 +1276,8 @@ try {
     const keptQ = (await settings.invoke("agent_hooks_status")).v;
     r.check(
       "被拦下时旧的那家一条没卸（预检排在卸旧之前）",
-      [keptQ?.agent, qManagedBefore],
-      ["qoder", keptQ?.managed],
+      ["qoder", qManagedBefore],
+      [keptQ?.agent, keptQ?.managed],
     );
     r.check("被拦下时 WorkBuddy 的文件一个字节没动", wBefore, readFileSync(wf, "utf8"));
 
