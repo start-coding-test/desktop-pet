@@ -194,7 +194,9 @@ function mountHookPanel(root, ctx) {
     .hk-box .hk-actions { display:flex; gap:6px; flex-wrap:wrap; }
     .hk-box .hk-agents { display:flex; gap:6px; flex-wrap:wrap; }
     .hk-box button { font:inherit; padding:2px 10px; }
-    .hk-box .hk-agents button[aria-pressed="true"] { border-color:#2563eb; color:#2563eb; font-weight:600; }
+    .hk-box .hk-agents button.off { color:#98a2b3; text-decoration:line-through; }
+    .hk-box .hk-consent-slot { display:none; }
+    .hk-box .hk-consent-slot.on { display:flex; gap:6px; }
     .hk-box .hk-status { white-space:pre-wrap; word-break:break-all; }
     .hk-box .hk-status.warn { color:#b54708; }
     .hk-box .hk-status.bad { color:#dc2626; }
@@ -228,20 +230,25 @@ function mountHookPanel(root, ctx) {
   // 上一次 set/install 带回的提示与自检结果；跟着 render 走，避免刷新一次就丢
   let lastHint = null;
   let lastCheck = null;
+  let pendingSwitch = null;
 
+  // 只用这份 widget 已经在用的那几种 DOM 动作：createElement / className / dataset /
+  // textContent / on / append / replaceChildren(带节点)。零参的 replaceChildren 与
+  // setAttribute("aria-pressed") / .disabled= 都不在其中 —— 上一版在这里冻结了整块面板：
+  // 安装真的落盘了，面板却永远停在「正在读取状态…」。
   const paintPicker = () => {
-    picker.replaceChildren();
+    const nodes = [];
     for (const opt of options) {
       const b = ctx.dom.createElement("button");
       b.type = "button";
-      b.className = `hk-agent hk-agent-${opt.id}`;
-      b.textContent = opt.wired ? opt.displayName : `${opt.displayName}（未接线）`;
+      b.className = opt.wired ? `hk-agent hk-agent-${opt.id}` : `hk-agent hk-agent-${opt.id} off`;
       b.dataset.agent = opt.id;
-      b.setAttribute("aria-pressed", String(opt.id === current));
-      if (!opt.wired) b.disabled = true;
-      else b.on("click", () => void switchTo(opt.id));
-      picker.append(b);
+      b.dataset.pressed = String(opt.id === current);
+      b.textContent = opt.wired ? opt.displayName : `${opt.displayName}（未接线）`;
+      if (opt.wired) b.on("click", () => void switchTo(opt.id));
+      nodes.push(b);
     }
+    if (nodes.length > 0) picker.replaceChildren(...nodes);
   };
 
   // 渲染只有一个口径：宿主的 status() 快照。外部值（路径/exe/error/日志原文）一律 textContent，不拼 HTML
@@ -250,8 +257,7 @@ function mountHookPanel(root, ctx) {
     const lines = [];
     options = Array.isArray(info?.options) ? info.options : [];
     current = String(info?.agent ?? "");
-    lastHint = info?.hint ?? null;
-    paintPicker();
+    if (info?.hint) lastHint = String(info.hint);
     const name = String(info?.displayName ?? current ?? "");
     if (files.length === 0) {
       st.dataset.state = "absent";
@@ -270,9 +276,11 @@ function mountHookPanel(root, ctx) {
     if (info.exe) lines.push(`hook 命令指向 ${info.exe}`);
     if (lastHint) lines.push(`生效条件：${lastHint}`);
     if (lastCheck) lines.push(lastCheck);
+    // 面板文本先落地，四选一后画：清单万一为空或形状不对，也不该把状态回显一起冻住
     st.textContent = lines.join("\n");
     st.classList.toggle("warn", st.dataset.state === "repair");
     st.classList.toggle("bad", Boolean(lastCheck) && lastCheck.startsWith("自检"));
+    paintPicker();
   };
 
   const refresh = async () => {
@@ -284,6 +292,7 @@ function mountHookPanel(root, ctx) {
     }
   };
   const run = async (label, fn) => {
+    hideConsent();
     st.dataset.state = "loading";
     st.textContent = `${label}中…`;
     try {
@@ -313,6 +322,7 @@ function mountHookPanel(root, ctx) {
   // 切换 = 先卸旧再装新，全部由宿主做（见 ADR-0002）。第一趟不带 confirm：
   // 需要用户拍板时宿主会原样拒掉并说明会连带启用几条，我们把那句话显示出来再问一次。
   const switchTo = async (id, confirm = false) => {
+    hideConsent();
     st.dataset.state = "loading";
     st.textContent = `切换到 ${id}…`;
     try {
@@ -336,18 +346,26 @@ function mountHookPanel(root, ctx) {
     }
   };
 
-  // 确认按钮单独占一格：每次重问都整格换掉，而不是往动作区堆「仍要打开」
-  // （只用这份 widget 已经在用的那几个 DOM 动作：createElement / replaceChildren / on）
+  // 确认按钮只在「宿主第一趟拒绝、等用户拍板」时出现：槽位常驻，靠 class 显隐
+  // （不动态增删节点：反复问不该把动作区堆成一排按钮，也不用零参 replaceChildren）
   const consentSlot = ctx.dom.createElement("div");
   consentSlot.className = "hk-consent-slot";
+  const consentBtn = ctx.dom.createElement("button");
+  consentBtn.type = "button";
+  consentBtn.className = "hk-consent";
+  consentBtn.textContent = "仍要打开";
+  consentBtn.on("click", () => {
+    if (pendingSwitch) void switchTo(pendingSwitch, true);
+  });
+  consentSlot.append(consentBtn);
   box.append(consentSlot);
   const showConsent = (id) => {
-    const b = ctx.dom.createElement("button");
-    b.type = "button";
-    b.className = "hk-consent";
-    b.textContent = "仍要打开";
-    b.on("click", () => void switchTo(id, true));
-    consentSlot.replaceChildren(b);
+    pendingSwitch = id;
+    consentSlot.className = "hk-consent-slot on";
+  };
+  const hideConsent = () => {
+    pendingSwitch = null;
+    consentSlot.className = "hk-consent-slot";
   };
 
   const button = (text, cls, fn) => {
