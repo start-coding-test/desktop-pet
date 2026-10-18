@@ -2084,10 +2084,11 @@ export function deactivate() {}
   // 这一刻会露出 "A行"/"常驻2"
   await statusCall(STATUS_B, "clear");
   const b3Reveal = await bubbleNow();
+  r.info("清掉 B 后的气泡", b3Reveal.show ? `show|${b3Reveal.text}` : "hidden");
   r.check(
     "清掉 B 之后气泡收起（说明 A 停用时条目确实被摘掉，不是只被压在下面）",
     false,
-    b3Reveal.show ? `true|${b3Reveal.text}` : "false",
+    b3Reveal.show,
   );
   // B 自己停用：轮询到收起，并记下实际耗时
   await statusCall(STATUS_B, "set", "B行2");
@@ -2101,10 +2102,11 @@ export function deactivate() {}
   const b3Elapsed = Date.now() - b3T0;
   r.info("停用 B 到气泡收起（轮询）", `${b3Elapsed}ms · ${b3Gone ? "5s 内收起" : "5s 未收起"}`);
   const b3AfterAllOff = await bubbleNow();
+  r.info("停用 B 后的气泡", b3AfterAllOff.show ? `show|${b3AfterAllOff.text}` : "hidden");
   r.check(
     "停用 B → 完全收起（轮询判据，没靠加大 sleep）",
     false,
-    b3AfterAllOff.show ? `true|${b3AfterAllOff.text}` : "false",
+    b3AfterAllOff.show,
   );
 
   // 收尾：改回原清单、撤销授权；fixture 目录与授权都不留给下一轮
