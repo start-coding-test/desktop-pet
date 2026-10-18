@@ -128,10 +128,61 @@ describe("boot：首屏不能等下一个微任务", () => {
 });
 
 describe("区域边界：ctx.host 只在 settings 区存在", () => {
-  it("settings 区有 agentHooks 三个方法", async () => {
+  it("settings 区有 agentHooks 四个方法（固定完整名单，不能用集合相等替换）", async () => {
     const cap = captureCtx(() => undefined);
     await harness({ module: cap.module, region: "settings" }).boot();
-    assert.deepEqual(Object.keys(cap.ctx().host.agentHooks).sort(), ["install", "status", "uninstall"]);
+    assert.deepEqual(Object.keys(cap.ctx().host.agentHooks).sort(), ["install", "set", "status", "uninstall"]);
+  });
+
+  // 上一条管「名单齐不齐」，这一条管「两张表会不会各说各话」：runner 上红过一次，
+  // 原因是协议表加了 agentHooks.set 而 settings 区 ctx 没加，而旧断言把窄的那面当成了期望值。
+  it("协议表里的 agentHooks.* 与 settings 区 ctx 的键是同一批名字", async () => {
+    const cap = captureCtx(() => undefined);
+    await harness({ module: cap.module, region: "settings" }).boot();
+    const fromProto = [...WIDGET_CALL_METHODS]
+      .filter((m) => m.startsWith("agentHooks."))
+      .map((m) => m.split(".")[1])
+      .sort();
+    assert.deepEqual(Object.keys(cap.ctx().host.agentHooks).sort(), fromProto);
+  });
+
+  it("旧三方法仍按零参数下发（加透传不该把它们变成带参调用）", async () => {
+    const cap = captureCtx(() => undefined);
+    const h = harness({ module: cap.module, region: "settings" });
+    await h.boot();
+    for (const name of ["status", "install", "uninstall"]) {
+      void cap.ctx().host.agentHooks[name]();
+      const call = h.sent.filter((m) => m.t === "call").at(-1);
+      assert.equal(call.method, `agentHooks.${name}`);
+      assert.deepEqual(call.args, [], `${name} 多带了参数`);
+    }
+  });
+
+  it("set('zcode', true) 把两个参数一起交给宿主", async () => {
+    const cap = captureCtx(() => undefined);
+    const h = harness({ module: cap.module, region: "settings" });
+    await h.boot();
+    const p = cap.ctx().host.agentHooks.set("zcode", true);
+    const call = h.sent.filter((m) => m.t === "call").at(-1);
+    assert.equal(call.method, "agentHooks.set");
+    assert.deepEqual(call.args, ["zcode", true]);
+    h.runtime.hostMessage({ t: "result", seq: call.seq, ok: true, value: { agent: "zcode" } });
+    assert.deepEqual(await p, { agent: "zcode" });
+  });
+
+  it("set 不带 confirm 时补 false（第一趟要停在确认门，不能默认放行）", async () => {
+    const cap = captureCtx(() => undefined);
+    const h = harness({ module: cap.module, region: "settings" });
+    await h.boot();
+    void cap.ctx().host.agentHooks.set("qoder");
+    const call = h.sent.filter((m) => m.t === "call").at(-1);
+    assert.deepEqual(call.args, ["qoder", false]);
+  });
+
+  it("宿主分发把 msg.args 交给目标方法（到了通道不算到宿主）", () => {
+    // worker-widget-host.ts 带着 `?worker` 说明符，node 里 import 不动，只能按本文件既有做法读源码文本；
+    // 行为上的证明在 runner：真点一次「仍要打开」，confirm 没透传过去界面就永远停在 consent。
+    assert.match(WORKER_WIDGET_HOST_SRC, /fn\.apply\(hooks, msg\.args\)/);
   });
 
   for (const region of ["badge", "overlay"]) {

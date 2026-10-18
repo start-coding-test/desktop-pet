@@ -81,7 +81,10 @@ async function handleCall(session: Session, msg: Extract<WidgetToHost, { t: "cal
     return;
   }
   const ctx = buildContext(session.manifest as never);
-  const hooks = createAgentHooksApi(session.manifest as never) as unknown as Record<string, () => Promise<unknown>>;
+  const hooks = createAgentHooksApi(session.manifest as never) as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
   try {
     if (msg.method === "bus.publish") {
       await ctx.bus.publish(msg.args[0] as string, msg.args[1]);
@@ -97,8 +100,10 @@ async function handleCall(session: Session, msg: Extract<WidgetToHost, { t: "cal
       reply(true, null);
       return;
     }
-    const fn = hooks[msg.method.split(".")[1] as "status" | "install" | "uninstall"];
-    reply(true, await fn.call(hooks));
+    const fn = hooks[msg.method.split(".")[1] as "status" | "install" | "uninstall" | "set"];
+    // 参数一律透传：门禁已经过了，这里不该再决定「哪个方法值得带参数」。
+    // `set` 靠这两个参数才知道切给谁、用户确认了没有；另外三个不接受参数，多给不影响。
+    reply(true, await fn.apply(hooks, msg.args));
   } catch (error) {
     const e = error as { code?: string; message?: string };
     fail(e.code ?? "legacy", e.message ?? String(error));
