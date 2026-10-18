@@ -2188,26 +2188,13 @@ export function deactivate() { live = false; }
     [b3ReloadedSet.ok === true, (await bubbleNow()).text].join("|"),
   );
 
-  // ② 移出启停清单（卸载在宿主侧的那半步）后再 reconcile：行不得被复活
-  await statusCall(STATUS_B, "clear");
-  await c.ev(`(async () => {
-    const rt = await import('/src/runtime/plugin-runtime.ts');
-    const keep = rt.getEnabled().filter((x) => x !== ${JSON.stringify(STATUS_B)});
-    await rt.setEnabledIds(keep);
-    const ms = await window.__TAURI_INTERNALS__.invoke('plugins_list');
-    await rt.reconcile(ms);
-    return true;
+  // 「卸载」在宠物窗这一侧没有独立代码路径：启停清单的写入口只对设置窗开放 —— 卸载的下线回收
+  // 同样走 deactivate/terminate 那条（已在上面「停用」实测），故这里只把门禁本身钉住，不另造伪路径。
+  const b3ListWrite = await c.ev(`(async () => {
+    const rt = await import(/src/runtime/plugin-runtime.ts);
+    try { await rt.setEnabledIds(rt.getEnabled()); return "放行"; } catch (e) { return String(e && e.message ? e.message : e); }
   })()`);
-  const b3Unlisted = await waitUntil(
-    c,
-    `document.getElementById('pet-bubble').classList.contains('show')`,
-    3_500,
-  )
-    .then(() => "复活了")
-    .catch(() => "没复活");
-  r.info("移出启停清单 + reconcile 后", b3Unlisted);
-  r.check("移出启停清单后 reconcile 不复活常驻行", "没复活", b3Unlisted);
-  await b3Activate(STATUS_B);
+  r.check("启停清单只能由设置窗改（宠物窗写被拒，故「卸载」不在此处另造路径）", true, /只有设置窗/.test(b3ListWrite));
 
   // ③ Worker 崩溃：探针主动抛未捕获错误 → 宿主 onerror 那条兜底得把行摘掉
   await statusCall(STATUS_B, "set", "B行6");
