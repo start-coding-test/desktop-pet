@@ -2067,10 +2067,13 @@ export function deactivate() {}
   await sleep(600);
   r.check("隐藏再显示之后常驻行仍在（按当前状态回来）", "常驻2", (await bubbleNow()).text);
 
-  // 回收：轮询判据（不靠加大 sleep）。停用一条命令要走 Worker 自己的 deactivate + terminate，
-  // 1.2s 这种固定等待会把「还没跑完」误判成「不回收」——上一轮就是这么红的。
+  // 回收：停用要走**真的下线路径**。裸写启停清单不会让宠物窗 reconcile（watchEnabled 只缓存，
+  // reconcile 只在启动与 host:plugin-toggled 时跑）—— 上一轮就是这么「停用」了个寂寞。
+  // 这里直接调运行时导出的 deactivatePlugin：它和用户点开关最终进的是同一个 doDeactivate（disposeAll 在那里）。
+  const b3Deactivate = (id) =>
+    c.ev(`(async () => { const rt = await import('/src/runtime/plugin-runtime.ts'); await rt.deactivatePlugin(${JSON.stringify(id)}); return true; })()`);
   await statusCall(STATUS_B, "set", "B行");
-  await setEnabled([...new Set([...enabledBeforeB3, STATUS_B])]);
+  await b3Deactivate(STATUS_A);
   await waitUntil(
     c,
     `(() => { const b = document.getElementById('pet-bubble'); return b.classList.contains('status') && b.textContent === 'B行'; })()`,
@@ -2078,7 +2081,7 @@ export function deactivate() {}
   ).catch(() => false);
   r.check("停用 A 后 B 的行不受影响（仍是 B行）", "B行", (await bubbleNow()).text);
   // 真正的「A 被摘掉」证据：把 B 也清掉之后气泡必须收起 —— 若 A 的条目还在（只是被压在下面），
-  // 这一刻会露出 "A行"
+  // 这一刻会露出 "A行"/"常驻2"
   await statusCall(STATUS_B, "clear");
   const b3Reveal = await bubbleNow();
   r.check(
@@ -2089,6 +2092,7 @@ export function deactivate() {}
   // B 自己停用：轮询到收起，并记下实际耗时
   await statusCall(STATUS_B, "set", "B行2");
   const b3T0 = Date.now();
+  await b3Deactivate(STATUS_B);
   const b3Gone = await waitUntil(
     c,
     `!document.getElementById('pet-bubble').classList.contains('show')`,
