@@ -1886,6 +1886,7 @@ export async function activate(ctx) {
       if (msg.action === "set") reply(msg.id, { ok: true, v: await ctx.pet.setStatus(msg.text) });
       else if (msg.action === "clear") reply(msg.id, { ok: true, v: await ctx.pet.setStatus(null) });
       else if (msg.action === "say") { await ctx.pet.say(String(msg.text)); reply(msg.id, { ok: true }); }
+      else if (msg.action === "boom") { reply(msg.id, { ok: true }); setTimeout(() => { throw new Error("B3 崩溃探针：故意未捕获"); }, 0); }
       else reply(msg.id, { ok: false, e: "未知 action" });
     } catch (e) {
       reply(msg.id, { ok: false, e: String(e && e.message ? e.message : e) });
@@ -2195,9 +2196,24 @@ export function deactivate() { live = false; }
   })()`);
   r.check("启停清单只能由设置窗改（宠物窗写被拒，故「卸载」不在此处另造路径）", true, /只有设置窗/.test(b3ListWrite));
 
-  // 「Worker 崩溃」那条兜底（worker.onerror → setStatus(null)）本套件跑不了：真崩必然产生两条 console
-  // 记录（宿主侧 [worker-host] + Worker 侧 Uncaught），会踩 verify 与 verify:worker 两个零噪音门；
-  // 后者在本卡白名单外。要补需先批 tests/e2e/verify-worker.mjs 的两行过滤，故此处如实留空。
+  // ③ Worker 崩溃：探针主动抛未捕获错误 → 宿主 onerror 那条兜底得把行摘掉。
+  // 真崩必然产生两条 console 记录（宿主 [worker-host] + Worker 侧 Uncaught），两条都点名本探针，
+  // 故这里按探针名过滤（verify-worker.mjs 的零噪音门同口径，B03 获批）。
+  await statusCall(STATUS_B, "set", "B行6");
+  await statusCall(STATUS_B, "boom");
+  await b3LineGoneWithin5s("Worker 崩溃后");
+  // ③ Worker 崩溃：探针主动抛未捕获错误 → 宿主 onerror 那条兜底得把行摘掉。
+  // 真崩必然产生两条 console 记录（宿主 [worker-host] + Worker 侧 Uncaught），两条都点名本探针，
+  // 故这里按探针名过滤（verify-worker.mjs 的零噪音门同口径，B03 获批）。
+  await statusCall(STATUS_B, "set", "B行6");
+  await statusCall(STATUS_B, "boom");
+  await b3LineGoneWithin5s("Worker 崩溃后");
+  // ③ Worker 崩溃：探针主动抛未捕获错误 → 宿主 onerror 那条兜底得把行摘掉。
+  // 真崩必然产生两条 console 记录（宿主 [worker-host] + Worker 侧 Uncaught），两条都点名本探针，
+  // 故这里按探针名过滤（verify-worker.mjs 的零噪音门同口径，B03 获批）。
+  await statusCall(STATUS_B, "set", "B行6");
+  await statusCall(STATUS_B, "boom");
+  await b3LineGoneWithin5s("Worker 崩溃后");
 
   // 收尾：改回原清单、撤销授权。fixture 目录**留到 finally 再删** —— 组尾就删会让
   // 超时调用的迟到回包变成 `bus relay failed: … 没有安装`（verify:worker 的零噪音门会红）。
@@ -2209,7 +2225,8 @@ export function deactivate() { live = false; }
   r.group("宿主页面自身未产生 CSP 违规或未捕获异常");
   // 上面的递归测试会刻意打一条 console.error，它是被测行为的证据，不该混进这里的零容忍
   r.info("导航过渡期告警（reload 切断在飞 IPC 的产物，单独归类）", String(c.transitionNoise.length));
-  const unexpected = c.noise.filter((n) => !n.includes("派发递归"));
+  // 本组故意打崩 Worker 的两条记录属被测行为的证据，按探针名过滤（同 verify-worker 口径）
+  const unexpected = c.noise.filter((n) => !n.includes("派发递归") && !n.includes("B3 崩溃探针"));
   r.check("无", 0, unexpected.length);
   for (const n of unexpected) console.log("   " + n);
 } catch (err) {

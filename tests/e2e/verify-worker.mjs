@@ -563,7 +563,9 @@ try {
 
   r.group("零噪音");
   r.info("导航过渡期告警", String(c.transitionNoise.length));
-  r.check("无 console 错误与未捕获异常", [], c.noise);
+  // B3 组那条「Worker 崩溃」断言是**故意**把探针打崩的，它的两条 console 记录（宿主 [worker-host] + Worker 侧 Uncaught）都点名探针，按名过滤（B03 获批）
+  const noise = c.noise.filter((n) => !n.includes("B3 崩溃探针"));
+  r.check("无 console 错误与未捕获异常", [], noise);
 } catch (err) {
   r.check("脚本未抛异常", true, false);
   console.error(err);
