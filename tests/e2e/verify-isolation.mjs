@@ -2038,6 +2038,7 @@ export function deactivate() { live = false; }
     b3WideDom.scroll > b3WideDom.client,
   );
   r.check("宽字符输入也没被 20 码点上限截短", 20, b3WideDom.len);
+  r.check("宽字符输入的返回值也是那 20 个字符（没被截短）", "🐱".repeat(20), b3Wide.v);
 
   const b3Escaped = await statusCall(STATUS_A, "set", "<b>x</b>");
   const b3Html = await c.ev(`document.getElementById('pet-bubble').innerHTML`);
@@ -2133,7 +2134,9 @@ export function deactivate() { live = false; }
     false,
     b3Reveal.show,
   );
-  // B 自己停用：轮询到收起，并记下实际耗时
+  // 「只测停用回收」：这一路**全程无撤权、无 Worker 崩溃、无 setStatus(null)** —— 只有停用回收能清掉它。
+  // 停用回收有两条冗余路径（桥里 register 的兜底回收 + worker-plugin-host 的 terminate 收尾），
+  // 只破坏其中一条会被另一条掩盖（这点已由变异 M3 实测确认）；所以这条断言要能挡住「两条都断」。
   await statusCall(STATUS_B, "set", "B行2");
   const b3T0 = Date.now();
   await b3Deactivate(STATUS_B);
@@ -2144,6 +2147,7 @@ export function deactivate() { live = false; }
   ).catch(() => false);
   const b3Elapsed = Date.now() - b3T0;
   r.info("停用 B 到气泡收起（轮询）", `${b3Elapsed}ms · ${b3Gone ? "5s 内收起" : "5s 未收起"}`);
+  r.check("停用回收在 5s 内生效（只测停用这条路径，轮询判据）", true, b3Gone);
   const b3AfterAllOff = await bubbleNow();
   r.info("停用 B 后的气泡", b3AfterAllOff.show ? `show|${b3AfterAllOff.text}` : "hidden");
   r.check(
