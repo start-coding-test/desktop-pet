@@ -1886,6 +1886,7 @@ export async function activate(ctx) {
       if (msg.action === "set") reply(msg.id, { ok: true, v: await ctx.pet.setStatus(msg.text) });
       else if (msg.action === "clear") reply(msg.id, { ok: true, v: await ctx.pet.setStatus(null) });
       else if (msg.action === "say") { await ctx.pet.say(String(msg.text)); reply(msg.id, { ok: true }); }
+      else if (msg.action === "boom") { reply(msg.id, { ok: true }); setTimeout(() => { throw new Error("B3 崩溃探针：故意未捕获"); }, 0); }
       else reply(msg.id, { ok: false, e: "未知 action" });
     } catch (e) {
       reply(msg.id, { ok: false, e: String(e && e.message ? e.message : e) });
@@ -2156,6 +2157,63 @@ export function deactivate() { live = false; }
     b3AfterAllOff.show,
   );
 
+  // 回收不止「停用」一条路：重载 / 移出启停清单 / Worker 崩溃 都得把行摘掉（各自实测，轮询判据，不加大 sleep）
+  const b3LineGoneWithin5s = async (label) => {
+    const t0 = Date.now();
+    const gone = await waitUntil(
+      c,
+      `!document.getElementById('pet-bubble').classList.contains('show')`,
+      5_000,
+    ).catch(() => false);
+    r.info(`${label} 到气泡收起（轮询）`, `${Date.now() - t0}ms · ${gone ? "5s 内收起" : "5s 未收起"}`);
+    r.check(`${label}：常驻行在 5s 内被摘掉`, true, gone);
+  };
+  const b3Activate = (id) =>
+    c.ev(`(async () => {
+      const rt = await import('/src/runtime/plugin-runtime.ts');
+      const ms = await window.__TAURI_INTERNALS__.invoke('plugins_list');
+      await rt.activatePlugin(ms.find((m) => m.id === ${JSON.stringify(id)}));
+      return true;
+    })()`);
+
+  // ① 重载（停用 + 装回同一份 manifest）：旧行必须摘掉；装回后仍能重新挂（授权不因重载丢失）
+  await statusCall(STATUS_B, "set", "B行4");
+  await b3Deactivate(STATUS_B);
+  await b3Activate(STATUS_B);
+  await b3LineGoneWithin5s("重载 B 后（旧行）");
+  const b3ReloadedSet = await statusCall(STATUS_B, "set", "B行5");
+  r.check(
+    "重载 B 之后还能重新挂行（授权未因重载丢失）",
+    "true|B行5",
+    [b3ReloadedSet.ok === true, (await bubbleNow()).text].join("|"),
+  );
+
+  // ② 移出启停清单（卸载在宿主侧的那半步）后再 reconcile：行不得被复活
+  await statusCall(STATUS_B, "clear");
+  await c.ev(`(async () => {
+    const rt = await import('/src/runtime/plugin-runtime.ts');
+    const keep = rt.getEnabled().filter((x) => x !== ${JSON.stringify(STATUS_B)});
+    await rt.setEnabledIds(keep);
+    const ms = await window.__TAURI_INTERNALS__.invoke('plugins_list');
+    await rt.reconcile(ms);
+    return true;
+  })()`);
+  const b3Unlisted = await waitUntil(
+    c,
+    `document.getElementById('pet-bubble').classList.contains('show')`,
+    3_500,
+  )
+    .then(() => "复活了")
+    .catch(() => "没复活");
+  r.info("移出启停清单 + reconcile 后", b3Unlisted);
+  r.check("移出启停清单后 reconcile 不复活常驻行", "没复活", b3Unlisted);
+  await b3Activate(STATUS_B);
+
+  // ③ Worker 崩溃：探针主动抛未捕获错误 → 宿主 onerror 那条兜底得把行摘掉
+  await statusCall(STATUS_B, "set", "B行6");
+  await statusCall(STATUS_B, "boom");
+  await b3LineGoneWithin5s("Worker 崩溃后");
+
   // 收尾：改回原清单、撤销授权。fixture 目录**留到 finally 再删** —— 组尾就删会让
   // 超时调用的迟到回包变成 `bus relay failed: … 没有安装`（verify:worker 的零噪音门会红）。
   await setEnabled(enabledBeforeB3);
@@ -2166,7 +2224,8 @@ export function deactivate() { live = false; }
   r.group("宿主页面自身未产生 CSP 违规或未捕获异常");
   // 上面的递归测试会刻意打一条 console.error，它是被测行为的证据，不该混进这里的零容忍
   r.info("导航过渡期告警（reload 切断在飞 IPC 的产物，单独归类）", String(c.transitionNoise.length));
-  const unexpected = c.noise.filter((n) => !n.includes("派发递归"));
+  // 「[worker-host]」是本组故意把 Worker 打崩的那条 console.error，属被测行为的证据
+  const unexpected = c.noise.filter((n) => !n.includes("派发递归") && !n.includes("[worker-host]"));
   r.check("无", 0, unexpected.length);
   for (const n of unexpected) console.log("   " + n);
 } catch (err) {
