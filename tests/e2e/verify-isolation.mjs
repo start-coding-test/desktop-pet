@@ -2067,6 +2067,31 @@ export function deactivate() {}
   await sleep(600);
   r.check("隐藏再显示之后常驻行仍在（按当前状态回来）", "常驻2", (await bubbleNow()).text);
 
+  // 撤权：失去 pet:say 之后那条行要摘掉并**正确回落到别人那条**；别人的行一概不动
+  await statusCall(STATUS_B, "set", "B行3");
+  await statusCall(STATUS_A, "set", "A行3");
+  r.check("撤权前 A 的行在最上（A 最后设置）", "A行3", (await bubbleNow()).text);
+  await revoke(STATUS_A);
+  const b3RevokeBack = await waitUntil(
+    c,
+    `(() => { const b = document.getElementById('pet-bubble'); return b.classList.contains('show') && b.textContent === 'B行3'; })()`,
+    5_000,
+  ).catch(() => false);
+  r.info("撤权 A 后回到 B行3 的耗时", b3RevokeBack ? "5s 内" : "5s 未回落");
+  r.check("撤销 A 的授权后 A 的行被摘掉、回落到 B 的行", "B行3", (await bubbleNow()).text);
+  // 「不误删别人的行 / 撤无关权限不误清」的反面证据：B 的行既没被摘也没被改
+  r.check("撤 A 的权不动 B 的行", "B行3", (await bubbleNow()).text);
+  // 无权之后不能再设置：会重新弹同意框，拒掉就不该出现这一行（不绕过授权）
+  const b3NoGrant = statusCall(STATUS_A, "set", "偷挂行").catch((err) => ({ ok: false, e: String(err?.message ?? err) }));
+  const b3ConsentAgain = await driveConsent("deny", STATUS_A).catch(() => null);
+  const b3NoGrantRes = await b3NoGrant;
+  r.info("撤权后再设置的同意框", b3ConsentAgain ? "弹了（已拒）" : "没弹");
+  r.check(
+    "撤权后无权再设置常驻行：拒掉同意框就拿不到这一行",
+    "false|false",
+    [b3NoGrantRes.ok === false, (await bubbleNow()).text === "偷挂行"].join("|"),
+  );
+
   // 回收：停用要走**真的下线路径**。裸写启停清单不会让宠物窗 reconcile（watchEnabled 只缓存，
   // reconcile 只在启动与 host:plugin-toggled 时跑）—— 上一轮就是这么「停用」了个寂寞。
   // 这里直接调运行时导出的 deactivatePlugin：它和用户点开关最终进的是同一个 doDeactivate（disposeAll 在那里）。

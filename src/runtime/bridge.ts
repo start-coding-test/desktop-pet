@@ -52,7 +52,27 @@ const statusTracked = new Set<string>();
 // 撤销授权后必须丢掉**本窗口**的桥缓存。运行时（宠物窗）的监听在 plugin-runtime 里，
 // 但设置窗里的插件设置页用的是本窗口的模块实例，而撤销入口就在设置窗 —— 漏了这条，
 // 缓存会一直说「已授权」，设置区插件的下一次调用要等整窗重载才会重新走能力校验。
-void listen<string>("host:permission-revoked", (e) => invalidatePermissions(e.payload)).catch(() => undefined);
+void listen<string>("host:permission-revoked", (e) => {
+  invalidatePermissions(e.payload);
+  void dropStatusIfUnauthorized(e.payload);
+});
+
+/**
+ * B3：撤权之后不许再留着常驻行 —— 但要**精确**判：只有这个插件确实**不再持有** `pet:say` 才摘它那条行。
+ * 撤的是别的权限、或撤的是别的插件，一概不动。
+ *
+ * 为什么问宿主而不是看本地缓存：撤回的是宿主的授权表这一事实，本地 `granted` 缓存刚被清掉，
+ * 拿不出「现在到底还持有什么」。查不到（命令失败）时**什么都不做** —— 宁可留一行，
+ * 也不能因为一次查询失败去误清别人的行。
+ */
+async function dropStatusIfUnauthorized(pluginId: string): Promise<void> {
+  try {
+    const held = await hostCall<boolean>("permission_check", { pluginId, capability: PET_SAY });
+    if (held !== true) petController()?.setStatus(pluginId, null);
+  } catch {
+    /* 见上：查询失败不清 */
+  }
+}
 
 export function invalidatePermissions(pluginId?: string): void {
   if (pluginId) granted.delete(pluginId);
