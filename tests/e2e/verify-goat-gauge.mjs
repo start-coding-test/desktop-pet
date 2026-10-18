@@ -165,6 +165,18 @@ const badgeHost = `#widget-badge div[data-plugin-id=${JSON.stringify(PID)}][data
 const overlayHost = `#widget-overlay div[data-plugin-id=${JSON.stringify(PID)}][data-region="overlay"]`;
 const settingsHost = `#plugin-settings div[data-plugin-id=${JSON.stringify(PID)}][data-region="settings"]`;
 
+async function setupBus() {
+  await c.ev(`(async () => {
+    const { bus } = await import('/src/runtime/event-bus.ts');
+    window.__bus = { publish: (topic, payload) => bus.publish(topic, payload, ${JSON.stringify(PID)}) };
+    window.__seen = { widget: [], status: [], panel: [] };
+    bus.subscribe(${JSON.stringify(`${PID}:widget`)}, (p) => window.__seen.widget.push(p));
+    bus.subscribe(${JSON.stringify(`${PID}:status`)}, (p) => window.__seen.status.push(p));
+    bus.subscribe(${JSON.stringify(`${PID}:panel`)}, (p) => window.__seen.panel.push(p));
+    return true;
+  })()`);
+}
+
 /* ---------- 插件指令与视图 ---------- */
 async function send(cmd) {
   await c.ev(`window.__bus.publish(${JSON.stringify(`${PID}:cmd`)}, ${JSON.stringify(cmd)})`);
@@ -260,15 +272,7 @@ try {
   r.group("启用与授权");
   await writeEnabledIds(settings.invoke, [...origEnabled, PID]);
   await reloadAndWait(c);
-  await c.ev(`(async () => {
-    const { bus } = await import('/src/runtime/event-bus.ts');
-    window.__bus = { publish: (topic, payload) => bus.publish(topic, payload, ${JSON.stringify(PID)}) };
-    window.__seen = { widget: [], status: [], panel: [] };
-    bus.subscribe(${JSON.stringify(`${PID}:widget`)}, (p) => window.__seen.widget.push(p));
-    bus.subscribe(${JSON.stringify(`${PID}:status`)}, (p) => window.__seen.status.push(p));
-    bus.subscribe(${JSON.stringify(`${PID}:panel`)}, (p) => window.__seen.panel.push(p));
-    return true;
-  })()`);
+  await setupBus();
 
   const badgeSlot = await waitUntil(
     c,
@@ -538,6 +542,7 @@ try {
   r.check("撤销后存储读不到", true, !!denied && (!denied.ok || denied.v === null));
   await writeEnabledIds(settings.invoke, [...origEnabled, PID]);
   await reloadAndWait(c);
+  await setupBus();
   const reconsent = await waitConsentForPlugin(beforeConsents, 30_000);
   r.check("重新启用会重新弹同意框", true, !!reconsent?.rendered);
   const reconsentCaps = new Set(reconsent?.caps ?? []);
