@@ -250,6 +250,8 @@ export const WIDGET_CALL_METHODS = [
   "agentHooks.status",
   "agentHooks.install",
   "agentHooks.uninstall",
+  // 与 plugin-worker-protocol 那张表同步追加（A02 设置页四选一）
+  "agentHooks.set",
 ] as const;
 
 export type WidgetCallMethod = (typeof WIDGET_CALL_METHODS)[number];

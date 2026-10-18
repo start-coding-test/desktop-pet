@@ -1,19 +1,22 @@
-//! Qoder hook 的安装与卸载。
+//! Agent hook 配置文件的**读写管线**：备份、原子替换、报告，以及按适配器分派。
 //!
-//! 目标配置文件：`~/.qoder-cn/settings.json` 与 `~/.qoder/settings.json`，
-//! 结构为 `{ "hooks": { "<Event>": [ { "hooks": [ { "type": "command", "command": …, "timeout": 2 } ] } ] } }`。
-//! Qoder 不需要额外的 `hooksConfig.enabled` 开关。
+//! 分工：配置文件长什么样（`hooks` 的嵌套形状、事件词表、超时字段叫什么）住在
+//! `services/agent/adapters/`；这一层只管「怎么安全地落到磁盘上」，两边不互相漏细节。
 //!
-//! 三条硬规则：
-//! 1. 只认自己的条目 —— 靠命令串里的 `--pet-hook` 标记识别，绝不删别人的 hook；
-//! 2. 重装即幂等 —— 先摘掉全部自家条目再追加，不会越装越多；
-//! 3. 坏文件不覆盖 —— 解析不出对象就直接拒绝，让用户自己修，别把配置写坏。
+//! 「只认 `--pet-hook` 标记的自家条目、重装幂等、坏文件不覆盖」这三条由适配器实现，
+//! 这一层再加三条自己的：
+//! 1. 写之前先备份，备份失败就不改 —— 宁可装不上，也不能把用户配置弄成不可恢复；
+//! 2. 落盘走「同目录临时文件 + rename」，且临时名带 pid；
+//! 3. 装卸串行化在一把锁里（见 `HOOK_IO`），四个调用方谁都不用记得加锁。
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde_json::{json, Value};
+
+use crate::services::agent::adapters::{self, zcode, AgentAdapter};
+use crate::services::agent::phases::AGENT_FLAG;
 
 /// 自家条目的识别标记。它同时是 hook 分支的 CLI 参数，两边共用这一个常量
 pub const HOOK_MARKER: &str = "--pet-hook";
@@ -30,139 +33,17 @@ fn lock_hook_io() -> std::sync::MutexGuard<'static, ()> {
     HOOK_IO.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// hook 超时（秒）。事件采集不该拖住 Agent，取小值
-const HOOK_TIMEOUT: i64 = 2;
-
-fn is_managed(hook: &Value) -> bool {
-    hook.get("command")
-        .and_then(Value::as_str)
-        .is_some_and(|cmd| cmd.contains(HOOK_MARKER))
-}
-
-/// 摘掉全部自家 hook，返回摘掉的条数；内层 `hooks` 被摘空的外层分组一并删除，
-/// 分组数组空了则连事件键一起删。
-pub fn strip_managed(config: &mut Value) -> usize {
-    let Some(hooks) = config.get_mut("hooks").and_then(Value::as_object_mut) else {
-        return 0;
-    };
-    let mut removed = 0;
-    let mut emptied: Vec<String> = Vec::new();
-
-    for (event, entries) in hooks.iter_mut() {
-        let Some(entries) = entries.as_array_mut() else {
-            continue;
-        };
-        let mut kept_groups: Vec<Value> = Vec::with_capacity(entries.len());
-        for entry in entries.drain(..) {
-            let mut entry = entry;
-            if let Some(group) = entry.get_mut("hooks").and_then(Value::as_array_mut) {
-                let before = group.len();
-                group.retain(|hook| !is_managed(hook));
-                removed += before - group.len();
-            }
-            let still_has_hooks = entry
-                .get("hooks")
-                .and_then(Value::as_array)
-                .is_some_and(|group| !group.is_empty());
-            if still_has_hooks {
-                kept_groups.push(entry);
-            }
-        }
-        *entries = kept_groups;
-        if entries.is_empty() {
-            emptied.push(event.clone());
-        }
-    }
-    for event in emptied {
-        hooks.remove(&event);
-    }
-    removed
-}
-
-/// 追加自家条目。调用方应先 strip_managed 以保证幂等。
-pub fn append_managed(config: &mut Value, command_for: impl Fn(&str) -> String) -> usize {
-    if config.get("hooks").is_none() {
-        config["hooks"] = json!({});
-    }
-    let Some(hooks) = config.get_mut("hooks").and_then(Value::as_object_mut) else {
-        return 0;
-    };
-    let mut added = 0;
-    for (event, phase) in super::agent::HOOK_PHASES {
-        let entry = hooks
-            .entry((*event).to_string())
-            .or_insert_with(|| json!([]));
-        let Some(list) = entry.as_array_mut() else {
-            continue;
-        };
-        list.push(json!({
-            "hooks": [{
-                "type": "command",
-                "command": command_for(phase),
-                "timeout": HOOK_TIMEOUT,
-            }]
-        }));
-        added += 1;
-    }
-    added
-}
-
-/// 配置里自家 hook 的条数（不含别人的）
-pub fn managed_count(config: &Value) -> usize {
-    let Some(hooks) = config.get("hooks").and_then(Value::as_object) else {
-        return 0;
-    };
-    hooks
-        .values()
-        .filter_map(Value::as_array)
-        .flatten()
-        .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
-        .flatten()
-        .filter(|hook| is_managed(hook))
-        .count()
-}
-
-fn parse_object(raw: &str) -> Result<Value, String> {
-    if raw.trim().is_empty() {
-        return Ok(json!({}));
-    }
-    let config: Value = serde_json::from_str(raw).map_err(|e| format!("配置不是合法 JSON: {e}"))?;
-    if !config.is_object() {
-        return Err("配置顶层不是对象，拒绝改写".into());
-    }
-    Ok(config)
-}
-
-/// 纯函数版安装：解析 → 拒绝坏结构 → 摘旧 → 追加
-pub fn install_in_text(
-    raw: &str,
-    command_for: impl Fn(&str) -> String,
-) -> Result<(String, usize), String> {
-    let mut config = parse_object(raw)?;
-    strip_managed(&mut config);
-    let added = append_managed(&mut config, command_for);
-    Ok((
-        serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?,
-        added,
-    ))
-}
-
-/// 纯函数版卸载：没有自家条目时返回 None，表示「不必改动这个文件」
-pub fn uninstall_in_text(raw: &str) -> Result<Option<(String, usize)>, String> {
-    let mut config = parse_object(raw)?;
-    let removed = strip_managed(&mut config);
-    if removed == 0 {
-        return Ok(None);
-    }
-    Ok(Some((
-        serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?,
-        removed,
-    )))
-}
-
-pub fn command_for(exe: &Path, phase: &str) -> String {
-    // 路径可能带空格，整体加引号；phase 取自白名单常量，无注入面
-    format!("\"{}\" {HOOK_MARKER} {phase}", exe.display())
+/// 装进配置里的那条命令：`"<exe>" --pet-hook <phase> --agent <id>`。
+/// 来源字段取自适配器 —— 装谁的 hook 就写谁，于是「谁在给我们发事件」与命令串里的来源
+/// 天然一致，不靠收件侧的缺省兜底。路径可能带空格，整体加引号；phase 来自白名单常量、
+/// id 来自注册表，两处都没有注入面。
+pub fn hook_command(
+    adapter: &dyn AgentAdapter,
+    exe: &Path,
+) -> impl for<'a> Fn(&'a str) -> String + 'static {
+    let exe = exe.display().to_string();
+    let agent: &'static str = adapter.id();
+    move |phase: &str| format!("\"{exe}\" {HOOK_MARKER} {phase} {AGENT_FLAG} {agent}")
 }
 
 #[derive(serde::Serialize)]
@@ -170,6 +51,11 @@ pub struct FileReport {
     pub path: String,
     pub managed: usize,
     pub error: Option<String>,
+    /// 装之前这个文件的「总开关」原值（JSON `null` = 原来根本没这个键）。
+    /// 只有在我们确实把它拨开了的时候才有值 —— 状态文件按路径存它，卸载时照单恢复。
+    /// 没有总开关的客户端（Qoder）永远是 `None`，也不进序列化结果。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub switch_before: Option<Value>,
 }
 
 impl FileReport {
@@ -178,27 +64,9 @@ impl FileReport {
             path: path.display().to_string(),
             managed: 0,
             error: Some(error.into()),
+            switch_before: None,
         }
     }
-}
-
-/// 候选配置文件：只有所在目录存在才算数（没装那个客户端就不该凭空造配置）。
-/// `PET_AGENT_CONFIG_FILES`（`;` 分隔）是开发与测试的覆盖入口，避免动到真实用户配置。
-pub fn candidate_files(home: &Path) -> Vec<PathBuf> {
-    if let Ok(list) = std::env::var("PET_AGENT_CONFIG_FILES") {
-        return list
-            .split(';')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .filter(|p| p.parent().is_some_and(|dir| dir.exists()))
-            .collect();
-    }
-    [".qoder", ".qoder-cn"]
-        .iter()
-        .map(|leaf| home.join(leaf).join("settings.json"))
-        .filter(|p| p.parent().is_some_and(|dir| dir.exists()))
-        .collect()
 }
 
 fn backup_once(path: &Path) -> std::io::Result<()> {
@@ -247,7 +115,10 @@ pub fn any_installed(reports: &[FileReport]) -> bool {
     reports.iter().any(|r| r.error.is_none() && r.managed > 0)
 }
 
-pub fn status_reports(files: &[PathBuf]) -> Vec<FileReport> {
+/// 数一数每个候选文件里自家条目有几条。读也进这把锁：装卸进行中查出来的条数
+/// 必须是一个稳定时刻的，否则状态页会拿到「半装完」的中间态。
+pub fn status_reports(adapter: &dyn AgentAdapter, files: &[PathBuf]) -> Vec<FileReport> {
+    let _io = lock_hook_io();
     files
         .iter()
         .map(|path| match read_existing(path) {
@@ -255,12 +126,17 @@ pub fn status_reports(files: &[PathBuf]) -> Vec<FileReport> {
                 path: path.display().to_string(),
                 managed: 0,
                 error: None,
+                switch_before: None,
             },
             Ok(Some(raw)) => match serde_json::from_str::<Value>(&raw) {
-                Ok(config) => FileReport {
+                // 先自己解析一遍只为「读不出来要报错误」这条：适配器的 managed_count 对
+                // 坏文本只数出 0，状态页据此显示「未安装」，用户以为摘干净了其实没有。
+                // 计数仍然交给适配器 —— 它才懂自己那种形状里哪几条是自家的。
+                Ok(_) => FileReport {
                     path: path.display().to_string(),
-                    managed: managed_count(&config),
+                    managed: adapter.managed_count(&raw),
                     error: None,
+                    switch_before: None,
                 },
                 Err(e) => FileReport::failed(path, format!("配置解析失败: {e}")),
             },
@@ -277,8 +153,11 @@ fn apply_text(path: &Path, text: &str) -> Result<(), String> {
     write_atomic(path, text)
 }
 
-pub fn install_files(files: &[PathBuf], exe: &Path) -> Vec<FileReport> {
+/// 整趟「读 → 改 → 落盘」在**同一把锁**里（PR-1 评审遗留项：上一版只串行了 IO 原语，
+/// 读与写之间仍有窗口）。适配器只做纯文本变换，所以锁罩得住整趟。
+pub fn install_files(adapter: &dyn AgentAdapter, files: &[PathBuf], exe: &Path) -> Vec<FileReport> {
     let _io = lock_hook_io();
+    let command_for = hook_command(adapter, exe);
     files
         .iter()
         .map(|path| {
@@ -286,24 +165,36 @@ pub fn install_files(files: &[PathBuf], exe: &Path) -> Vec<FileReport> {
                 Ok(raw) => raw.unwrap_or_default(),
                 Err(e) => return FileReport::failed(path, e.to_string()),
             };
-            let owned = path.clone();
-            let exe = exe.to_path_buf();
-            match install_in_text(&raw, move |phase| command_for(&exe, phase)) {
-                Ok((text, added)) => match apply_text(&owned, &text) {
+            match adapter.install_in_text(&raw, &command_for) {
+                Ok(text) => match apply_text(path, &text) {
                     Ok(()) => FileReport {
-                        path: owned.display().to_string(),
-                        managed: added,
+                        path: path.display().to_string(),
+                        // 条数取「这份新文本里实际有几条自家条目」，不取追加计数：
+                        // 磁盘上的事实才是状态页与「停用→再启用」恢复要相信的
+                        managed: adapter.managed_count(&text),
                         error: None,
+                        // 「原来不是开着」才算我们拨的：原本 true 的话卸载时不该动它
+                        switch_before: adapter
+                            .switch_before(&raw)
+                            .filter(|was| was != &json!(true))
+                            .filter(|_| adapter.has_switch()),
                     },
-                    Err(e) => FileReport::failed(&owned, e),
+                    Err(e) => FileReport::failed(path, e),
                 },
-                Err(e) => FileReport::failed(&owned, e),
+                Err(e) => FileReport::failed(path, e),
             }
         })
         .collect()
 }
 
-pub fn uninstall_files(files: &[PathBuf]) -> Vec<FileReport> {
+/// 卸载。`switches` 是状态文件里记的那份「装之前每个文件的总开关原值」：
+/// 键是路径、值是原值（JSON `null` = 原来没这个键，恢复=删掉）；**没有这条记录就完全不碰开关**
+/// —— 不是我们拨开的，就没资格关。
+pub fn uninstall_files(
+    adapter: &dyn AgentAdapter,
+    files: &[PathBuf],
+    switches: &Value,
+) -> Vec<FileReport> {
     let _io = lock_hook_io();
     files
         .iter()
@@ -316,19 +207,23 @@ pub fn uninstall_files(files: &[PathBuf]) -> Vec<FileReport> {
                     path: path.display().to_string(),
                     managed: 0,
                     error: None,
+                    switch_before: None,
                 };
             };
-            match uninstall_in_text(&raw) {
+            let before = switches.get(path.display().to_string());
+            match adapter.uninstall_restoring_switch(&raw, before) {
                 Ok(None) => FileReport {
                     path: path.display().to_string(),
                     managed: 0,
                     error: None,
+                    switch_before: None,
                 },
                 Ok(Some((text, removed))) => match apply_text(path, &text) {
                     Ok(()) => FileReport {
                         path: path.display().to_string(),
                         managed: removed,
                         error: None,
+                        switch_before: before.cloned(),
                     },
                     Err(e) => FileReport::failed(path, e),
                 },
@@ -338,133 +233,374 @@ pub fn uninstall_files(files: &[PathBuf]) -> Vec<FileReport> {
         .collect()
 }
 
+/// ZCode 的日志目录（`<root>/.zcode/cli/log`），root 同样受 `PET_AGENT_HOME` 覆盖。
+fn zcode_log_dir(home: &Path) -> PathBuf {
+    let root = match std::env::var("PET_AGENT_HOME") {
+        Ok(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
+        _ => home.to_path_buf(),
+    };
+    root.join(".zcode").join("cli").join("log")
+}
+
+/// 目录里那个 `zcode-*.jsonl` 中**最后被写过**的一份。文件名里的日期格式我们不确定，
+/// 所以按 mtime 挑而不是自己拼日期 —— 拼错的表现是「永远查不出问题」，那种假绿最坏。
+fn newest_zcode_log(dir: &Path) -> Option<(PathBuf, u64)> {
+    let entries = fs::read_dir(dir).ok()?;
+    let mut best: Option<(std::time::SystemTime, PathBuf, u64)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        if !name.starts_with("zcode-") || !name.ends_with(".jsonl") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(mtime) = meta.modified() else { continue };
+        if best.as_ref().is_none_or(|(t, _, _)| mtime >= *t) {
+            best = Some((mtime, path, meta.len()));
+        }
+    }
+    best.map(|(_, path, len)| (path, len))
+}
+
+/// 装之前的日志「记号」：那份日志已经写到哪了。`None` = 当时还没有这份日志
+/// （没有日志目录，或目录里还没有文件）；装之后若冒出新文件，就整份当新增来读。
+#[derive(Debug)]
+pub struct LogMark {
+    pub path: PathBuf,
+    pub len: u64,
+}
+
+pub fn mark_zcode_log(home: &Path) -> Option<LogMark> {
+    let (path, len) = newest_zcode_log(&zcode_log_dir(home))?;
+    Some(LogMark { path, len })
+}
+
+/// 装后自检（方案 §3.5）：只读安装之后新增的那些行，判据住在 `zcode::scan_new_log_lines`。
+/// 三种结果必须分开报：查过没问题 / 查出问题（附原文）/ **没日志可读所以没查**。
+/// 把第三种说成第一种，等于给用户一张「一切正常」的假条。
+pub fn zcode_self_check(mark: Option<&LogMark>, home: &Path, our_command: &str) -> Value {
+    let Some((path, len)) = newest_zcode_log(&zcode_log_dir(home)) else {
+        return json!({ "status": "unavailable", "detail": "没找到 ZCode 的日志文件，装后自检没做成" });
+    };
+    // 还是那份文件就只看新增的一段；冒出新文件（跨天，或装之前根本没有日志）就整份算新增
+    let start = mark.filter(|m| m.path == path).map_or(0, |m| m.len);
+    if len <= start {
+        return json!({ "status": "ok", "detail": "装完到自检之间没有新日志行" });
+    }
+    let Ok(all) = fs::read(&path) else {
+        return json!({ "status": "unavailable", "detail": "日志读不出来，装后自检没做成" });
+    };
+    let end = (len as usize).min(all.len());
+    let tail = String::from_utf8_lossy(&all[start as usize..end]).to_string();
+    match zcode::scan_new_log_lines(&tail, our_command) {
+        Some(line) => json!({
+            "status": "problem",
+            "detail": "ZCode 读完新配置后报了错，下面这行是日志原文",
+            "logPath": path.display().to_string(),
+            "line": line,
+        }),
+        None => json!({ "status": "ok", "detail": "日志里没有指向我们的坏行" }),
+    }
+}
+
+/// 切换 Agent 之前问一句：这个适配器在它的候选文件里需不需要用户先确认
+/// （ZCode 的总开关显式关着、且用户自己配过 hook）。多个文件要确认的条数**加总**成一个数 ——
+/// 弹两次一样的框不如一次说清「一共 N 条」。
+/// 读文件住在这一层：适配器只做文本变换。
+pub fn pending_consent(adapter: &dyn AgentAdapter, files: &[PathBuf]) -> Option<usize> {
+    let mut total = 0;
+    let mut needed = false;
+    for path in files {
+        let Ok(Some(raw)) = read_existing(path) else {
+            continue;
+        };
+        if let Some(count) = adapter.switch_needs_consent(&raw) {
+            needed = true;
+            total += count;
+        }
+    }
+    needed.then_some(total)
+}
+
+/// 卸载应用前的清理：把**每个已接线适配器**名下的自家条目都摘净。
+///
+/// 这里不按「当前联动的那个 Agent」走：应用都没了，状态文件里写的是谁已经不重要；而留在
+/// 别人配置里的 `--pet-hook` 条目指向一个不存在的 exe，每来一次事件就失败一次。
+/// 每个适配器只摘自己那种形状里的条目，摘不到就不改那个文件。
+pub fn uninstall_everywhere(home: &Path, switches: &Value) -> Vec<FileReport> {
+    adapters::wired()
+        .iter()
+        .flat_map(|adapter| uninstall_files(*adapter, &adapter.targets(home), switches))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::agent::adapters::claude_style::QODER;
+    use crate::services::agent::adapters::zcode::ZCODE;
     use crate::services::agent::HOOK_PHASES;
 
-    fn cmd(phase: &str) -> String {
-        format!("C:\\app\\desktop-pet.exe {HOOK_MARKER} {phase}")
+    fn tmp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pet-hook-io-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("建临时目录");
+        dir
     }
 
-    fn parse(text: &str) -> Value {
-        serde_json::from_str(text).expect("产出必须是合法 JSON")
-    }
-
+    /// 装出来的命令必须带来源字段，且路径带空格时只对 exe 加引号。
+    /// 缺 `--agent` 的行在收件侧按 qoder 兜底 —— 但「能兜底」不等于「该继续生产缺省形状」：
+    /// 接线第二个 Agent 之后，少了这个字段就是桌宠对着别人的会话演。
     #[test]
-    fn installs_every_event_and_keeps_other_keys() {
-        let (text, added) = install_in_text(r#"{"theme":"dark"}"#, cmd).unwrap();
-        let config = parse(&text);
-        assert_eq!(added, HOOK_PHASES.len());
-        assert_eq!(config["theme"], "dark");
-        assert_eq!(managed_count(&config), HOOK_PHASES.len());
+    fn installed_commands_carry_the_adapter_id() {
+        let dir = tmp_dir("cmd");
+        let path = dir.join("settings.json");
+        fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
+        let exe = Path::new(r"C:\Program Files\pet\desktop-pet.exe");
+
+        let reports = install_files(&QODER, std::slice::from_ref(&path), exe);
+        assert!(reports[0].error.is_none(), "{:?}", reports[0].error);
+        assert_eq!(reports[0].managed, HOOK_PHASES.len());
+
+        let text = fs::read_to_string(&path).unwrap();
+        let config: Value = serde_json::from_str(&text).unwrap();
+        let command = config["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("命令必须是字符串")
+            .to_string();
         assert_eq!(
-            config["hooks"]["PreToolUse"][0]["hooks"][0]["type"],
-            "command"
+            command,
+            format!(
+                "\"C:\\Program Files\\pet\\desktop-pet.exe\" {HOOK_MARKER} pre {AGENT_FLAG} qoder"
+            ),
+            "引号包住的是 exe，phase 后面必须跟来源"
         );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
+    /// 状态查询用的尺子与安装报告是同一把（都走适配器）；读不出来的文件必须**报错误**
+    /// 而不是静默算 0 条，否则状态页会把「有陈旧条目」说成「未安装」。
     #[test]
-    fn treats_missing_file_content_as_empty_object() {
-        let (text, added) = install_in_text("", cmd).unwrap();
-        assert_eq!(added, HOOK_PHASES.len());
-        assert!(text.starts_with('{'));
+    fn status_counts_ours_and_surfaces_unreadable_files() {
+        let dir = tmp_dir("status");
+        let good = dir.join("settings.json");
+        let bad = dir.join("broken.json");
+        fs::write(
+            &good,
+            r#"{"hooks":{"Stop":[{"hooks":[
+            {"type":"command","command":"x.exe --pet-hook stop","timeout":2},
+            {"type":"command","command":"keep.sh"}
+        ]}]}}"#,
+        )
+        .unwrap();
+        fs::write(&bad, "{ not json").unwrap();
+
+        let reports = status_reports(&QODER, &[good, bad]);
+        assert_eq!(reports[0].managed, 1, "只数自家的");
+        assert_eq!(reports[0].error, None);
+        assert!(
+            reports[1].error.is_some(),
+            "解析失败要成一条错误，不能静默算 0"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
+    /// 清理按「每个适配器各摘各的」走：一个文件只出一份报告，自家摘净、用户的键留着。
+    /// 这条同时是「`--pet-hook-cleanup` 走的是环境覆盖那一条路」的证据 —— 它是全仓唯一
+    /// 改 `PET_AGENT_CONFIG_FILES` 的测试，别的测试都不读它，所以不会互相串。
     #[test]
-    fn reinstall_is_idempotent() {
-        let (once, _) = install_in_text("{}", cmd).unwrap();
-        let (twice, added) = install_in_text(&once, cmd).unwrap();
-        let config = parse(&twice);
-        assert_eq!(added, HOOK_PHASES.len());
-        assert_eq!(managed_count(&config), HOOK_PHASES.len());
-        assert_eq!(config["hooks"]["Stop"].as_array().unwrap().len(), 1);
+    fn uninstall_everywhere_reports_each_targets_list_once_and_keeps_user_keys() {
+        let _env = adapters::lock_test_env();
+        let dir = tmp_dir("everywhere");
+        let path = dir.join("settings.json");
+        let exe = Path::new(r"C:\app\desktop-pet.exe");
+        std::env::set_var("PET_AGENT_CONFIG_FILES", &path);
+        // ZCode 那份候选表也要钉成空的：不清这个变量，另一个测试设的目录会让它冒出候选，
+        // 报告条数就不是这条能算准的了
+        std::env::set_var("PET_AGENT_HOME", dir.join("no-agent-home"));
+        // 环境里那两个样例文件的父目录存在才算候选；不存在时上面这条等于「一个候选都没有」
+        fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
+
+        assert!(any_installed(&install_files(
+            &QODER,
+            &QODER.targets(&dir),
+            exe
+        )));
+
+        let cleaned = uninstall_everywhere(&dir, &json!({}));
+        // 报告数 = 各适配器**实际存在**的候选文件数（没有装的那个出 0 份，不是 1 份空报告）
+        let expected: usize = adapters::wired()
+            .iter()
+            .map(|a| a.targets(&dir).len())
+            .sum();
+        assert_eq!(cleaned.len(), expected);
+        assert_eq!(cleaned[0].managed, HOOK_PHASES.len());
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(!after.contains(HOOK_MARKER), "自家条目该摘净");
+        let config: Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(config["theme"], "dark", "用户的键一个不少");
+
+        std::env::remove_var("PET_AGENT_CONFIG_FILES");
+        std::env::remove_var("PET_AGENT_HOME");
+        let _ = fs::remove_dir_all(&dir);
     }
 
+    /// 总开关的「抄旧值 → 恢复」whole 走的是这条流水线（适配器单测只证文本变换）。
+    /// 两个方向都要钉：装的时候把原值抄进报告（状态文件才有东西可存），
+    /// 卸的时候**没有记录就绝不碰开关** —— 不是我们拨开的，就没资格关。
     #[test]
-    fn keeps_foreign_hooks_in_the_same_event() {
-        let raw = json!({
-            "hooks": { "PreToolUse": [ { "hooks": [
-                { "type": "command", "command": "other-tool --notify" },
-                { "type": "command", "command": "stale.exe --pet-hook pre" }
-            ] } ] }
-        });
-        let (text, _) = install_in_text(&raw.to_string(), cmd).unwrap();
-        let config = parse(&text);
-        let groups = config["hooks"]["PreToolUse"].as_array().unwrap();
-        // 陈旧自家条目被摘掉，别人的原样留在原分组；我们的作为新分组追加
+    fn switch_state_is_captured_on_install_and_restored_on_uninstall() {
+        let _env = adapters::lock_test_env();
+        let dir = tmp_dir("switch");
+        let cli = dir.join(".zcode").join("cli");
+        fs::create_dir_all(&cli).unwrap();
+        let path = cli.join("config.json");
+        fs::write(&path, r#"{"hooks":{"enabled":false,"events":{}}}"#).unwrap();
+        std::env::set_var("PET_AGENT_HOME", &dir);
+        let exe = Path::new(r"C:\app\desktop-pet.exe");
+
+        let reports = install_files(&ZCODE, &ZCODE.targets(&dir), exe);
+        assert!(any_installed(&reports), "{:?}", reports[0].error);
         assert_eq!(
-            groups
-                .iter()
-                .flat_map(|g| g["hooks"].as_array().unwrap().iter())
-                .filter(|h| h["command"] == "other-tool --notify")
-                .count(),
-            1
+            reports[0].switch_before,
+            Some(json!(false)),
+            "装之前是关着的，必须记下来"
         );
-        // 整个事件里只剩一份自家条目，且每个事件都只有一份
-        assert_eq!(managed_count(&config), HOOK_PHASES.len());
+        let after_install: Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after_install["hooks"]["enabled"], true);
+
+        let switches = json!({ path.display().to_string(): false });
+        let cleaned = uninstall_files(&ZCODE, &ZCODE.targets(&dir), &switches);
+        assert_eq!(cleaned[0].managed, ZCODE.events().len());
+        let after_uninstall: Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
-            groups
-                .iter()
-                .flat_map(|g| g["hooks"].as_array().unwrap().iter())
-                .filter(|h| is_managed(h))
-                .count(),
-            1
+            after_uninstall,
+            serde_json::from_str::<Value>(r#"{"hooks":{"enabled":false}}"#).unwrap(),
+            "恢复到装之前：值写回 false，events 摘空后整个键一起删"
         );
+
+        // 没有记录 = 不是我们拨的：一条都不该改
+        fs::write(&path, r#"{"hooks":{"enabled":true,"events":{}}}"#).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+        let none_recorded = uninstall_files(&ZCODE, std::slice::from_ref(&path), &json!({}));
+        assert_eq!(none_recorded[0].managed, 0, "没有自家条目就不算改动");
+        assert_eq!(fs::read_to_string(&path).unwrap(), before, "一个字都不写");
+
+        std::env::remove_var("PET_AGENT_HOME");
+        let _ = fs::remove_dir_all(&dir);
     }
 
+    /// 切换前的确认问：只有「显式关着 + 用户自己配过条目」才要问；
+    /// 多个文件要确认的条数加总成一个数（弹两次一样的框不如一次说清）。
     #[test]
-    fn uninstall_removes_only_ours_and_drops_empty_keys() {
-        let (text, _) = install_in_text("{}", cmd).unwrap();
-        let (after, removed) = uninstall_in_text(&text).unwrap().unwrap();
-        let config = parse(&after);
-        assert_eq!(removed, HOOK_PHASES.len());
-        assert_eq!(managed_count(&config), 0);
-        assert_eq!(config["hooks"].as_object().unwrap().len(), 0);
-    }
+    fn pending_consent_only_when_the_switch_is_explicitly_off() {
+        let _env = adapters::lock_test_env();
+        let dir = tmp_dir("consent");
+        std::env::set_var("PET_AGENT_HOME", &dir);
+        std::env::remove_var("PET_AGENT_CONFIG_FILES");
+        let cli = dir.join(".zcode").join("cli");
+        fs::create_dir_all(&cli).unwrap();
+        let file = cli.join("config.json");
 
-    #[test]
-    fn uninstall_keeps_user_owned_hooks() {
-        let raw = json!({
-            "hooks": { "Stop": [ { "hooks": [
-                { "type": "command", "command": "mine.exe --pet-hook stop" },
-                { "type": "command", "command": "keep.sh" }
-            ] } ] }
-        });
-        let (after, removed) = uninstall_in_text(&raw.to_string()).unwrap().unwrap();
-        let config = parse(&after);
-        assert_eq!(removed, 1);
+        fs::write(
+            &file,
+            r#"{"hooks":{"enabled":false,"events":{"Stop":[{"hooks":[{"type":"command","command":"keep.sh"}]}]}}}"#,
+        )
+        .unwrap();
         assert_eq!(
-            config["hooks"]["Stop"][0]["hooks"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
+            pending_consent(&ZCODE, &ZCODE.targets(&dir)),
+            Some(1),
+            "关着的开关 + 用户那 1 条 → 要问"
         );
-        assert_eq!(config["hooks"]["Stop"][0]["hooks"][0]["command"], "keep.sh");
+
+        // 用户一条都没有：打开开关不会连带启用任何东西，不该拦路
+        fs::write(&file, r#"{"hooks":{"enabled":false,"events":{}}}"#).unwrap();
+        assert_eq!(pending_consent(&ZCODE, &ZCODE.targets(&dir)), None);
+
+        // 本来就开着：没什么要确认的
+        fs::write(
+            &file,
+            r#"{"hooks":{"enabled":true,"events":{"Stop":[{"hooks":[{"type":"command","command":"keep.sh"}]}]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(pending_consent(&ZCODE, &ZCODE.targets(&dir)), None);
+
+        // 没有这个键（ZCode 按关处理，但「开关现在是关的」那句文案不成立）→ 不问
+        fs::write(
+            &file,
+            r#"{"hooks":{"events":{"Stop":[{"hooks":[{"type":"command","command":"keep.sh"}]}]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(pending_consent(&ZCODE, &ZCODE.targets(&dir)), None);
+
+        // Qoder 没有总开关，永远不问
+        assert_eq!(pending_consent(&QODER, std::slice::from_ref(&file)), None);
+
+        std::env::remove_var("PET_AGENT_HOME");
+        let _ = fs::remove_dir_all(&dir);
     }
 
+    /// 装后自检的三种结果要能分开：新增坏行 / 没新行 / **没日志可读所以没查**。
+    /// 第三种最要紧：它不能长得像「查过了、一切正常」。
     #[test]
-    fn uninstall_reports_no_change_when_nothing_ours() {
-        assert!(uninstall_in_text(r#"{"theme":"dark"}"#).unwrap().is_none());
+    fn self_check_separates_problem_from_ok_from_not_checked() {
+        let _env = adapters::lock_test_env();
+        let dir = tmp_dir("selfcheck");
+        std::env::set_var("PET_AGENT_HOME", &dir);
+        let log = dir.join(".zcode").join("cli").join("log");
+        let bad_line = r#"{"event":"config_file_invalid","path":"config.json"}"#;
+
+        // 1) 还没有日志目录 = 没查
+        assert_eq!(
+            zcode_self_check(mark_zcode_log(&dir).as_ref(), &dir, "--agent zcode")["status"],
+            "unavailable",
+            "没日志时必须说「没查」，不是「查过且没问题」"
+        );
+
+        // 2) 装之前就有的坏行按字节偏移切掉，不算我们引入的
+        fs::create_dir_all(&log).unwrap();
+        let file = log.join("zcode-2026-10-18.jsonl");
+        fs::write(&file, format!("{bad_line}\n")).unwrap();
+        let mark = mark_zcode_log(&dir).expect("该能挑出这份日志");
+        fs::write(&file, format!("{bad_line}\n{{\"level\":\"info\"}}\n")).unwrap();
+        let ok = zcode_self_check(Some(&mark), &dir, "--agent zcode");
+        assert_eq!(ok["status"], "ok", "新增的那行不是坏行：{ok}");
+
+        // 3) 装之后追加坏行 → problem，并把原文交出去
+        fs::write(
+            &file,
+            format!("{bad_line}\n{{\"level\":\"info\"}}\n{bad_line}2\n"),
+        )
+        .unwrap();
+        let problem = zcode_self_check(Some(&mark), &dir, "--agent zcode");
+        assert_eq!(problem["status"], "problem");
+        assert!(
+            String::from(problem["line"].as_str().unwrap_or_default())
+                .contains("config_file_invalid"),
+            "设置页要能附上日志原文：{problem}"
+        );
+
+        // 4) 跨天冒出的新文件整份都算新增：记号对不上路径，不能当成「没新行」。
+        //    先删掉旧的那份，免得「挑最新日志」按 mtime 比较时两份同刻、结果不稳定。
+        fs::remove_file(&file).unwrap();
+        fs::write(log.join("zcode-2026-10-19.jsonl"), format!("{bad_line}\n")).unwrap();
+        assert_eq!(
+            zcode_self_check(Some(&mark), &dir, "--agent zcode")["status"],
+            "problem",
+            "新日志文件里的坏行也是我们的责任范围"
+        );
+
+        std::env::remove_var("PET_AGENT_HOME");
+        let _ = fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn refuses_to_rewrite_malformed_or_non_object_config() {
-        assert!(install_in_text("{ not json", cmd).is_err());
-        assert!(install_in_text("[1,2,3]", cmd).is_err());
-        assert!(uninstall_in_text("[1,2,3]").is_err());
-    }
-
-    #[test]
-    fn quotes_exe_path_for_spaces() {
-        let built = command_for(Path::new(r"C:\Program Files\pet\desktop-pet.exe"), "pre");
-        assert!(built.starts_with('"'));
-        assert!(built.contains("Program Files"));
-        assert!(built.ends_with("--pet-hook pre"));
-    }
-
-    /// 「装成功才算用户的选择」的判据：设置页据此决定要不要往 agent-linkage.json 写 qoder。
+    /// 「装成功才算用户的选择」的判据：设置页据此决定要不要往 agent-linkage.json 写选择。
     /// 全失败还去记，等于让下一次启用插件装一个从没成功过的 hook。
     #[test]
     fn any_installed_needs_a_file_without_error_and_with_entries() {
@@ -472,6 +608,7 @@ mod tests {
             path: "x".into(),
             managed,
             error: error.map(str::to_string),
+            switch_before: None,
         };
         assert!(any_installed(&[ok(12, None)]));
         assert!(

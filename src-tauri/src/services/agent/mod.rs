@@ -8,6 +8,7 @@
 //! 为什么不写死 identifier：hook 分支在建窗之前就返回了，拿不到 AppHandle，
 //! 于是从编译期内嵌的 tauri.conf.json 读，保持单一来源。
 
+pub mod adapters;
 pub mod inbox;
 pub mod linkage;
 pub mod phases;

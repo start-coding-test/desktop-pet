@@ -2,7 +2,7 @@
 
 清单第 42 项 L1 要「Web Worker 插件宿主：ADR + 原型（插件身份由宿主分配，不可伪造）」。
 **决定：把插件代码从承载窗的 realm 搬进 module Worker；插件身份由宿主在创建 Worker 时分配并绑定到那条
-`MessagePort`，Worker 侧不再有 `invoke` 可调；面向插件的 22 个方法改走宿主代理；
+`MessagePort`，Worker 侧不再有 `invoke` 可调；面向插件的 23 个方法改走宿主代理；
 widget 的容器与 Shadow DOM 仍留在宿主 realm，Worker 只发渲染指令。**
 
 **为什么算决策**：这是一次真实的换轨，不是"再优化一下"。它会推翻本仓一条写了很久的自我承认 ——
@@ -40,8 +40,10 @@ T10 数出的可伪造点里，前 6 条都源于同一个事实：**Worker 里�
 
 ## 契约（L1 原型必须遵守的形状）
 
-- **接口面 = 22 个方法**：`buildContext`（`bridge.ts:120-258`）暴露的 19 个（bus 2 / storage 3 / ble 5 / widget 1 / pet 2 /
-  http 1 / notify 1 / overlay 3 / log 1）加 `createAgentHooksApi` 的 3 个。（那份表不入库：每个方法背后的命令名我逐条核过都在 `lib.rs:96` 的 48 条注册表里，缺失 0。）Worker 版桥必须覆盖这张表，不许多也不许多年。
+- **接口面 = 23 个方法**：`buildContext`（`bridge.ts:120-258`）暴露的 19 个（bus 2 / storage 3 / ble 5 / widget 1 / pet 2 /
+  http 1 / notify 1 / overlay 3 / log 1）加 `createAgentHooksApi` 的 4 个（A02 为设置页四选一追加 `agentHooks.set`）。（那份表不入库：每个方法背后的命令名我逐条核过都在 `lib.rs:96` 的 49 条注册表里，缺失 0。）Worker 版桥必须覆盖这张表，不许多也不许多年。
+  **追加的方法只许是「设置页需要的新方法名」**，对撞与匹配逻辑一律不动（PM 2026-10-17 的授权口径）；改这张表的顺序是
+  **先改本 ADR 与 `unit-worker-host.mjs` 的文件头，再动代码**，且那条「恰好等于完整名单」的断言只许变严不许变松。
 - **渲染层留在宿主 realm**：widget 的容器与 Shadow DOM 由宿主持有（`widget-host.ts`），Worker 只发渲染指令。
   四个插件对主文档 realm 的依赖共 84 处，分级是 **W 可做 6 / 需宿主代理 78 / 做不到 0**——
   也就是说没有哪条必须在 Worker 里做不到的事，但绝大多数要么变成消息、要么留在宿主侧。
@@ -152,5 +154,5 @@ dev 用 `npm run dev:debug`（无 CSP），打包版用 `tauri build --no-bundle
   `verify-isolation` 里那批「越权尝试被拒」的断言要**新增而不是替换**——同 realm 越权用例全部被拒是 L2 的验收，本波先把判据立起来。
   拆两步的依据是 T16 取证（`reference/T16-summary.md`）：**阶段一不用改任何插件代码** ——
   四个入口闭包共 20 个文件对宿主 realm 零依赖（B=0、C=0），把 Worker 变成默认即可收口第 1/2/3/5 条；
-  **阶段二才是硬骨头** —— 338 行 DOM 全在 widget 图，缺的是渲染指令词汇表与一条反向事件通道（`el-on` 17 行在 22 表里没有对应物）。
+  **阶段二才是硬骨头** —— 338 行 DOM 全在 widget 图，缺的是渲染指令词汇表与一条反向事件通道（`el-on` 17 行在 23 表里没有对应物）。
 - L1/L2 都不改能力名单与授权模型（K3/K4 交付的那套），改的只是「谁在替插件说话」。

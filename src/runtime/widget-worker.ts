@@ -53,6 +53,8 @@ export interface AgentHooksApi {
   status(): Promise<unknown>;
   install(): Promise<unknown>;
   uninstall(): Promise<unknown>;
+  /** 唯一一个带参数的：切换要同时交出「选哪家」和「用户已确认」 */
+  set(agent: string, confirm?: boolean): Promise<unknown>;
 }
 
 export interface WidgetRuntime {
@@ -115,6 +117,8 @@ export function createWidgetRuntime(deps: WidgetRuntimeDeps): WidgetRuntime {
           status: agent("agentHooks.status"),
           install: agent("agentHooks.install"),
           uninstall: agent("agentHooks.uninstall"),
+          // 不能套上面那个零参工厂：set 少了 agent 与 confirm 就切不动，宿主只会收到一次 agent 为空的调用
+          set: (agentId, confirm) => call("agentHooks.set", [agentId, confirm ?? false]),
         },
       };
     }

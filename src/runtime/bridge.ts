@@ -113,6 +113,11 @@ export function createAgentHooksApi(manifest: ManifestLike) {
     status: gated(manifest, AGENT_HOOKS, () => hostCall<unknown>("agent_hooks_status", { pluginId: manifest.id })),
     install: gated(manifest, AGENT_HOOKS, () => hostCall<unknown>("agent_hooks_install", { pluginId: manifest.id })),
     uninstall: gated(manifest, AGENT_HOOKS, () => hostCall<unknown>("agent_hooks_uninstall", { pluginId: manifest.id })),
+    // 切换联动的 Agent（设置页四选一）。单独一条命令的理由见 ADR-0002 与 A02 卡片 §5：
+    // 「卸旧失败、停在原状态」必须同步回给设置页，复用 install 或「写配置再让宿主响应」都做不到
+    set: gated(manifest, AGENT_HOOKS, (agent: string, confirm?: boolean) =>
+      hostCall<unknown>("agent_linkage_set", { pluginId: manifest.id, agent, confirm: confirm ?? false }),
+    ),
   };
 }
 

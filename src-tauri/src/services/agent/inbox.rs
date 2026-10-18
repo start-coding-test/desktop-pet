@@ -31,7 +31,10 @@ fn app_data_dir_standalone() -> Result<PathBuf, String> {
 
 /// 收全 stdin 并落成 JSONL 的一行。这里出错一律静默返回：该分支既没有日志系统
 /// 也没有窗口，报错无处可显示，更不能反过来挡住 Agent。
-pub fn hook_ingest(phase: &'static str) {
+///
+/// `agent` 是来源标识，取自命令行校验过的结果（见 `phases::hook_phase_from_args`）——
+/// **不能**从 hook 的 payload 里取，那是外部输入，来源过滤拿它当依据就等于让事件自己声明来源。
+pub fn hook_ingest(phase: &'static str, agent: &'static str) {
     let dir = match app_data_dir_standalone().map(|p| inbox_dir(&p)) {
         Ok(dir) => dir,
         Err(_) => return,
@@ -48,12 +51,7 @@ pub fn hook_ingest(phase: &'static str) {
     let text = String::from_utf8_lossy(&buf);
     let text = text.trim();
 
-    // 重新序列化保证「一条事件 = 一行」，否则读侧的行切分会被多行 JSON 打乱
-    let line = match serde_json::from_str::<Value>(text) {
-        Ok(payload) => json!({ "phase": phase, "at": now_ms(), "payload": payload }),
-        Err(_) => json!({ "phase": phase, "at": now_ms(), "raw": text }),
-    };
-    let mut encoded = line.to_string();
+    let mut encoded = line_for(phase, agent, text).to_string();
     encoded.push('\n');
     if let Ok(mut file) = OpenOptions::new()
         .create(true)
@@ -61,6 +59,20 @@ pub fn hook_ingest(phase: &'static str) {
         .open(dir.join(format!("{phase}.jsonl")))
     {
         let _ = file.write_all(encoded.as_bytes());
+    }
+}
+
+/// 把 stdin 原文包成一行 JSONL 的对象：除新增的 `agent` 外，键、格式与从前一致。
+///
+/// 单独成函数是因为 `hook_ingest` 要读 stdin，单测造不出那个环境；键集合这条判据
+/// （「新行的键恰好等于旧键加 agent」）只能在这里成立。
+fn line_for(phase: &str, agent: &str, text: &str) -> Value {
+    // 重新序列化保证「一条事件 = 一行」，否则读侧的行切分会被多行 JSON 打乱
+    match serde_json::from_str::<Value>(text) {
+        Ok(payload) => {
+            json!({ "phase": phase, "at": now_ms(), "agent": agent, "payload": payload })
+        }
+        Err(_) => json!({ "phase": phase, "at": now_ms(), "agent": agent, "raw": text }),
     }
 }
 
@@ -80,5 +92,55 @@ pub(super) fn enforce_inbox_cap(dir: &Path) {
         {
             let _ = fs::write(&path, b"");
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys(value: &Value) -> Vec<String> {
+        let mut got: Vec<String> = value
+            .as_object()
+            .expect("必须是对象")
+            .keys()
+            .cloned()
+            .collect();
+        got.sort();
+        got
+    }
+
+    /// 一行里只多了 `agent`，其余键与从前一致；非 JSON 的旧形状也一样。
+    /// （`keys()` 按字典序排过，所以 `payload` 排在 `phase` 前面：`pa` < `ph`。）
+    #[test]
+    fn ingest_line_keys_are_the_old_ones_plus_agent() {
+        let good = line_for("pre", "zcode", r#"{"session_id":"s1"}"#);
+        assert_eq!(
+            keys(&good),
+            vec![
+                "agent".to_string(),
+                "at".to_string(),
+                "payload".to_string(),
+                "phase".to_string()
+            ]
+        );
+        assert_eq!(good["agent"], "zcode");
+        assert_eq!(good["phase"], "pre");
+        assert_eq!(
+            good["payload"]["session_id"], "s1",
+            "payload 原样带着，没被拆"
+        );
+        assert!(good["at"].is_i64(), "时间戳还得在");
+
+        let bad = line_for("post", "qoder", "这不是 JSON");
+        assert_eq!(
+            keys(&bad),
+            vec![
+                "agent".to_string(),
+                "at".to_string(),
+                "phase".to_string(),
+                "raw".to_string()
+            ]
+        );
+        assert_eq!(bad["raw"], "这不是 JSON");
     }
 }

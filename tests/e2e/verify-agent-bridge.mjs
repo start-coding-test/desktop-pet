@@ -631,6 +631,31 @@ try {
   r.check("宿主路径（设置窗、不带 pluginId）照旧可用", true, hostStatus.ok === true);
   r.check("宿主 status 回显含配置文件列表", true, Array.isArray(hostStatus.v?.files));
 
+  // closed Shadow DOM 里的元素从外面查不到：按 verify-astock 的既有做法，从 widgetHost.mounted
+  // 取挂载记录、用它捕获的 shadow 引用操作（都在页面内求值，走真实点击路径）。
+  // 定义在外层：④ 那组（安装/卸载/启停）和 ⑨ 的「四选一」都要用，抄两份就会各漂各的。
+  const recExpr = `((await import('/src/runtime/widget-host.ts')).widgetHost.mounted.get(${JSON.stringify(AGENT_ID)}) ?? []).find((r) => r.host.dataset.region === "settings")`;
+  const stateExpr = (want) =>
+    `(async () => { const rec = ${recExpr}; return !!rec && rec.shadow.querySelector('.hk-status')?.dataset.state === ${JSON.stringify(want)}; })()`;
+  const clickShadow = async (selector, label) => {
+    const ok = await waitUntil(
+      settings.client,
+      `(async () => { const rec = ${recExpr}; return !!rec?.shadow?.querySelector(${JSON.stringify(selector)}); })()`,
+      15_000,
+    );
+    r.check(label, true, ok);
+    if (ok) {
+      await settings.client.ev(`(async () => {
+        const rec = ${recExpr};
+        rec.shadow.querySelector(${JSON.stringify(selector)}).click();
+        return true;
+      })()`);
+    }
+    return ok;
+  };
+  const statusText = () =>
+    settings.client.ev(`(async () => { const rec = ${recExpr}; return rec ? rec.shadow.querySelector('.hk-status')?.textContent ?? '' : ''; })()`);
+
   r.group("插件页：Qoder hook 接入（端到端，只碰 temp 样例）");
   // A9a：入口在 agent 桥自己的设置页（settings 区 widget）。写盘类断言一律只碰
   // PET_AGENT_CONFIG_FILES 指到的 temp/a9a 样例；不满足就整组跳过并说清原因。
@@ -661,8 +686,11 @@ try {
   if (!underTemp) {
     r.info("跳过写盘断言", "hook 配置未指向 temp/a9a（启动时未设 PET_AGENT_CONFIG_FILES）；本组不写任何文件");
   } else {
-    // 「他人条目未变」复用 verify-isolation.mjs「逐字段未变（键序由宿主归一）」的同一口径：
-    // 按键排序的规范串比较（宿主 serde_json 整文件重写会归一键序，那是既有行为、不是改动）。
+    // 「他人条目未变」沿用「逐字段未变」的同一口径：按键排序的规范串比较。
+    // 注意这个排序只是**比对手段**，不代表宿主的行为：A02 起宿主开了 serde_json 的
+    // preserve_order，整文件重写不再把键归一成字母序，而是原样保留用户自己的键序
+    // （改 ZCode 那种混着 MCP/权限开关的配置就必须这样）。键序真被改坏时，
+    // 红的是 commands/agent.rs 那条「往返后键序不变」的单测，不是这里。
     const canon = (value) => {
       if (Array.isArray(value)) return value.map(canon);
       if (value && typeof value === "object") {
@@ -684,29 +712,6 @@ try {
       }
       return JSON.stringify(out);
     };
-    // closed Shadow DOM 里的元素从外面查不到：按 verify-astock 的既有做法，从 widgetHost.mounted
-    // 取挂载记录、用它捕获的 shadow 引用操作（都在页面内求值，走真实点击路径）。
-    const recExpr = `((await import('/src/runtime/widget-host.ts')).widgetHost.mounted.get(${JSON.stringify(AGENT_ID)}) ?? []).find((r) => r.host.dataset.region === "settings")`;
-    const stateExpr = (want) =>
-      `(async () => { const rec = ${recExpr}; return !!rec && rec.shadow.querySelector('.hk-status')?.dataset.state === ${JSON.stringify(want)}; })()`;
-    const clickShadow = async (selector, label) => {
-      const ok = await waitUntil(
-        settings.client,
-        `(async () => { const rec = ${recExpr}; return !!rec?.shadow?.querySelector(${JSON.stringify(selector)}); })()`,
-        15_000,
-      );
-      r.check(label, true, ok);
-      if (ok) {
-        await settings.client.ev(`(async () => {
-          const rec = ${recExpr};
-          rec.shadow.querySelector(${JSON.stringify(selector)}).click();
-          return true;
-        })()`);
-      }
-      return ok;
-    };
-    const statusText = () =>
-      settings.client.ev(`(async () => { const rec = ${recExpr}; return rec ? rec.shadow.querySelector('.hk-status')?.textContent ?? '' : ''; })()`);
 
     // 打开 agent 桥的插件页（套件前面已把它加进启用清单；没加上就补一次开关，与用户点开关同一条路径）
     await settings.client.ev(`document.querySelector('#nav-plugins .nav-item[data-view=${JSON.stringify(AGENT_ID)}]')?.click(); true`);
@@ -764,6 +769,17 @@ try {
     for (const f of stAfterInstall?.files ?? []) {
       r.check("安装后样例文件恰好 expectedPerFile 条", stAfterInstall.expectedPerFile, readFileSync(f.path, "utf8").split("--pet-hook").length - 1);
     }
+    // 装出来的条目必须带来源字段：不带的话，收件侧只能靠「缺省按 qoder」兜底 ——
+    // 接线第二个 Agent 之后，那个兜底就是「桌宠对着别人的会话演」。
+    // files.length 也钉住，否则空数组的 every() 恒真是条假绿。
+    r.check(
+      "装好的条目带 --agent qoder",
+      true,
+      (stAfterInstall?.files?.length ?? 0) > 0 &&
+        (stAfterInstall?.files ?? []).every((f) =>
+          readFileSync(f.path, "utf8").includes("--pet-hook pre --agent qoder"),
+        ),
+    );
     r.check("安装不改别人条目（复用按键排序规范串口径）", expectForeign, `${foreignOf(cfgA)}|${foreignOf(cfgB)}`);
     const shownInstall = String(await statusText());
     r.check("回显条数与随后一次 status() 一致", true, shownInstall.includes(`共 ${stAfterInstall.managed} 条`));
@@ -842,7 +858,68 @@ try {
       await eventCount(),
     );
 
-    // ⑦ --pet-hook-cleanup：NSIS 卸载前那条清理分支。跑在真的 dev 实例旁边，
+    // ⑦ 来源过滤（A02）：与当前 Agent 不一致的事件只推进偏移量，不进状态机也不广播。
+    // 用真 exe 注入而不是直接写收件文件：一次跑完「--agent 参数 → JSONL → watcher」整条链。
+    r.group("来源过滤：别的 Agent 的事件不驱动桌宠");
+    const foreignSess = `verify-foreign-${Date.now()}`;
+    const eventsBeforeFilter = await eventCount();
+    const foreign = spawnSync(EXE, ["--pet-hook", "pre", "--agent", "zcode"], {
+      input: JSON.stringify({ session_id: foreignSess, tool_name: "Bash" }),
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    r.check("带 --agent zcode 的 hook 分支退出码为 0", 0, foreign.status);
+    await sleep(1_500);
+    r.check("外来来源不产生 agent:event", eventsBeforeFilter, await eventCount());
+    r.check(
+      "外来事件确实落了盘（红在这条说明是采集坏了，而不是过滤生效）",
+      true,
+      readFileSync(join(INBOX, "pre.jsonl"), "utf8").includes(foreignSess),
+    );
+    // 对照：同一 phase 换成当前来源必须照常广播 —— 没有这条，上面的绿可能只是整条链断了
+    const mine = spawnSync(EXE, ["--pet-hook", "pre", "--agent", "qoder"], {
+      input: JSON.stringify({ session_id: `verify-mine-${Date.now()}`, tool_name: "Bash" }),
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    r.check("带 --agent qoder 的 hook 分支退出码为 0", 0, mine.status);
+    r.check(
+      "当前来源照常广播，且 payload 带上 agent 字段",
+      true,
+      await waitUntil(
+        c,
+        `(window.__topics.slice().reverse().find(([k]) => k === 'host-event')?.[1]?.agent === 'qoder')`,
+        8_000,
+      ),
+    );
+    r.check(
+      "agent:state 也带上 agent 字段",
+      true,
+      await waitUntil(
+        c,
+        `(window.__topics.slice().reverse().find(([k]) => k === 'host-state')?.[1]?.agent === 'qoder')`,
+        8_000,
+      ),
+    );
+
+    // 缺省（不带 --agent）的旧形状必须仍然可用：A01 装好的条目就是这个形状
+    const legacy = spawnSync(EXE, ["--pet-hook", "post"], {
+      input: JSON.stringify({ session_id: `verify-legacy-${Date.now()}`, tool_name: "Bash" }),
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    r.check("不带 --agent 的旧 hook 条目退出码为 0", 0, legacy.status);
+    r.check(
+      "不带 --agent 时按 qoder 处理，事件照常被采集",
+      true,
+      await waitUntil(
+        c,
+        `(window.__topics.slice().reverse().find(([k]) => k === 'host-event')?.[1]?.phase === 'post')`,
+        8_000,
+      ),
+    );
+
+    // ⑧ --pet-hook-cleanup：NSIS 卸载前那条清理分支。跑在真的 dev 实例旁边，
     // 顺带证明分流发生在单实例锁与建窗之前 —— 排错了要么条目不被清，要么现成实例被干扰。
     r.group("卸载前清理分支（起一个 exe --pet-hook-cleanup）");
     const readInboxLen = () => {
@@ -880,6 +957,139 @@ try {
     writeFileSync(cfgA, foreignOnly("a"));
     writeFileSync(cfgB, foreignOnly("b"));
     r.info("样例配置已复位", "两份都只剩用户自己的 hook 条目");
+  }
+
+  // ⑨ ZCode 切换（A02-4）：夹具目录由本套件自建自删，工作流不负责预置。
+  // 只跑 ZCode —— codex / workbuddy 的适配器在 PR-3 接线，那时按同一形状各加一组。
+  r.group("ZCode 切换：确认门、双文件、总开关恢复（只碰 PET_AGENT_HOME 下的夹具）");
+  const ZHOME = String(env.PET_AGENT_HOME ?? "");
+  // 两组前置都要满足：PET_AGENT_HOME 在 temp 下（写盘安全），且④那组真的把设置页开起来了
+  // （本组的切换走界面 —— 设置区 widget 没挂载就没有按钮可点，那是前置不成立而不是行为坏了）
+  const zhomeOk = ZHOME !== "" && resolve(ZHOME).startsWith(TEMP_ROOT + sep) && underTemp;
+  r.check("前置齐备：PET_AGENT_HOME 在 temp 下 + 设置页已挂载", true, zhomeOk);
+  if (!zhomeOk) {
+    r.info("跳过 ZCode 组", "PET_AGENT_HOME 未设/不在 temp 下，或设置页没打开；本组一个文件都不写");
+  } else {
+    const zcli = join(ZHOME, ".zcode", "cli");
+    rmSync(zcli, { recursive: true, force: true });
+    mkdirSync(zcli, { recursive: true });
+    const zcfg = join(zcli, "config.json");
+    const zset = join(zcli, "setting.json");
+    const userHook = { type: "command", command: "user-hook.sh", timeoutMs: 3000 };
+    const sample = (enabled) =>
+      JSON.stringify(
+        {
+          mcpServers: { fake: { command: "npx fake-mcp" } },
+          ...(enabled === undefined ? {} : { hooks: { enabled, events: { Stop: [{ hooks: [userHook] }] } } }),
+          permissions: { allow: ["Bash"] },
+        },
+        null,
+        2,
+      );
+
+    writeFileSync(zcfg, sample(false));
+    const zBefore = readFileSync(zcfg, "utf8");
+    const denied = await settings.invoke("agent_linkage_set", { agent: "zcode" });
+    r.check("总开关显式关着且用户配过条目 → 第一次切换被要求确认", false, denied.ok);
+    r.check("确认文案带上用户自己的条数", true, /1 条/.test(String(denied.e)));
+    r.check(
+      "确认拒绝带 ASCII 机器可读前缀（界面靠它判，不靠猜中文）",
+      "[need-confirm]",
+      String(denied.e).slice(0, 14),
+    );
+    r.check("被拦下时一个文件都没动", zBefore, readFileSync(zcfg, "utf8"));
+    r.check("未知来源的 agent 值直接被拒（不是任意非空字符串）", false, (await settings.invoke("agent_linkage_set", { agent: "nope" })).ok);
+
+    // 真正走一遍界面：点四选一里的 ZCode → 桥 → Worker 通道 agentHooks.set → 宿主。
+    // 这条链上任何一环没接上，表现都是「按了没反应」，所以判据必须是界面状态而不是 invoke 结果。
+    const clickedZ = await clickShadow(".hk-agent-zcode", "四选一里有 ZCode 这个按钮");
+    // 最早断点：监听到底有没有被调到（widget 在 click 处理器第一行写这个标记）。
+    // 没有它，「点了没反应」就得分不清是监听没注册、还是宿主调用失败、还是失败被覆盖。
+    r.check(
+      "点 ZCode 的监听被调到（面板 dataset.lastSwitch）",
+      "zcode",
+      await settings.client.ev(
+        `(async () => { const rec = ${recExpr}; return rec?.shadow?.querySelector('.hk-status')?.dataset.lastSwitch ?? ""; })()`,
+      ),
+    );
+    r.check(
+      "第一趟停在确认门（界面 dataset.state=consent）",
+      true,
+      clickedZ && (await waitUntil(settings.client, stateExpr("consent"), 12_000)),
+    );
+    // 上一轮这条判据红但看不出红在哪一步：把面板原文打出来，日志里就能直接读到
+    // 界面收到的那句（是宿主的拒绝、还是别的），不用再猜。
+    r.info("点 ZCode 之后面板原文", String(await statusText()));
+    r.check("确认提示没改写宿主原话", true, /1 条/.test(String(await statusText())));
+    // 「按钮出现了」以前只查 .hk-consent 在不在 —— 那个按钮是常驻 DOM、靠 class 显隐的，
+    // 所以那条判据永远真，等于没判。改成查槽位的 class 是不是亮着。
+    const slotOn = await settings.client.ev(
+      `(async () => { const rec = ${recExpr}; return String(rec?.shadow?.querySelector('.hk-consent-slot')?.className ?? '').includes("on"); })()`,
+    );
+    r.check("确认槽位亮着（不是「元素在就等于按钮在」）", true, slotOn);
+    const clickedConsent = await clickShadow(".hk-consent", "「仍要打开」点得到");
+    r.check(
+      "点「仍要打开」之后装上（界面 state=installed）",
+      true,
+      clickedConsent && (await waitUntil(settings.client, stateExpr("installed"), 20_000)),
+    );
+    const zText = readFileSync(zcfg, "utf8");
+    r.check("装了 7 个事件（ZCode 没有 SessionEnd/Notification/Subagent）", 7, zText.split("--pet-hook").length - 1);
+    r.check("条目带 --agent zcode", true, zText.includes("--pet-hook pre --agent zcode"));
+    r.check("只写文档列出的字段（不写 matcher / args）", false, /matcher|"args"/.test(zText));
+    r.check("timeoutMs 用毫秒", true, zText.includes("\"timeoutMs\": 2000"));
+    r.check("总开关被打开", true, JSON.parse(zText).hooks.enabled === true);
+    const zc = JSON.parse(zText);
+    const inner = zc.hooks.events.Stop.flatMap((g) => g.hooks ?? []);
+    const mine = inner.find((h) => String(h.command).includes("--pet-hook"));
+    const kept = inner.find((h) => !String(h.command).includes("--pet-hook"));
+    r.check("我们的条目独占一个分组", true, zc.hooks.events.Stop.length >= 2 && kept?.command === "user-hook.sh" && !!mine);
+    r.check("其他键一个不少，且顶层键序原样（preserve_order 的端到端证据）", ["mcpServers", "hooks", "permissions"], Object.keys(zc));
+    r.check("没装过的那份 setting.json 不被凭空造出来", false, existsSync(zset));
+
+    const stZ = (await settings.invoke("agent_hooks_status")).v;
+    r.check("状态页按当前那一家报（agent=zcode，每文件 7 条）", ["zcode", 7, 7], [stZ?.agent, stZ?.expectedPerFile, stZ?.managed]);
+    r.check("四选一清单列全四个槽位（含未接线的 codex/workbuddy）", ["codex", "qoder", "workbuddy", "zcode"], (stZ?.options ?? []).map((o) => o.id).sort());
+    r.check("未接线的槽位标成 wired=false", false, (stZ?.options ?? []).find((o) => o.id === "codex")?.wired);
+    r.check("装完提示由适配器给（新开会话才生效）", true, /新开/.test(String(stZ?.hint)));
+
+    // 来源过滤在真实切换之后仍只对当前那一家放行：注入 qoder 事件不该动桌宠，zcode 事件该动
+    const evCount = async () =>
+      (await c.ev(`window.__topics.filter(([k]) => k === 'host-event').length`));
+    const evBefore = await evCount();
+    spawnSync(EXE, ["--pet-hook", "pre", "--agent", "qoder"], {
+      input: JSON.stringify({ session_id: `verify-back-qoder-${Date.now()}`, tool_name: "Bash" }),
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    await sleep(1_500);
+    r.check("当前是 ZCode 时，注入 qoder 事件不广播", evBefore, await evCount());
+    spawnSync(EXE, ["--pet-hook", "pre", "--agent", "zcode"], {
+      input: JSON.stringify({ session_id: `verify-zcode-live-${Date.now()}`, tool_name: "Bash" }),
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    r.check("切到 ZCode 后自己的事件照常广播", true, await waitUntil(c, `(window.__topics.slice().reverse().find(([k]) => k === 'host-event')?.[1]?.agent === 'zcode')`, 8_000));
+
+    // 切回 Qoder：走界面（点四选一里的 Qoder），ZCode 的条目摘净，并且**总开关回到装之前的
+    // false**（hooksEnabled 记录的端到端证据）
+    const clickedBack = await clickShadow(".hk-agent-qoder", "四选一里 Qoder 是选中态、也能点");
+    r.check(
+      "切回 Qoder 后界面回到已安装",
+      true,
+      clickedBack && (await waitUntil(settings.client, stateExpr("installed"), 20_000)),
+    );
+    const zAfter = readFileSync(zcfg, "utf8");
+    r.check("ZCode 的条目摘净", 0, zAfter.split("--pet-hook").length - 1);
+    r.check("总开关恢复成装之前的 false", true, JSON.parse(zAfter).hooks.enabled === false);
+    r.check("用户自己的条目仍然在", "user-hook.sh", JSON.parse(zAfter).hooks.events.Stop.flatMap((g) => g.hooks ?? [])[0]?.command);
+    r.check("恢复后键序与内容回到原样", ["mcpServers", "hooks", "permissions"], Object.keys(JSON.parse(zAfter)));
+    const stQ = (await settings.invoke("agent_hooks_status")).v;
+    r.check("状态页跟着回到 Qoder", ["qoder", 12], [stQ?.agent, stQ?.expectedPerFile]);
+
+    // 夹具目录自己删：工作流不负责预置，也不能把它留给下一轮
+    rmSync(join(ZHOME, ".zcode"), { recursive: true, force: true });
+    r.check("夹具目录已自删", false, existsSync(zcli));
   }
 
   r.group("收尾前的完整性");

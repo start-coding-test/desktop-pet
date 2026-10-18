@@ -99,6 +99,7 @@ function buildContext(pluginId: string): WorkerPluginContext {
       status: () => ask<unknown>("agentHooks.status", []),
       install: () => ask<unknown>("agentHooks.install", []),
       uninstall: () => ask<unknown>("agentHooks.uninstall", []),
+      set: (agent, confirm) => ask<unknown>("agentHooks.set", [agent, confirm ?? false]),
     },
   };
 }

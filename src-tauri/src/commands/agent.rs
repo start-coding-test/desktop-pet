@@ -11,7 +11,7 @@
 //! 那条缺口要等 Web Worker 宿主才收口，别在这条注释里给自己假安全感。
 //!
 //! 这两个命令还是「用户显式选择」的唯一写入口（`agent-linkage.json` 的 `agent` 字段，
-//! 见 services/agent/linkage.rs）：装成功记 qoder，卸载记 null。
+//! 见 services/agent/linkage.rs）：装成功记那次的适配器 id，卸载记 null。
 //! 启停联动、删除插件、启动清理和 `--pet-hook-cleanup` 都只读它 ——
 //! 停用插件导致的卸载不是退出，重新启用时全靠这个字段把安装恢复回来。
 
@@ -21,8 +21,8 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 
 use crate::host_error::{HostError, INTERNAL, NOT_FOUND};
+use crate::services::agent::adapters::{self, AgentAdapter};
 use crate::services::agent::linkage;
-use crate::services::agent::HOOK_PHASES;
 use crate::services::agent_hooks;
 use crate::services::permission::PermissionState;
 
@@ -64,28 +64,51 @@ fn exe_path_error(e: std::io::Error) -> HostError {
 }
 
 fn snapshot(app: &AppHandle) -> Result<Value, HostError> {
-    let files = agent_hooks::candidate_files(&home_dir(app)?);
-    let reports = agent_hooks::status_reports(&files);
+    // 按「当前联动的那一家」查，不是写死 Qoder：设置页回显的必须就是用户选中的那个 Agent
+    let adapter = linkage::current_adapter(app);
+    let files = adapter.targets(&home_dir(app)?);
+    let reports = agent_hooks::status_reports(adapter, &files);
     let managed: usize = reports.iter().map(|r| r.managed).sum();
-    let expected = HOOK_PHASES.len();
+    let expected = adapter.events().len();
     Ok(json!({
         "exe": exe_path().map(|p| p.display().to_string()).unwrap_or_default(),
         "files": reports,
         "managed": managed,
         // 装了但条数不对（比如换过 exe 路径）时，UI 该提示「需要修复」而不是「已安装」
         "installed": managed > 0 && files.len() * expected == managed,
+        // 每份文件该有几条，由适配器的事件表给，不再直接引 Qoder 那张常量表
         "expectedPerFile": expected,
+        "agent": adapter.id(),
+        "displayName": adapter.display_name(),
+        "hint": adapter.post_install_hint(),
+        // 四选一的清单（含还没接线的槽位，界面按 wired=false 禁选）
+        "options": adapters::choices(),
     }))
 }
 
 /// 安装的配置目录入口：一个候选都没有时按「资源名字不存在」拒（not-found）。
 /// 独立成函数让这条失败在单测里可达（命令体要 AppHandle 与窗口，构造不出来）。
-fn required_hook_configs(home: &Path) -> Result<Vec<PathBuf>, HostError> {
-    let files = agent_hooks::candidate_files(home);
+///
+/// 文案整个由适配器拼：接第二个客户端时不该还写着 Qoder，而 Qoder 那句要与旧文案**逐字相同**
+/// （判据是 `install_without_qoder_config_dirs_is_not_found`）。
+fn required_hook_configs(
+    adapter: &dyn AgentAdapter,
+    home: &Path,
+) -> Result<Vec<PathBuf>, HostError> {
+    let files = adapter.targets(home);
     if files.is_empty() {
         return Err(HostError::new(
             NOT_FOUND,
-            "没找到 Qoder 的配置目录（~/.qoder 或 ~/.qoder-cn）",
+            format!(
+                "没找到 {} 的配置目录（{}）",
+                adapter.display_name(),
+                adapter
+                    .dir_hint()
+                    .iter()
+                    .map(|d| format!("~/{d}"))
+                    .collect::<Vec<_>>()
+                    .join(" 或 ")
+            ),
         ));
     }
     Ok(files)
@@ -108,11 +131,29 @@ pub fn agent_hooks_install(
     plugin_id: Option<String>,
 ) -> Result<Value, HostError> {
     assert_caller(&app, &window, plugin_id.as_deref(), "查询或改动 Agent hook")?;
-    let files = required_hook_configs(&home_dir(&app)?)?;
-    let reports = agent_hooks::install_files(&files, &exe_path()?);
+    // 「安装」装的是当前选中的那一家（四选一由 agent_linkage_set 负责改这个选择）
+    let adapter = linkage::current_adapter(&app);
+    let files = required_hook_configs(adapter, &home_dir(&app)?)?;
+    let reports = agent_hooks::install_files(adapter, &files, &exe_path()?);
     // 只有真装上才算用户的选择；全失败不写，见 linkage::note_installed
-    linkage::note_installed(&app, &reports);
-    Ok(json!({ "files": reports }))
+    linkage::note_installed(&app, adapter.id(), &reports);
+    Ok(json!({ "files": reports, "hint": adapter.post_install_hint() }))
+}
+
+/// 切换联动的 Agent（设置页四选一）。单独一条命令的理由（PM Q1）：它要把
+/// 「卸旧失败、停在原状态」这个结果**同步**回设置页，并按调用方做权限校验 ——
+/// 复用现有方法或「写配置文件再让宿主响应」两条路都做不到。
+/// `confirm` 是 ZCode 总开关那句确认的第二次点击（见 linkage::switch_agent）。
+#[tauri::command]
+pub fn agent_linkage_set(
+    app: AppHandle,
+    window: tauri::Window,
+    plugin_id: Option<String>,
+    agent: String,
+    confirm: Option<bool>,
+) -> Result<Value, HostError> {
+    assert_caller(&app, &window, plugin_id.as_deref(), "切换联动的 Agent")?;
+    linkage::switch_agent(&app, &agent, confirm.unwrap_or(false), &home_dir(&app)?)
 }
 
 #[tauri::command]
@@ -122,8 +163,11 @@ pub fn agent_hooks_uninstall(
     plugin_id: Option<String>,
 ) -> Result<Value, HostError> {
     assert_caller(&app, &window, plugin_id.as_deref(), "查询或改动 Agent hook")?;
-    let files = agent_hooks::candidate_files(&home_dir(&app)?);
-    let reports = agent_hooks::uninstall_files(&files);
+    // 卸载按「摘净每个已接线适配器」走，不是只摘 Qoder：设置页的卸载与「撤销授权」连带的
+    // 宿主卸载都意味着用户退出联动，留着别家的条目和一个已经被我们拨开的总开关没有道理。
+    // （`note_uninstalled` 会清掉总开关记录，所以只摘一家的话那笔账就丢了。）
+    let reports =
+        agent_hooks::uninstall_everywhere(&home_dir(&app)?, &linkage::recorded_switches_of(&app));
     // 卸载（含「撤销授权」连带的宿主卸载）算明确退出：记 null，别再自动装回来
     linkage::note_uninstalled(&app);
     Ok(json!({ "files": reports }))
@@ -132,6 +176,7 @@ pub fn agent_hooks_uninstall(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::agent::adapters::claude_style::{self, QODER};
     use crate::services::agent::HOOK_PHASES;
 
     /// B2 验收 P0：含他人 hook 条目的样例配置走完 install → uninstall 后，
@@ -160,7 +205,7 @@ mod tests {
         std::fs::write(&path, sample).unwrap();
 
         let exe = std::path::Path::new(r"C:\app\desktop-pet.exe");
-        let reports = agent_hooks::install_files(std::slice::from_ref(&path), exe);
+        let reports = agent_hooks::install_files(&QODER, std::slice::from_ref(&path), exe);
         assert!(reports[0].error.is_none(), "{:?}", reports[0].error);
         assert_eq!(reports[0].managed, HOOK_PHASES.len());
 
@@ -171,7 +216,8 @@ mod tests {
         assert!(installed.contains("keep.sh"));
         assert!(!installed.contains("D:\\\\old\\\\desktop-pet.exe"));
 
-        let reports2 = agent_hooks::uninstall_files(std::slice::from_ref(&path));
+        let reports2 =
+            agent_hooks::uninstall_files(&QODER, std::slice::from_ref(&path), &json!({}));
         assert_eq!(reports2[0].managed, HOOK_PHASES.len());
         let after = std::fs::read_to_string(&path).unwrap();
         assert!(!after.contains("--pet-hook"));
@@ -185,15 +231,21 @@ mod tests {
             ]
         };
         assert_eq!(foreign(&installed), foreign(&after));
-        assert_eq!(
-            foreign(&installed)[0],
-            "{\"command\":\"other-tool --notify\",\"timeout\":5,\"type\":\"command\"}"
-        );
+        // 键序也是「未变」的一部分，而且这条要的就是键序：样例里三个键是**故意**不按字母序
+        // 写的（type → command → timeout）。serde_json 没开 preserve_order 时这里会得到
+        // {"command":…,"timeout":…,"type":…}，等于我们替用户把他的配置重排了一遍。
+        // 装卸两个端点都钉：只钉 install 那端，「卸载时又排一次序」就看不见。
+        let untouched = vec![
+            "{\"type\":\"command\",\"command\":\"other-tool --notify\",\"timeout\":5}".to_string(),
+            "{\"type\":\"command\",\"command\":\"keep.sh\",\"timeout\":3}".to_string(),
+        ];
+        assert_eq!(foreign(&installed), untouched, "装完不能重排别人条目的键序");
+        assert_eq!(foreign(&after), untouched, "卸载往返后仍然是原键序");
 
         // 其余内容也原样：theme 还在，顶层 hooks 只少了自家条目所在的数组项
         let val: Value = serde_json::from_str(&after).unwrap();
         assert_eq!(val["theme"], "dark");
-        assert_eq!(agent_hooks::managed_count(&val), 0);
+        assert_eq!(claude_style::managed_count(&val), 0);
         assert_eq!(
             val["hooks"]["PreToolUse"][0]["hooks"]
                 .as_array()
@@ -215,7 +267,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pet-a04-cfg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let err = required_hook_configs(&dir).unwrap_err();
+        let err = required_hook_configs(&QODER, &dir).unwrap_err();
         assert_eq!(err.code, NOT_FOUND);
         assert_eq!(
             err.message,

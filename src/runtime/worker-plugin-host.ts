@@ -206,6 +206,7 @@ class WorkerPluginHost {
       "agentHooks.status": () => session.agentHooks.status(),
       "agentHooks.install": () => session.agentHooks.install(),
       "agentHooks.uninstall": () => session.agentHooks.uninstall(),
+      "agentHooks.set": (args) => session.agentHooks.set(String(args[0]), Boolean(args[1])),
     };
   }
 
