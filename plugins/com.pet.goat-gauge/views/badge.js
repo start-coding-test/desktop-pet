@@ -4,6 +4,7 @@ import { fmtCountdown, fmtMoney, fmtPct } from "../format.js";
 import { toneOfPct } from "../charts.js";
 import { TOPIC_CMD, TOPIC_WIDGET } from "../topics.js";
 import { addStyle, tag, text } from "./dom.js";
+import { setClassIfChanged, setTextIfChanged } from "./write.js";
 
 const CSS = `
   .g-badge { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px;
@@ -33,9 +34,9 @@ export function mountBadge(root, ctx, cleanups) {
 
   let lastView = null;
   let mounted = false;
+  const cache = {};
 
-  function render(view) {
-    lastView = view ?? null;
+  function show() {
     const d = lastView;
     if (!d || d.state === "onboarding" || !d.account || !d.windows) {
       if (mounted) badge.remove();
@@ -44,8 +45,8 @@ export function mountBadge(root, ctx, cleanups) {
     }
 
     if (d.state === "auth_error") {
-      label.textContent = "Key 失效";
-      badge.className = "g-badge bad";
+      setTextIfChanged(label, "Key 失效", cache, "label");
+      setClassIfChanged(badge, "g-badge bad", cache);
       if (!mounted) {
         root.append(badge);
         mounted = true;
@@ -53,16 +54,18 @@ export function mountBadge(root, ctx, cleanups) {
       return;
     }
 
-    const mode = d.config?.badgeMode === "cost_today" ? "cost_today" : d.config?.badgeMode;
-    if (mode === "cost_today") {
+    // 旧存储里的 cost_today 由 store-schema 迁移；视图再兜一层，避免缓存旧 payload。
+    const rawMode = d.config?.badgeMode;
+    const mode = rawMode === "cost_today" ? "cost_period" : rawMode;
+    if (mode === "cost_period") {
       const cost = Number(d.usage?.total_cost);
       if (!Number.isFinite(cost)) {
         if (mounted) badge.remove();
         mounted = false;
         return;
       }
-      badge.className = "g-badge";
-      label.textContent = `本期 ${fmtMoney(cost, d.config ?? {})}`;
+      setClassIfChanged(badge, "g-badge", cache);
+      setTextIfChanged(label, `本期 ${fmtMoney(cost, d.config ?? {})}`, cache, "label");
     } else {
       const meta = MODES[mode] ?? MODES.five_hour;
       const window = d.windows?.[meta.window];
@@ -76,14 +79,14 @@ export function mountBadge(root, ctx, cleanups) {
       const resetAt = Number(window.reset_at) || 0;
       const countdown = resetAt > now ? ` · ${fmtCountdown(resetAt, now)}` : "";
       if (window.exceeded === true) {
-        label.textContent = `${meta.prefix} 已用尽${countdown}`;
-        badge.className = "g-badge bad";
+        setTextIfChanged(label, `${meta.prefix} 已用尽${countdown}`, cache, "label");
+        setClassIfChanged(badge, "g-badge bad", cache);
       } else if (!Number.isFinite(pct)) {
-        label.textContent = `${meta.prefix} —`;
-        badge.className = "g-badge";
+        setTextIfChanged(label, `${meta.prefix} —`, cache, "label");
+        setClassIfChanged(badge, "g-badge", cache);
       } else {
-        label.textContent = `${meta.prefix} ${fmtPct(pct)}${countdown}`;
-        badge.className = `g-badge ${toneOfPct(pct)}`;
+        setTextIfChanged(label, `${meta.prefix} ${fmtPct(pct)}${countdown}`, cache, "label");
+        setClassIfChanged(badge, `g-badge ${toneOfPct(pct)}`, cache);
       }
     }
 
@@ -93,8 +96,13 @@ export function mountBadge(root, ctx, cleanups) {
     }
   }
 
+  function render(view) {
+    lastView = view ?? null;
+    show();
+  }
+
   const timer = setInterval(() => {
-    if (lastView) render(lastView);
+    if (lastView) show();
   }, 1000);
   cleanups.push(() => clearInterval(timer));
   cleanups.push(ctx.bus.subscribe(TOPIC_WIDGET, (view) => render(view ?? {})));

@@ -25,6 +25,7 @@ const { authEvent, evaluate } = await import(
   new URL("../../plugins/com.pet.goat-gauge/alerts.js", import.meta.url)
 );
 const {
+  BADGE_MODES,
   DEFAULT_CONFIG,
   migrate,
   sanitizeAlertsFired,
@@ -34,6 +35,12 @@ const {
   sanitizeSnapshot,
   SCHEMA_VERSION,
 } = await import(new URL("../../plugins/com.pet.goat-gauge/store-schema.js", import.meta.url));
+const {
+  setAttrIfChanged,
+  setClassIfChanged,
+  setDatasetIfChanged,
+  setTextIfChanged,
+} = await import(new URL("../../plugins/com.pet.goat-gauge/views/write.js", import.meta.url));
 const { DEMO_SCENARIOS, demoSnapshot } = await import(
   new URL("../../plugins/com.pet.goat-gauge/demo.js", import.meta.url)
 );
@@ -655,6 +662,89 @@ eq("倒计时归零", "0:00", fmtCountdown(0, 1_000));
 eq("百分比取整", "63%", fmtPct(62.6));
 eq("百分比坏值", "—", fmtPct(null));
 
+/* ============================ write dedupe ============================ */
+group("write dedupe");
+
+{
+  function fakeNode() {
+    const counts = { text: 0, class: 0, attr: 0, dataset: 0 };
+    let textValue = "";
+    let classValue = "";
+    const attrs = new Map();
+    const data = {};
+    return {
+      counts,
+      get textContent() {
+        return textValue;
+      },
+      set textContent(value) {
+        textValue = String(value);
+        counts.text += 1;
+      },
+      get className() {
+        return classValue;
+      },
+      set className(value) {
+        classValue = String(value);
+        counts.class += 1;
+      },
+      setAttribute(name, value) {
+        attrs.set(name, value);
+        counts.attr += 1;
+      },
+      dataset: new Proxy(data, {
+        set(target, key, value) {
+          target[key] = value;
+          counts.dataset += 1;
+          return true;
+        },
+        get(target, key) {
+          return target[key];
+        },
+      }),
+    };
+  }
+
+  const node = fakeNode();
+  const cache = {};
+  setTextIfChanged(node, "same", cache, "t");
+  eq("首次文本写入 > 0", 1, node.counts.text);
+  setTextIfChanged(node, "same", cache, "t");
+  eq("相同文本不写", 1, node.counts.text);
+  setTextIfChanged(node, "changed", cache, "t");
+  eq("文本变化写入", 2, node.counts.text);
+
+  setClassIfChanged(node, "a", cache);
+  eq("首次 class 写入", 1, node.counts.class);
+  setClassIfChanged(node, "a", cache);
+  eq("相同 class 不写", 1, node.counts.class);
+  setClassIfChanged(node, "b", cache);
+  eq("class 变化写入", 2, node.counts.class);
+
+  const both = fakeNode();
+  const bothCache = {};
+  setTextIfChanged(both, "x", bothCache, "t");
+  setClassIfChanged(both, "y", bothCache);
+  eq("文本和 class 都改：文本写入", 1, both.counts.text);
+  eq("文本和 class 都改：class 写入", 1, both.counts.class);
+
+  const attr = fakeNode();
+  const attrCache = {};
+  setAttrIfChanged(attr, "d", "M0 0", attrCache);
+  setAttrIfChanged(attr, "d", "M0 0", attrCache);
+  eq("相同 SVG 属性不写", 1, attr.counts.attr);
+  setAttrIfChanged(attr, "d", "M1 1", attrCache);
+  eq("SVG 属性变化写入", 2, attr.counts.attr);
+
+  const dataNode = fakeNode();
+  const dataCache = {};
+  setDatasetIfChanged(dataNode, "state", "ok", dataCache);
+  setDatasetIfChanged(dataNode, "state", "ok", dataCache);
+  eq("相同 dataset 不写", 1, dataNode.counts.dataset);
+  setDatasetIfChanged(dataNode, "state", "bad", dataCache);
+  eq("dataset 变化写入", 2, dataNode.counts.dataset);
+}
+
 /* ============================ store-schema ============================ */
 group("store-schema");
 
@@ -686,6 +776,17 @@ group("store-schema");
   eq("demo 只认真布尔", false, config.demo);
   eq("petReact=false 保留", false, config.petReact);
   eq("非法坐标回落", 360, config.overlayX);
+  eq(
+    "旧 cost_today 迁移为 cost_period",
+    "cost_period",
+    sanitizeConfig({ badgeMode: "cost_today" }).badgeMode,
+  );
+  eq(
+    "cost_period 合法",
+    "cost_period",
+    sanitizeConfig({ badgeMode: "cost_period" }).badgeMode,
+  );
+  check("BADGE_MODES 不再含 cost_today", true, !BADGE_MODES.includes("cost_today"));
 }
 
 {
