@@ -61,14 +61,20 @@ export interface OverlayShowOptions {
   placement?: string;
 }
 
-/** settings 区 widget 专属：ctx.host.agentHooks（bridge.ts:102-108，只经 widget-host.ts:97-105 注入，边界见 ADR-0001）。 */
+/** settings 区 widget 专属：ctx.host.agentHooks（定义在 bridge.ts 的 createAgentHooksApi，
+ *  只经 widget-host 注入，边界见 ADR-0001）。名字面由 ADR-0006 那张表管，增删先改 ADR。 */
 export interface AgentHooksApi {
-  /** Rust `agent_hooks_status` 的返回：{ exe, files, managed, installed, expectedPerFile }（src-tauri/src/commands/agent.rs:53-60）；失败 reject */
+  /** Rust `agent_hooks_status` 的返回：{ exe, files, managed, installed, expectedPerFile,
+   *  agent, displayName, hint, options }（A02 起按「当前那一家」查，options 是四选一清单）；失败 reject */
   status(): Promise<unknown>;
-  /** Rust `agent_hooks_install` 的返回：{ files: reports }（agent.rs:85）；没找到 Qoder 配置目录时 reject（agent.rs:81-83） */
+  /** Rust `agent_hooks_install` 的返回：{ files: reports, hint }；没找到当前 Agent 的配置目录时 reject */
   install(): Promise<unknown>;
-  /** Rust `agent_hooks_uninstall` 的返回：{ files: reports }（agent.rs:97）；失败 reject */
+  /** Rust `agent_hooks_uninstall` 的返回：{ files: reports }（摘净每个已接线适配器的条目）；失败 reject */
   uninstall(): Promise<unknown>;
+  /** Rust `agent_linkage_set`：切换联动的 Agent —— 先卸旧、成功后再装新，卸旧失败就停在原状态。
+   *  `confirm` 只为一件事：ZCode 的 hook 总开关显式关着且用户自己配过条目时，宿主第一趟 reject 并说明
+   *  「打开会连带启用 N 条」，界面问过用户之后带 `true` 重试。**不带 confirm 时一个文件都不会被改。** */
+  set(agent: string, confirm?: boolean): Promise<unknown>;
 }
 
 /** 总线 topic 的**注释性**宽联合（K2）：标准 topic（`StandardTopic`，定义处 packages/sdk/topics.js）

@@ -183,7 +183,7 @@ function mountSettings(root, ctx, cleanups) {
 }
 
 
-/* ---------- 设置面板：Qoder hook 接入（settings 区专属能力 agent:hooks，见 ADR-0001） ---------- */
+/* ---------- 设置面板：Agent hook 接入（settings 区专属能力 agent:hooks，见 ADR-0001） ---------- */
 function mountHookPanel(root, ctx) {
   const api = ctx.host && ctx.host.agentHooks;
   const style = ctx.dom.createElement("style");
@@ -191,23 +191,28 @@ function mountHookPanel(root, ctx) {
     .hk-box { margin-top:12px; padding-top:10px; border-top:1px dashed rgba(71,84,103,.3);
       font-size:12px; color:#475467; display:grid; gap:6px; }
     .hk-box .hk-hd { font-weight:600; color:#344054; }
-    .hk-box .hk-actions { display:flex; gap:6px; }
+    .hk-box .hk-actions { display:flex; gap:6px; flex-wrap:wrap; }
+    .hk-box .hk-agents { display:flex; gap:6px; flex-wrap:wrap; }
     .hk-box button { font:inherit; padding:2px 10px; }
+    .hk-box .hk-agents button[aria-pressed="true"] { border-color:#2563eb; color:#2563eb; font-weight:600; }
     .hk-box .hk-status { white-space:pre-wrap; word-break:break-all; }
     .hk-box .hk-status.warn { color:#b54708; }
+    .hk-box .hk-status.bad { color:#dc2626; }
   `;
   const box = ctx.dom.createElement("div");
   box.className = "hk-box";
   const hd = ctx.dom.createElement("div");
   hd.className = "hk-hd";
-  hd.textContent = "Qoder hook 接入";
+  hd.textContent = "Agent hook 接入（同一时间只联动一个）";
+  const picker = ctx.dom.createElement("div");
+  picker.className = "hk-agents";
   const st = ctx.dom.createElement("div");
   st.className = "hk-status";
   st.dataset.state = "loading";
   st.textContent = "正在读取状态…";
   const actions = ctx.dom.createElement("div");
   actions.className = "hk-actions";
-  box.append(hd, st, actions);
+  box.append(hd, picker, st, actions);
   root.append(style, box);
 
   if (!api) {
@@ -216,27 +221,58 @@ function mountHookPanel(root, ctx) {
     return;
   }
 
-  // 渲染只有一个口径：宿主的 status() 快照。外部值（路径/exe/error）一律 textContent，不拼 HTML
+  // 四选一的清单来自宿主的 status().options（含还没接线的槽位），界面自己不养一份名单 ——
+  // 名单与注册表漂移的表现是「点了一个宿主不认识的 Agent」，那比少一个按钮难查得多。
+  let options = [];
+  let current = "";
+  // 上一次 set/install 带回的提示与自检结果；跟着 render 走，避免刷新一次就丢
+  let lastHint = null;
+  let lastCheck = null;
+
+  const paintPicker = () => {
+    picker.replaceChildren();
+    for (const opt of options) {
+      const b = ctx.dom.createElement("button");
+      b.type = "button";
+      b.className = `hk-agent hk-agent-${opt.id}`;
+      b.textContent = opt.wired ? opt.displayName : `${opt.displayName}（未接线）`;
+      b.dataset.agent = opt.id;
+      b.setAttribute("aria-pressed", String(opt.id === current));
+      if (!opt.wired) b.disabled = true;
+      else b.on("click", () => void switchTo(opt.id));
+      picker.append(b);
+    }
+  };
+
+  // 渲染只有一个口径：宿主的 status() 快照。外部值（路径/exe/error/日志原文）一律 textContent，不拼 HTML
   const render = (info) => {
     const files = Array.isArray(info?.files) ? info.files : [];
     const lines = [];
+    options = Array.isArray(info?.options) ? info.options : [];
+    current = String(info?.agent ?? "");
+    lastHint = info?.hint ?? null;
+    paintPicker();
+    const name = String(info?.displayName ?? current ?? "");
     if (files.length === 0) {
       st.dataset.state = "absent";
-      lines.push("未安装：没找到 Qoder 的配置目录（~/.qoder 或 ~/.qoder-cn）。");
+      lines.push(`未安装：没找到 ${name} 的配置目录。`);
     } else if (info.installed === true) {
       st.dataset.state = "installed";
-      lines.push(`已安装：每个文件 ${info.expectedPerFile} 个事件，共 ${info.managed} 条。`);
+      lines.push(`已安装（${name}）：每个文件 ${info.expectedPerFile} 个事件，共 ${info.managed} 条。`);
     } else if (Number(info.managed) > 0) {
       st.dataset.state = "repair";
-      lines.push(`需要修复（条数不对）：当前共 ${info.managed} 条，应为 ${files.length * info.expectedPerFile} 条。`);
+      lines.push(`需要修复（条数不对，${name}）：当前共 ${info.managed} 条，应为 ${files.length * info.expectedPerFile} 条。`);
     } else {
       st.dataset.state = "absent";
-      lines.push("未安装。");
+      lines.push(`${name}：未安装。`);
     }
     for (const f of files) lines.push(`· ${f.path} — ${f.error ? `失败：${f.error}` : `${f.managed} 条`}`);
     if (info.exe) lines.push(`hook 命令指向 ${info.exe}`);
+    if (lastHint) lines.push(`生效条件：${lastHint}`);
+    if (lastCheck) lines.push(lastCheck);
     st.textContent = lines.join("\n");
     st.classList.toggle("warn", st.dataset.state === "repair");
+    st.classList.toggle("bad", Boolean(lastCheck) && lastCheck.startsWith("自检"));
   };
 
   const refresh = async () => {
@@ -251,15 +287,69 @@ function mountHookPanel(root, ctx) {
     st.dataset.state = "loading";
     st.textContent = `${label}中…`;
     try {
-      await fn();
-      // install/uninstall 的返回是逐文件报告、没有 exe/expectedPerFile：统一再拉一次 status 重渲染
-      // （仍是宿主的返回值，不缓存自己算的数）
+      const result = await fn();
+      // install/uninstall/set 的返回里带 hint 与 selfCheck：先记下再拉 status 重渲染
+      // （条数与状态一律以宿主的 status() 为准，界面不缓存自己算的数）
+      if (result && typeof result === "object") {
+        if (result.hint) lastHint = String(result.hint);
+        lastCheck = describeCheck(result.selfCheck);
+      }
       await refresh();
     } catch (err) {
       st.dataset.state = "error";
       st.textContent = `${label}失败：${err instanceof Error ? err.message : String(err)}`;
     }
   };
+
+  // 装后自检的三种结果要说人话，尤其「没查」不能被显示成「查过且没问题」
+  const describeCheck = (raw) => {
+    if (!raw || typeof raw !== "object") return null;
+    if (raw.status === "problem") return `自检发现问题：${raw.detail}\n日志原文：${raw.line}`;
+    if (raw.status === "unavailable") return `自检未做：${raw.detail}`;
+    if (raw.status === "ok") return `自检通过：${raw.detail}`;
+    return null;
+  };
+
+  // 切换 = 先卸旧再装新，全部由宿主做（见 ADR-0002）。第一趟不带 confirm：
+  // 需要用户拍板时宿主会原样拒掉并说明会连带启用几条，我们把那句话显示出来再问一次。
+  const switchTo = async (id, confirm = false) => {
+    st.dataset.state = "loading";
+    st.textContent = `切换到 ${id}…`;
+    try {
+      const result = await api.set(id, confirm);
+      lastHint = result?.hint ?? null;
+      lastCheck = describeCheck(result?.selfCheck);
+      await refresh();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!confirm && /确认/.test(msg)) {
+        // 宿主的文案已经带上条数与原因，这里只加一个动作，不改写它
+        st.dataset.state = "consent";
+        st.textContent = `${msg}\n（当前选中未变；「仍要打开」才会动手）`;
+        showConsent(id);
+        return;
+      }
+      st.dataset.state = "error";
+      // 切换失败可能只动了旧的一半，别把它显示成「一切照旧」
+      st.textContent = `切换失败：${msg}\n（联动可能停在中间状态，按「刷新」看磁盘上的实情）`;
+      void refresh();
+    }
+  };
+
+  // 确认按钮单独占一格：每次重问都整格换掉，而不是往动作区堆「仍要打开」
+  // （只用这份 widget 已经在用的那几个 DOM 动作：createElement / replaceChildren / on）
+  const consentSlot = ctx.dom.createElement("div");
+  consentSlot.className = "hk-consent-slot";
+  box.append(consentSlot);
+  const showConsent = (id) => {
+    const b = ctx.dom.createElement("button");
+    b.type = "button";
+    b.className = "hk-consent";
+    b.textContent = "仍要打开";
+    b.on("click", () => void switchTo(id, true));
+    consentSlot.replaceChildren(b);
+  };
+
   const button = (text, cls, fn) => {
     const b = ctx.dom.createElement("button");
     b.type = "button";

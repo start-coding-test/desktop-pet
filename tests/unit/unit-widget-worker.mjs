@@ -389,10 +389,11 @@ describe("deactivate：Widget 侧自己收尾，宿主才 terminate", () => {
   });
 });
 
-describe("调用面比入口的 22 表窄：不借搬迁扩权", () => {
-  it("widget 只能喊这 5 个方法", () => {
+describe("调用面比入口的 23 表窄：不借搬迁扩权", () => {
+  it("widget 只能喊这 6 个方法", () => {
     assert.deepEqual([...WIDGET_CALL_METHODS].sort(), [
       "agentHooks.install",
+      "agentHooks.set",
       "agentHooks.status",
       "agentHooks.uninstall",
       "bus.publish",

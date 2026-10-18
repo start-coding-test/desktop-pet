@@ -8,7 +8,7 @@
 // 错误的规整（asHostError）留在宿主侧做，Worker 只消费 `{code, message}` 这个纯负载。
 import catalog from "../../packages/sdk/error-codes.json" with { type: "json" };
 
-/** 面向插件的 22 个方法（点号命名空间）。`log` 不占能力，但同样只能走这条通道。 */
+/** 面向插件的 23 个方法（点号命名空间）。`log` 不占能力，但同样只能走这条通道。 */
 export const PLUGIN_WORKER_METHODS = [
   "bus.publish",
   "bus.subscribe",
@@ -32,13 +32,15 @@ export const PLUGIN_WORKER_METHODS = [
   "agentHooks.status",
   "agentHooks.install",
   "agentHooks.uninstall",
+  // A02 设置页四选一：切换联动的 Agent（先卸旧再装新，同步拿回结果）
+  "agentHooks.set",
 ] as const;
 
 export type WorkerMethod = (typeof PLUGIN_WORKER_METHODS)[number];
 
 /**
- * 宿主派发表要覆盖的方法：22 个里除去 `bus.subscribe`（参数带函数）与 `log`（不回包），
- * 剩下 20 个都是「纯参数进、纯值出」，可以做成一张表 —— 表的完备性由 Record 类型钉住。
+ * 宿主派发表要覆盖的方法：23 个里除去 `bus.subscribe`（参数带函数）与 `log`（不回包），
+ * 剩下 21 个都是「纯参数进、纯值出」，可以做成一张表 —— 表的完备性由 Record 类型钉住。
  */
 export type ProxiedMethod = Exclude<WorkerMethod, "bus.subscribe" | "log">;
 
