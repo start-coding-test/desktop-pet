@@ -957,6 +957,96 @@ try {
     r.info("样例配置已复位", "两份都只剩用户自己的 hook 条目");
   }
 
+  // ⑨ ZCode 切换（A02-4）：夹具目录由本套件自建自删，工作流不负责预置。
+  // 只跑 ZCode —— codex / workbuddy 的适配器在 PR-3 接线，那时按同一形状各加一组。
+  r.group("ZCode 切换：确认门、双文件、总开关恢复（只碰 PET_AGENT_HOME 下的夹具）");
+  const ZHOME = String(env.PET_AGENT_HOME ?? "");
+  const zhomeOk = ZHOME !== "" && resolve(ZHOME).startsWith(TEMP_ROOT + sep);
+  r.check("PET_AGENT_HOME 指向 temp 下（否则真实用户的 ~/.zcode 会被写）", true, zhomeOk);
+  if (!zhomeOk) {
+    r.info("跳过 ZCode 组", "PET_AGENT_HOME 未设或不在 temp 根下；本组一个文件都不写");
+  } else {
+    const zcli = join(ZHOME, ".zcode", "cli");
+    rmSync(zcli, { recursive: true, force: true });
+    mkdirSync(zcli, { recursive: true });
+    const zcfg = join(zcli, "config.json");
+    const zset = join(zcli, "setting.json");
+    const userHook = { type: "command", command: "user-hook.sh", timeoutMs: 3000 };
+    const sample = (enabled) =>
+      JSON.stringify(
+        {
+          mcpServers: { fake: { command: "npx fake-mcp" } },
+          ...(enabled === undefined ? {} : { hooks: { enabled, events: { Stop: [{ hooks: [userHook] }] } } }),
+          permissions: { allow: ["Bash"] },
+        },
+        null,
+        2,
+      );
+
+    writeFileSync(zcfg, sample(false));
+    const zBefore = readFileSync(zcfg, "utf8");
+    const denied = await settings.invoke("agent_linkage_set", { agent: "zcode" });
+    r.check("总开关显式关着且用户配过条目 → 第一次切换被要求确认", false, denied.ok);
+    r.check("确认文案带上用户自己的条数", true, /1 条/.test(String(denied.e)));
+    r.check("被拦下时一个文件都没动", zBefore, readFileSync(zcfg, "utf8"));
+    r.check("未知来源的 agent 值直接被拒（不是任意非空字符串）", false, (await settings.invoke("agent_linkage_set", { agent: "nope" })).ok);
+
+    const ok1 = await settings.invoke("agent_linkage_set", { agent: "zcode", confirm: true });
+    r.check("确认后切换成功", true, ok1.ok);
+    const zText = readFileSync(zcfg, "utf8");
+    r.check("装了 7 个事件（ZCode 没有 SessionEnd/Notification/Subagent）", 7, zText.split("--pet-hook").length - 1);
+    r.check("条目带 --agent zcode", true, zText.includes("--pet-hook pre --agent zcode"));
+    r.check("只写文档列出的字段（不写 matcher / args）", false, /matcher|"args"/.test(zText));
+    r.check("timeoutMs 用毫秒", true, zText.includes("\"timeoutMs\": 2000"));
+    r.check("总开关被打开", true, JSON.parse(zText).hooks.enabled === true);
+    const zc = JSON.parse(zText);
+    const inner = zc.hooks.events.Stop.flatMap((g) => g.hooks ?? []);
+    const mine = inner.find((h) => String(h.command).includes("--pet-hook"));
+    const kept = inner.find((h) => !String(h.command).includes("--pet-hook"));
+    r.check("我们的条目独占一个分组", true, zc.hooks.events.Stop.length >= 2 && kept?.command === "user-hook.sh" && !!mine);
+    r.check("其他键一个不少，且顶层键序原样（preserve_order 的端到端证据）", ["mcpServers", "hooks", "permissions"], Object.keys(zc));
+    r.check("没装过的那份 setting.json 不被凭空造出来", false, existsSync(zset));
+
+    const stZ = (await settings.invoke("agent_hooks_status")).v;
+    r.check("状态页按当前那一家报（agent=zcode，每文件 7 条）", ["zcode", 7, 7], [stZ?.agent, stZ?.expectedPerFile, stZ?.managed]);
+    r.check("四选一清单列全四个槽位（含未接线的 codex/workbuddy）", ["codex", "qoder", "workbuddy", "zcode"], (stZ?.options ?? []).map((o) => o.id).sort());
+    r.check("未接线的槽位标成 wired=false", false, (stZ?.options ?? []).find((o) => o.id === "codex")?.wired);
+    r.check("装完提示由适配器给（新开会话才生效）", true, /新开/.test(String(stZ?.hint)));
+
+    // 来源过滤在真实切换之后仍只对当前那一家放行：注入 qoder 事件不该动桌宠，zcode 事件该动
+    const evCount = async () =>
+      (await c.ev(`window.__topics.filter(([k]) => k === 'host-event').length`));
+    const evBefore = await evCount();
+    spawnSync(EXE, ["--pet-hook", "pre", "--agent", "qoder"], {
+      input: JSON.stringify({ session_id: `verify-back-qoder-${Date.now()}`, tool_name: "Bash" }),
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    await sleep(1_500);
+    r.check("当前是 ZCode 时，注入 qoder 事件不广播", evBefore, await evCount());
+    spawnSync(EXE, ["--pet-hook", "pre", "--agent", "zcode"], {
+      input: JSON.stringify({ session_id: `verify-zcode-live-${Date.now()}`, tool_name: "Bash" }),
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    r.check("切到 ZCode 后自己的事件照常广播", true, await waitUntil(c, `(window.__topics.slice().reverse().find(([k]) => k === 'host-event')?.[1]?.agent === 'zcode')`, 8_000));
+
+    // 切回 Qoder：ZCode 的条目摘净，并且**总开关回到装之前的 false**（hooksEnabled 记录的端到端证据）
+    const back = await settings.invoke("agent_linkage_set", { agent: "qoder" });
+    r.check("切回 Qoder 成功", true, back.ok);
+    const zAfter = readFileSync(zcfg, "utf8");
+    r.check("ZCode 的条目摘净", 0, zAfter.split("--pet-hook").length - 1);
+    r.check("总开关恢复成装之前的 false", true, JSON.parse(zAfter).hooks.enabled === false);
+    r.check("用户自己的条目仍然在", "user-hook.sh", JSON.parse(zAfter).hooks.events.Stop.flatMap((g) => g.hooks ?? [])[0]?.command);
+    r.check("恢复后键序与内容回到原样", ["mcpServers", "hooks", "permissions"], Object.keys(JSON.parse(zAfter)));
+    const stQ = (await settings.invoke("agent_hooks_status")).v;
+    r.check("状态页跟着回到 Qoder", ["qoder", 12], [stQ?.agent, stQ?.expectedPerFile]);
+
+    // 夹具目录自己删：工作流不负责预置，也不能把它留给下一轮
+    rmSync(join(ZHOME, ".zcode"), { recursive: true, force: true });
+    r.check("夹具目录已自删", false, existsSync(zcli));
+  }
+
   r.group("收尾前的完整性");
   r.check("测试期间宠物窗未被重载", token, await c.ev(`window.__verifyToken ?? null`));
   await sleep(500); // console 事件异步送达
