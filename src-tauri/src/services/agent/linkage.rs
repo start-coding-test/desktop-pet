@@ -287,6 +287,23 @@ pub fn consent_gate(consent: Option<usize>, confirm: bool) -> bool {
     consent.is_some() && !confirm
 }
 
+/// 「要先问用户」那条拒绝的机器可读前缀。为什么塞在 message 里而不是加字段：
+/// IPC 错误的形状被 ADR-0007 钉成 `{code, message}`，而 `invalid-state` 这个码同时也被
+/// 「卸旧失败」用 —— 让设置页去猜中文字串，猜错的表现是把一次真失败显示成确认框。
+/// 前缀是 ASCII 的固定串，界面显示前会剥掉，用户看不到它。
+pub const NEED_CONFIRM: &str = "[need-confirm]";
+
+/// 确认框那句话。抽成函数是为了让「前缀在、条数在」这条契约能被离线钉住
+/// （`switch_agent` 那层要 AppHandle 与真文件，跑不了）。
+pub fn confirm_prompt(display_name: &str, user_hooks: usize) -> HostError {
+    HostError::new(
+        INVALID_STATE,
+        format!(
+            "{NEED_CONFIRM} {display_name} 的 hook 总开关现在是关的，打开以后你之前配的 {user_hooks} 条 hook 也会一起生效。确认请再点一次。"
+        ),
+    )
+}
+
 /// 卸完旧的了：该装、该停、还是没地方装。三个分支都可达，所以没有兜底分支。
 pub fn plan_install(remove_failed: bool, has_targets: bool) -> SwitchPlan {
     if remove_failed {
@@ -324,13 +341,9 @@ pub fn switch_agent(
     let targets = adapter.targets(home);
     let consent = agent_hooks::pending_consent(adapter, &targets);
     if consent_gate(consent, confirm) {
-        let mine = consent.unwrap_or_default();
-        return Err(HostError::new(
-            INVALID_STATE,
-            format!(
-                "{} 的 hook 总开关现在是关的，打开以后你之前配的 {mine} 条 hook 也会一起生效。确认请再点一次。",
-                adapter.display_name()
-            ),
+        return Err(confirm_prompt(
+            adapter.display_name(),
+            consent.unwrap_or_default(),
         ));
     }
     let removed = agent_hooks::uninstall_everywhere(home, &recorded_switches(&data));
@@ -997,6 +1010,21 @@ mod tests {
         assert!(
             !consent_gate(None, false),
             "没有确认问题就不该拦（Qoder 恒如此）"
+        );
+    }
+
+    /// 确认框那句话的契约：**ASCII 前缀（给机器判）+ 条数（给人看）**两条都得在。
+    /// 设置页剥掉前缀再显示；少了前缀它只能去猜中文字串（猜错就把一次真失败显示成确认框），
+    /// 少了条数它说不清「打开会连带启用几条」—— 那正是这句确认存在的理由。
+    #[test]
+    fn the_confirm_prompt_carries_the_machine_token_and_the_count() {
+        let e = confirm_prompt("ZCode", 3);
+        assert_eq!(e.code, INVALID_STATE);
+        assert!(e.message.starts_with(NEED_CONFIRM), "{}", e.message);
+        assert!(
+            e.message.contains("3 条"),
+            "条数是确认的依据：{}",
+            e.message
         );
     }
 

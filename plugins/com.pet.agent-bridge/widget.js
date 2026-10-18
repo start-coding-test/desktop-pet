@@ -331,18 +331,21 @@ function mountHookPanel(root, ctx) {
       lastCheck = describeCheck(result?.selfCheck);
       await refresh();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!confirm && /确认/.test(msg)) {
-        // 宿主的文案已经带上条数与原因，这里只加一个动作，不改写它
+      // 错误经过 Worker 通道后不一定是 Error 实例，取 message 也要兜住裸字符串
+      const raw = String(err?.message ?? err ?? "");
+      // 判「要不要问用户」只看那个 ASCII 前缀（契约与单测见 linkage::NEED_CONFIRM）：
+      // 上一版在这里匹配中文字串，结果 runner 上点了没反应 —— 猜错的表现是把一次真失败
+      // 显示成确认框，或者反过来把确认框显示成失败。
+      if (raw.startsWith("[need-confirm]")) {
         st.dataset.state = "consent";
-        st.textContent = `${msg}\n（当前选中未变；「仍要打开」才会动手）`;
+        st.textContent = `${raw.slice("[need-confirm]".length).trim()}\n（当前选中未变；「仍要打开」才会动手）`;
         showConsent(id);
         return;
       }
       st.dataset.state = "error";
-      // 切换失败可能只动了旧的一半，别把它显示成「一切照旧」
-      st.textContent = `切换失败：${msg}\n（联动可能停在中间状态，按「刷新」看磁盘上的实情）`;
-      void refresh();
+      // 这里**不**再 refresh 一次：切换失败可能只动了旧的一半，而刷新会把这句原因从面板上
+      // 抹掉，症状正是「面板说一切正常、磁盘上一半没摘」。要现状用户自己按「刷新」。
+      st.textContent = `切换失败：${raw}\n（联动可能停在中间状态，按「刷新」看磁盘上的实情）`;
     }
   };
 

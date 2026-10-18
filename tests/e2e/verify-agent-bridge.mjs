@@ -992,6 +992,11 @@ try {
     const denied = await settings.invoke("agent_linkage_set", { agent: "zcode" });
     r.check("总开关显式关着且用户配过条目 → 第一次切换被要求确认", false, denied.ok);
     r.check("确认文案带上用户自己的条数", true, /1 条/.test(String(denied.e)));
+    r.check(
+      "确认拒绝带 ASCII 机器可读前缀（界面靠它判，不靠猜中文）",
+      "[need-confirm]",
+      String(denied.e).slice(0, 14),
+    );
     r.check("被拦下时一个文件都没动", zBefore, readFileSync(zcfg, "utf8"));
     r.check("未知来源的 agent 值直接被拒（不是任意非空字符串）", false, (await settings.invoke("agent_linkage_set", { agent: "nope" })).ok);
 
