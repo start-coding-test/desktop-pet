@@ -2202,18 +2202,6 @@ export function deactivate() { live = false; }
   await statusCall(STATUS_B, "set", "B行6");
   await statusCall(STATUS_B, "boom");
   await b3LineGoneWithin5s("Worker 崩溃后");
-  // ③ Worker 崩溃：探针主动抛未捕获错误 → 宿主 onerror 那条兜底得把行摘掉。
-  // 真崩必然产生两条 console 记录（宿主 [worker-host] + Worker 侧 Uncaught），两条都点名本探针，
-  // 故这里按探针名过滤（verify-worker.mjs 的零噪音门同口径，B03 获批）。
-  await statusCall(STATUS_B, "set", "B行6");
-  await statusCall(STATUS_B, "boom");
-  await b3LineGoneWithin5s("Worker 崩溃后");
-  // ③ Worker 崩溃：探针主动抛未捕获错误 → 宿主 onerror 那条兜底得把行摘掉。
-  // 真崩必然产生两条 console 记录（宿主 [worker-host] + Worker 侧 Uncaught），两条都点名本探针，
-  // 故这里按探针名过滤（verify-worker.mjs 的零噪音门同口径，B03 获批）。
-  await statusCall(STATUS_B, "set", "B行6");
-  await statusCall(STATUS_B, "boom");
-  await b3LineGoneWithin5s("Worker 崩溃后");
 
   // 收尾：改回原清单、撤销授权。fixture 目录**留到 finally 再删** —— 组尾就删会让
   // 超时调用的迟到回包变成 `bus relay failed: … 没有安装`（verify:worker 的零噪音门会红）。
