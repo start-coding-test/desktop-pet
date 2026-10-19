@@ -441,6 +441,13 @@ try {
   const bubbleNow = () =>
     c.ev(`(() => { const b = document.getElementById('pet-bubble');
       return { show: b.classList.contains('show'), status: b.classList.contains('status'), text: b.textContent }; })()`);
+  /** 一次求值里同时读「气泡现在的样子」与「宿主手上我们最后一条是什么」。
+   *  分两次读，中间正好落进一次合并发送就会比出假红 —— A03 那轮「期望值从实际里取」的同类教训。 */
+  const bubbleVsOurs = () =>
+    c.ev(`(() => { const b = document.getElementById('pet-bubble'); const s = window.__pet.status;
+      let last = null;
+      for (let i = s.length - 1; i >= 0; i--) if (s[i][0] === ${JSON.stringify(AGENT_ID)}) { last = s[i][1]; break; }
+      return { show: b.classList.contains('show'), status: b.classList.contains('status'), text: b.textContent, last }; })()`);
   /** 等槽里不是台词（台词亮 3.6s 且按设计占槽）；不等就直接读，读到的可能是那句台词 */
   const waitStatusSlot = () =>
     waitUntil(
@@ -569,11 +576,14 @@ try {
     await waitUntil(c, `(() => { const s = window.__pet.status; for (let i = s.length - 1; i >= 0; i--) if (s[i][0] === ${JSON.stringify(AGENT_ID)}) return s[i][1] !== null; return false; })()`, 12_000),
   );
   await waitStatusSlot(); // 台词（上一轮的「这边需要你确认一下」）会占槽 3.6s，不等就读到的是它
-  const lineOn = await bubbleNow();
-  const ourLine = await ourLastLine();
-  r.check("气泡显示的正是本插件那一行（内容 + 单行化类）", [true, ourLine], [lineOn.show && lineOn.status === true, lineOn.text]);
-  r.check("常驻行不含会话标题那串口令", false, String(ourLine ?? "").includes("abc123"));
-  r.check("常驻行不含命令摘要那串口令", false, String(ourLine ?? "").includes("abc123-inner"));
+  const on = await bubbleVsOurs();
+  r.check(
+    "气泡显示的正是本插件最近交给宿主的那一行（同一次求值里读，不赌时序）",
+    true,
+    on.show === true && on.status === true && on.last !== null && on.text === on.last,
+  );
+  r.check("常驻行不含会话标题那串口令", false, String(on.last ?? "").includes("abc123"));
+  r.check("常驻行不含命令摘要那串口令", false, String(on.last ?? "").includes("abc123-inner"));
   const viewOn = await lastView();
   r.check("下发给 badge/设置页的数据里没有 title/detail 字段", [], Object.keys(viewOn ?? {}).filter((k) => k === "title" || k === "detail"));
   r.check("老开关开着也没让那两串进到插件这一层", false, JSON.stringify(viewOn ?? "").includes("abc123"));
@@ -658,13 +668,13 @@ try {
   r.check("插件源码里不再出现 overlay 这个词（没有藏在别的调用面上的残留）", false, /overlay/i.test(pluginSrc));
 
   r.group("销毁别人那扇窗，不影响本插件的常驻行");
-  const lineBeforeDestroy = await ourLastLine();
-  r.check("前置：销毁之前本插件确实挂着一条非空的常驻行", true, lineBeforeDestroy !== null);
+  const beforeDestroy = await bubbleVsOurs();
+  r.check("前置：销毁之前本插件确实挂着一条非空的常驻行（且就显示在气泡上）", true, beforeDestroy.last !== null && beforeDestroy.text === beforeDestroy.last);
   await invoke("overlay_destroy", { pluginId: HR_ID });
   r.check("心率的窗确实被收掉了", true, await waitUntil(c, `(async () => { const l = await window.__TAURI_INTERNALS__.invoke('overlay_list'); return !l.some(([id, visible]) => id === ${JSON.stringify(HR_ID)} && visible); })()`, 12_000));
   await waitStatusSlot();
-  const afterDestroy = await bubbleNow();
-  r.check("销毁只收掉那一扇，本插件的常驻行不受影响", lineBeforeDestroy, afterDestroy.text);
+  const afterDestroy = await bubbleVsOurs();
+  r.check("销毁只收掉那一扇，本插件的常驻行不受影响", true, afterDestroy.show === true && afterDestroy.status === true && afterDestroy.text === beforeDestroy.last);
 
   /** 宠物窗的可见性：轮询到想要的那一侧（本套件的既有做法，不拿固定 sleep 当判据） */
   const petVisible = async (want, timeoutMs = 8_000) => {
@@ -683,6 +693,8 @@ try {
    *  （deactivate 会送一次 null），重启不留痕迹，所以得单独数 activate。 */
   const activateCount = () =>
     c.ev(`window.__topics.filter(([k, p]) => k === 'status' && String(p?.text ?? '').includes('已接管')).length`);
+  const isActiveNow = () =>
+    c.ev(`(async () => { const rt = await import('/src/runtime/plugin-runtime.ts'); return rt.isActive(${JSON.stringify(AGENT_ID)}); })()`);
 
   r.group("游戏模式隐身：常驻行跟着宠物窗看不见，恢复后按当前状态回来");
   // 隐身的实质（原「卡片一起收掉」）在新接口下 = 「这一行此刻看不见」。
@@ -702,24 +714,28 @@ try {
     ),
   );
   r.check("前置：隐身之前宠物窗自己是可见的（否则下面两条是空判）", true, await petVisible(true));
-  const lineForStealth = await ourTail();
   await waitStatusSlot();
-  r.check("前置：隐身之前气泡上就是本插件那一行", lineForStealth, (await bubbleNow()).text);
+  const preHide = await bubbleVsOurs();
+  r.check("前置：隐身之前气泡上就是本插件那一行", true, preHide.last !== null && preHide.text === preHide.last);
+  const lineForStealth = preHide.last;
   const callsBeforeHide = await ourStatusCalls();
   const activatesBeforeHide = await activateCount();
   petHidden = true;
   await invoke("set_pet_hidden", { hidden: true });
   r.check("隐身时宠物窗不可见（常驻行挂在它身上，因此一并看不见）", true, await petVisible(false));
   r.info("隐身期间的 document.visibilityState（只取证）", String(await c.ev("document.visibilityState ?? ''")));
-  // 先钉前提再下结论（PM 的 A04-D4 第 2 条）：下面那条计数判据要成立，隐身窗口里本插件必须
-  // 既没被停用也没被重启 —— 停用会多一次 setStatus(null)，重启会多一次 activate 的痕迹。
+  // 先钉前提再下结论（PM 的 A04-D4 第 2 条 + A04-D5 的补两条）：下面那条计数判据要成立，
+  // 隐身窗口里本插件必须既没被停用也没被重启，而且数 activate 的那个计数器本身得是活的。
+  // isActive 在窗口**起点和终点各采一次**：只采终点的话，「中途被停用又启回来」这条路径看不见。
+  r.check("前提：隐身窗口起点本插件仍在运行（isActive 为 true）", true, await isActiveNow());
+  r.check("前提：activate 计数器是活的（截至隐身起点已激活 ≥1 次，否则「次数没涨」是空判）", true, activatesBeforeHide >= 1);
   r.check(
-    "前提：隐身窗口内本插件仍在运行（isActive 为 true）",
-    true,
-    await c.ev(`(async () => { const rt = await import('/src/runtime/plugin-runtime.ts'); return rt.isActive(${JSON.stringify(AGENT_ID)}); })()`),
+    "隐身期间插件没有自己实现隐身逻辑：setStatus 调用数一条不多",
+    callsBeforeHide,
+    await ourStatusCalls(),
   );
-  r.check("隐身期间插件没有自己实现隐身逻辑：setStatus 调用数一条不多", callsBeforeHide, await ourStatusCalls());
   r.check("前提：隐身期间本插件没有被重新 activate 过（activate 次数没涨）", activatesBeforeHide, await activateCount());
+  r.check("前提：隐身窗口终点本插件仍在运行（isActive 为 true）", true, await isActiveNow());
   // 恢复：无论上面判成什么样都必须放回来，中途抛错也别让宠物一直隐身（外层 finally 兜底）
   await invoke("set_pet_hidden", { hidden: false });
   petHidden = false;
@@ -840,6 +856,7 @@ try {
     const at = h.fire();
     r.check("窗口到点只发最后一次", "1000|C", `${at}|${h.sent[1]?.[1]}`);
     r.check("延迟按「上次发出 + gap」算，不给每次变化重起一圈", 800, at - 200);
+    r.check("整段一共只发两次：一次即时 + 一次合并（精确次数，不是判 ≤）", 2, h.sent.length);
     r.check("到点之后没有第二条待发的", null, h.fire());
   }
   {
