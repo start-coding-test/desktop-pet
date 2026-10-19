@@ -1,9 +1,10 @@
-// 状态卡渲染器。区域约定与心率插件一致：
+// 状态显示的两个区（A9b 之后没有第三区了）：
 //   badge   = 宠物旁的一行小字
-//   overlay = 桌面左上角的大卡（主视图）
-//   settings= 设置窗里的隐私开关 + Qoder hook 接入（ctx.host 只注入给这个区）
-// 所有数据来自 `${PID}:widget` topic；敏感字段在 index.js 就已按开关剥掉，
-// 这里拿不到就不可能显示，不存在「渲染后再藏起来」的漏洞。
+//   settings= 设置窗里的 Agent 四选一与 hook 装卸（ctx.host 只注入给这个区）
+// 会话状态的「桌面可见」那一层已经交给本体气泡的常驻行（`ctx.pet.setStatus`，宿主侧是 B3）：
+// 头顶那张 overlay 大卡删了，插件也不再申请 overlay 能力。
+// 所有数据来自 `${PID}:widget` topic，而 topic 里根本没有会话标题与命令摘要 ——
+// index.js 不采集它们，这里拿不到也就无从显示，不存在「渲染后再藏起来」的漏洞。
 import { TOPIC_CMD, TOPIC_WIDGET } from "./topics.js";
 
 const scopes = new WeakMap();
@@ -19,8 +20,7 @@ export function mount(root, ctx) {
   const cleanups = [];
   scopes.set(root, cleanups);
   if (ctx.region === "badge") return mountBadge(root, ctx, cleanups);
-  if (ctx.region === "overlay") return mountCard(root, ctx, cleanups);
-  if (ctx.region === "settings") return mountSettings(root, ctx, cleanups);
+  if (ctx.region === "settings") return mountSettings(root, ctx);
   return undefined;
 }
 
@@ -59,8 +59,8 @@ function mountBadge(root, ctx, cleanups) {
 
   watch(ctx, cleanups, (d) => {
     const steps = typeof d.steps === "number" ? d.steps : 0;
-    const idleEmpty =
-      (d.state ?? "idle") === "idle" && steps === 0 && !d.toolName && !d.title && !d.detail;
+    // A9b 之后 payload 里没有 title / detail 这两个字段了（不采集），空态判据只看这三项
+    const idleEmpty = (d.state ?? "idle") === "idle" && steps === 0 && !d.toolName;
     if (idleEmpty) {
       el.remove();
       return;
@@ -71,120 +71,37 @@ function mountBadge(root, ctx, cleanups) {
   });
 }
 
-/* ---------- 桌面左上角大卡 ---------- */
-function mountCard(root, ctx, cleanups) {
-  const style = ctx.dom.createElement("style");
-  style.textContent = `
-    .ag-card { width: 300px; padding: 12px 14px 13px; border-radius: 14px;
-      background: rgba(16,18,24,.9); border:1px solid rgba(255,255,255,.1);
-      box-shadow: 0 8px 26px rgba(0,0,0,.42); color:#f2f5f8;
-      font: 13px/1.5 system-ui, "Segoe UI", sans-serif; }
-    .ag-card .title { font-size:13px; font-weight:600; color:#fff;
-      white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    .ag-card .row { display:flex; align-items:center; gap:7px; margin-top:7px; }
-    .ag-card .dot { width:8px; height:8px; border-radius:50%; background:#9aa4b2; flex:none; }
-    .ag-card .label { font-size:12.5px; }
-    .ag-card .steps { margin-left:auto; font-size:11px; color:#98a2b3;
-      font-variant-numeric: tabular-nums; }
-    .ag-card .detail { margin-top:6px; padding-left:15px; font-size:11.5px; color:#b6c0cd;
-      font-family: ui-monospace, Consolas, monospace;
-      white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    .ag-card.idle { opacity:.62; }
-  `;
-  const el = ctx.dom.createElement("div");
-  el.className = "ag-card idle";
-  const title = ctx.dom.createElement("div");
-  title.className = "title";
-  const row = ctx.dom.createElement("div");
-  row.className = "row";
-  const dot = ctx.dom.createElement("i");
-  dot.className = "dot";
-  const label = ctx.dom.createElement("span");
-  label.className = "label";
-  const steps = ctx.dom.createElement("span");
-  steps.className = "steps";
-  row.append(dot, label, steps);
-  const detail = ctx.dom.createElement("div");
-  detail.className = "detail";
-  el.append(title, row, detail);
-  root.append(style, el);
-
-  watch(ctx, cleanups, (d) => {
-    el.classList.toggle("idle", d.state === "idle");
-    // 标题被关掉时显示占位，不留空行，也不泄露任何会话内容
-    title.textContent = d.title || "Agent 会话";
-    dot.style.background = STATE_COLOR[d.state] ?? "#9aa4b2";
-    label.textContent = d.label ?? d.state ?? "待命";
-    label.style.color = STATE_COLOR[d.state] ?? "#f2f5f8";
-    steps.textContent = d.steps ? `${d.steps} 步` : "";
-    detail.textContent = d.detail || (d.toolName ? d.toolName : "");
-  });
-}
-
-/* ---------- 设置面板：隐私开关 ---------- */
-function mountSettings(root, ctx, cleanups) {
+/* ---------- 设置面板 ---------- */
+function mountSettings(root, ctx) {
   const style = ctx.dom.createElement("style");
   style.textContent = `
     .ag-set { font-size:12px; color:#475467; display:grid; gap:6px; }
-    .ag-set label { display:flex; align-items:center; gap:6px; }
     .ag-set .note { color:#98a2b3; font-size:11px; }
   `;
   const box = ctx.dom.createElement("div");
   box.className = "ag-set";
-
-  const mk = (key, text, note) => {
-    const label = ctx.dom.createElement("label");
-    const input = ctx.dom.createElement("input");
-    input.type = "checkbox";
-    input.dataset.key = key;
-    const span = ctx.dom.createElement("span");
-    span.textContent = text;
-    label.append(input, span);
-    box.append(label);
-    if (note) {
-      const p = ctx.dom.createElement("div");
-      p.className = "note";
-      p.textContent = note;
-      box.append(p);
-    }
-    return input;
-  };
-  const title = mk("showTitle", "显示会话标题（首条输入前 48 字）");
-  const detail = mk("showDetail", "显示命令 / 路径摘要");
+  // A9b：隐私开关（显示会话标题 / 命令摘要）撤掉了 —— 常驻行一直可见、不受它们控制，
+  // 留着就是骗人；而且 index.js 现在根本不采集那两个字段。
   const note = ctx.dom.createElement("div");
   note.className = "note";
-  note.textContent = "默认都关：只显工具名与步数。开了就等于把会话内容常驻显示在桌面上。";
+  note.textContent = "会话状态显示在本体气泡的常驻状态行上（只显示 Agent、状态与步数，不含会话标题与命令内容）。";
   box.append(note);
   root.append(style, box);
+  // 面板挂载即向入口 realm 要一次当前值（宿主 `*:widget` 的回灌是双保险），
+  // 并把宿主给的显示名交出去 —— 入口 realm 没有 ctx.host，只有这里拿得到 displayName。
+  const sendSync = (displayName) => ctx.bus.publish(TOPIC_CMD, { action: "sync", displayName });
+  // 面板是新建的、会话早就在跑：开口要一次当前值，否则 badge 会显示成默认态
+  sendSync();
 
-  const send = () =>
-    ctx.bus.publish(TOPIC_CMD, {
-      action: "config",
-      showTitle: title.checked,
-      showDetail: detail.checked,
-    });
-  title.on("change", send);
-  detail.on("change", send);
-  // 面板是新建的、配置是早就存在的：开口要一次当前值，否则两个开关都显示成关
-  ctx.bus.publish(TOPIC_CMD, { action: "sync" });
-  cleanups.push(() => {
-    title.off("change");
-    detail.off("change");
-  });
-
-  // 回显当前开关：payload 里带着 config，避免面板重开后显示成默认值
-  watch(ctx, cleanups, (d) => {
-    title.checked = d.showTitle === true;
-    detail.checked = d.showDetail === true;
-  });
-
-  // Qoder hook 的装/卸入口（B2 把宿主那张卡片删掉后，这里就是唯一入口）
-  mountHookPanel(root, ctx);
+  // Agent hook 的装/卸与四选一（B2 把宿主那张卡片删掉后，这里就是唯一入口）。
+  // 宿主 status() 给的 displayName 顺带交给入口 realm —— 常驻行要显示 Agent 名，
+  // 而入口 realm 没有 ctx.host，只有这个区拿得到它，插件里因此不留第二份名字表。
+  mountHookPanel(root, ctx, (displayName) => sendSync(displayName));
 }
 
 
 /* ---------- 设置面板：Agent hook 接入（settings 区专属能力 agent:hooks，见 ADR-0001） ---------- */
-function mountHookPanel(root, ctx) {
+function mountHookPanel(root, ctx, reportName) {
   const api = ctx.host && ctx.host.agentHooks;
   const style = ctx.dom.createElement("style");
   style.textContent = `
@@ -266,6 +183,9 @@ function mountHookPanel(root, ctx) {
     current = String(info?.agent ?? "");
     if (info?.hint) lastHint = String(info.hint);
     const name = String(info?.displayName ?? current ?? "");
+    // 常驻行的 Agent 名只认宿主给的这一个来源：入口 realm 没有 ctx.host，拿不到 displayName，
+    // 插件里再养一份「id → 名字」表迟早和宿主漂移。
+    if (name) reportName?.(name);
     if (files.length === 0) {
       st.dataset.state = "absent";
       lines.push(`未安装：没找到 ${name} 的配置目录。`);

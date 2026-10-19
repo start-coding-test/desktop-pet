@@ -5,7 +5,8 @@
 //   2) 采集→归一化→宠物 —— 往收件目录追加事件，断言宠物动作、台词、总线 topic 与去重。
 // 不依赖 petdex，也不需要 Qoder 真跑起来：事件是按其 hook 形状直接造的。
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve, sep } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
+import { pathToFileURL } from "node:url";
 import { argv, env } from "node:process";
 import { spawnSync } from "node:child_process";
 import {
@@ -24,6 +25,9 @@ import { waitWidgetRealm } from "./harness/widget-realm.mjs";
 
 const PORT = Number(env.CDP_PORT ?? argv.find((a) => a.startsWith("--port="))?.split("=")[1] ?? 9223);
 const AGENT_ID = "com.pet.agent-bridge";
+// 常驻行挂在宠物本体那扇窗的气泡上；隐身是整扇窗 hide（src-tauri/src/window/pet.rs 的
+// set_pet_hidden → get_webview_window("pet")），所以「这一行看不看得见」的硬信号只有窗级的那一个
+const PET_WINDOW_LABEL = "pet";
 // 探针插件：只为钉住「声明 agent:hooks 的插件第一次调用必经同意框」这条宿主规则。
 // 规则与用户此刻有没有授权过真实的 Agent 插件无关 —— 探针起手必然没授权，所以那一扇框
 // 是必然要弹的；运行时自建自删，全程不碰 com.pet.agent-bridge 的授权状态。
@@ -109,6 +113,10 @@ let c = null;
 let settings = null;
 let origEnabled = [];
 let pumpDone = null;
+/** 本跑预置进插件存储的那份老配置；收尾必须把它恢复成本跑之前的样子（不存在就删掉） */
+let legacySeed = null;
+/** 隐身判据把宠物窗藏起来了：中途抛错也得在 finally 里放回来，不能让用户桌上一片空白 */
+let petHidden = false;
 const grantedCaps = [];
 const consentPump = makeConsentPump(grantedCaps);
 
@@ -271,57 +279,21 @@ try {
   await sleep(2000); // 若实现错成「每次都弹框」，给泵留出把它记下来的时间
   r.check("同一能力第二次调用不再弹框", beforeSecond, probeBoxes().length);
 
-  /** 本插件那扇悬浮窗：标签 overlay-<id>，但 Tauri 不允许点号，id 里的点被编码成 `_`
-   *  （与 Rust 的 overlay_label 同式：id 词表里没有下划线，所以这是一一对应）；
-   *  标题带原 id，用来在 CDP 里认出是哪一扇 */
+  /** 悬浮窗标签的编码规则（Tauri 不许点号，id 里的点被编码成 `_`，与 Rust 的 overlay_label 同式）。
+   *  A9b 之后本插件**不再有**这一扇窗：这里留着标签式子，是为了把「查不到」判成一个可复核的字符串，
+   *  而不是判一个含糊的「少了点什么」。心率那扇仍然要用它。 */
   const overlayLabelFor = (id) => `overlay-${id.replace(/\./g, "_").replace(/[^A-Za-z0-9_-]/g, "-")}`;
   const OVERLAY_LABEL = overlayLabelFor(AGENT_ID);
   const OVERLAY_TITLE = `DesktopPet Overlay · ${AGENT_ID}`;
-  const findOverlayTarget = async () =>
-    (await listPages(PORT).catch(() => [])).find(
-      (t) => /overlay\.html/.test(t.url) && t.title === OVERLAY_TITLE,
+  /** 按插件标题认出某一扇 overlay 页，在它里面跑一段求值；窗不存在返回 null。
+   *  （宿主规则原来借本插件的卡当夹具，A9b 之后借心率那扇 —— 换夹具不换实质） */
+  async function withOverlayPageFor(pluginId, fn) {
+    const wantTitle = `DesktopPet Overlay · ${pluginId}`;
+    const target = (await listPages(PORT).catch(() => [])).find(
+      (t) => /overlay\.html/.test(t.url) && t.title === wantTitle,
     );
-
-  /**
-   * overlay 窗里是否挂上了本插件的容器。
-   * widget 渲染在 closed Shadow DOM 里，外部选择器穿不进去（那是隔离设计的一部分），
-   * 所以这里只断言到「挂上了没有」；卡片内容的正确性由下发给 widget 的数据断言保证。
-   */
-  async function overlayMounted(timeoutMs = 15_000) {
-    const until = Date.now() + timeoutMs;
-    while (Date.now() < until) {
-      const target = await findOverlayTarget();
-      if (target) {
-        const oc = await attach(
-          PORT,
-          (t) => t.webSocketDebuggerUrl === target.webSocketDebuggerUrl,
-          8_000,
-        ).catch(() => null);
-        if (oc) {
-          try {
-            const has = await oc.ev(
-              `!!document.querySelector('#widget-overlay [data-plugin-id=${JSON.stringify(AGENT_ID)}][data-region="overlay"]')`,
-            );
-            if (has) return true;
-          } finally {
-            oc.close();
-          }
-        }
-      }
-      await sleep(600);
-    }
-    return false;
-  }
-
-  /** 在 overlay 窗里跑一段求值；窗不存在返回 null */
-  async function withOverlayPage(fn) {
-    const target = await findOverlayTarget();
     if (!target) return null;
-    const oc = await attach(
-      PORT,
-      (t) => t.webSocketDebuggerUrl === target.webSocketDebuggerUrl,
-      8_000,
-    ).catch(() => null);
+    const oc = await attach(PORT, (t) => t.webSocketDebuggerUrl === target.webSocketDebuggerUrl, 8_000).catch(() => null);
     if (!oc) return null;
     try {
       return await fn(oc);
@@ -329,35 +301,50 @@ try {
       oc.close();
     }
   }
+  const overlayPagePresent = async () =>
+    !!(await listPages(PORT).catch(() => [])).find(
+      (t) => /overlay\.html/.test(t.url) && t.title === OVERLAY_TITLE,
+    );
+  /** 宿主的 overlay 登记表里，本插件是否以「某个窗」的形式存在（不论可见与否） */
+  const agentInOverlayTable = async () =>
+    c.ev(
+      `(async () => { try { const l = await window.__TAURI_INTERNALS__.invoke('overlay_list'); return l.some(([id]) => id === ${JSON.stringify(AGENT_ID)}); } catch { return "查询失败"; } })()`,
+    );
 
-  async function overlayVisible(want, timeoutMs = 15_000) {
-    const until = Date.now() + timeoutMs;
-    while (Date.now() < until) {
-      const v = await invoke("plugin:window|is_visible", { label: OVERLAY_LABEL });
-      if (v.ok && v.v === want) return true;
-      await sleep(500);
-    }
-    return false;
-  }
-
-  /** 最近一次下发给卡片的数据（隐私开关的强度就体现在这里） */
-  async function lastCard() {
-    const all = await c.ev(`window.__topics.slice().filter(([k]) => k === 'card').map(([,p]) => p)`);
+  /** 最近一次下发给 badge/设置页的数据（A9b 之后这份数据里根本没有标题与命令摘要） */
+  async function lastView() {
+    const all = await c.ev(`window.__topics.slice().filter(([k]) => k === 'view').map(([,p]) => p)`);
     return all.length ? all[all.length - 1] : null;
   }
 
-  /** 模拟设置面板里的隐私开关：走插件自己的 cmd topic */
-  async function setCardConfig(showTitle, showDetail) {
-    await c.ev(`(async () => {
-      const { bus } = await import('/src/runtime/event-bus.ts');
-      bus.publish(${JSON.stringify(`${AGENT_ID}:cmd`)}, {
-        action: 'config',
-        showTitle: ${showTitle},
-        showDetail: ${showDetail},
-      }, ${JSON.stringify(AGENT_ID)});
-      return true;
-    })()`);
-    await sleep(1200);
+  /**
+   * 预置「升级前把那两只隐私开关打开过」的老用户存储：直接写插件自己的 store.json，
+   * 因为 A9b 之后**没有任何代码路径**会替插件写它 —— 通过插件去写等于自己把被测对象改了。
+   * 返回 { read, restore }：restore 在 finally 里把文件恢复成本跑之前的样子（原来不存在就删掉）。
+   */
+  function seedLegacyConfig(showTitle, showDetail) {
+    const file = join(env.APPDATA, "com.desktoppet.pet", "plugins", AGENT_ID, "store.json");
+    const before = existsSync(file) ? readFileSync(file, "utf8") : null;
+    let map;
+    if (before === null) {
+      map = {};
+    } else {
+      try {
+        map = JSON.parse(before);
+      } catch {
+        throw new Error(`插件存储不是合法 JSON，拒绝在脏环境上预置：${file}`);
+      }
+    }
+    map.config = { showTitle, showDetail };
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify(map, null, 2));
+    return {
+      read: () => (existsSync(file) ? readFileSync(file, "utf8") : null),
+      restore: () => {
+        if (before === null) rmSync(file, { force: true });
+        else writeFileSync(file, before);
+      },
+    };
   }
 
   r.group("启用插件");
@@ -388,7 +375,7 @@ try {
       const host = await import('/src/pet/host.ts');
       const ctrl = host.petController();
       if (!ctrl) return false;
-      window.__pet = { acts: [], said: [] };
+      window.__pet = { acts: [], said: [], status: [] };
       const react0 = ctrl.react.bind(ctrl);
       const say0 = ctrl.say.bind(ctrl);
       ctrl.react = (a) => { window.__pet.acts.push(a); return react0(a); };
@@ -399,12 +386,41 @@ try {
       bus.subscribe(${JSON.stringify(`${AGENT_ID}:status`)}, (p) => window.__topics.push(['status', p]));
       bus.subscribe("agent:state", (p) => window.__topics.push(['host-state', p]));
       bus.subscribe('agent:event', (p) => window.__topics.push(['host-event', p]));
-      bus.subscribe(${JSON.stringify(`${AGENT_ID}:widget`)}, (p) => window.__topics.push(['card', p]));
+      bus.subscribe(${JSON.stringify(`${AGENT_ID}:widget`)}, (p) => window.__topics.push(['view', p]));
+      // 常驻行的真实落点：桥把插件给的文本交给本体控制器（已截断到 20 码点之后）。
+      // 记在这里而不是只看气泡 DOM —— 台词与常驻行共用一个槽，气泡那一刻显示的可能是一句台词，
+      // 而「本插件到底往宿主登记了哪几行」是判限频、判清除、判隐身不自己藏的唯一硬证据。
+      const setStatus0 = ctrl.setStatus.bind(ctrl);
+      ctrl.setStatus = (pid, text) => {
+        window.__pet.status.push([pid, text]);
+        return setStatus0(pid, text);
+      };
       return true;
     })()`),
   );
   const acts = () => c.ev(`window.__pet.acts.slice()`);
   const said = () => c.ev(`window.__pet.said.slice()`);
+  /** 本体控制器收到过的常驻行设置记录：[[pluginId, text|null], …]（按发生顺序） */
+  const statusLog = () => c.ev(`window.__pet.status.slice()`);
+  /** 本插件最近一次**非清除**的常驻行文本（判「气泡里现在该是我们的哪一行」用） */
+  const ourLastLine = async () => {
+    const log = await statusLog();
+    for (let i = log.length - 1; i >= 0; i--) if (log[i][0] === AGENT_ID && log[i][1] !== null) return log[i][1];
+    return null;
+  };
+  const ourStatusCalls = async () => (await statusLog()).filter(([p]) => p === AGENT_ID).length;
+
+  /** 气泡此刻的样子（B3 的口径：常驻行单行化靠 `.status` 类，台词占槽时没有它） */
+  const bubbleNow = () =>
+    c.ev(`(() => { const b = document.getElementById('pet-bubble');
+      return { show: b.classList.contains('show'), status: b.classList.contains('status'), text: b.textContent }; })()`);
+  /** 等槽里不是台词（台词亮 3.6s 且按设计占槽）；不等就直接读，读到的可能是那句台词 */
+  const waitStatusSlot = () =>
+    waitUntil(
+      c,
+      `(() => { const b = document.getElementById('pet-bubble'); return !b.classList.contains('show') || b.classList.contains('status'); })()`,
+      8_000,
+    ).catch(() => false);
 
   /**
    * 等某个能力真的被授权。插件在 activate 时第一次 publish、第一次 react 各自会弹一个
@@ -469,7 +485,16 @@ try {
   emitPhase("stop", {});
   r.check("宠物收到 waving", true, await waitUntil(c, `window.__pet.acts.includes('waving')`, 15_000));
 
-  r.group("一轮结束：迟到的 post 不再打开，卡片 3 秒自动收起");
+  /** 本插件最后一次被交给本体控制器的值（`null` = 清除；一次都没有 = 那个说明串） */
+  const ourTail = async () => {
+    const log = await statusLog();
+    for (let i = log.length - 1; i >= 0; i--) if (log[i][0] === AGENT_ID) return log[i][1];
+    return "(本插件一次都没设过)";
+  };
+  const waitOurClear = (timeoutMs = 9_000) =>
+    waitUntil(c, `(() => { const s = window.__pet.status; for (let i = s.length - 1; i >= 0; i--) if (s[i][0] === ${JSON.stringify(AGENT_ID)}) return s[i][1] === null; return false; })()`, timeoutMs).catch(() => false);
+
+  r.group("一轮结束：常驻行留一会儿就清掉，迟到的 post 不再把它点亮");
   emitPhase("post", { tool_name: "Bash" }); // 比 stop 晚到，属于常态
   await sleep(2000);
   r.check(
@@ -477,7 +502,14 @@ try {
     "completed",
     await c.ev(`(window.__topics.slice().reverse().find(([k]) => k === 'host-state')?.[1].state ?? '')`),
   );
-  r.check("卡片 3 秒后自动收起", true, await overlayVisible(false, 9_000));
+  // 原「卡片 3 秒后自动收起」的实质：这一轮的可见反馈不会永远挂着。卡片没了，
+  // 同一实质落在常驻行上 —— 被清成 null（取代者：B3 的清除语义 + 插件的收尾定时器）
+  r.check("轮结束后常驻行被清成 null（收起的实质搬到这里）", true, await waitOurClear());
+  const nonNullBefore = (await statusLog()).filter(([p, t]) => p === AGENT_ID && t !== null).length;
+  emitPhase("post", { tool_name: "Edit" }); // 又一个迟到的
+  await sleep(2_000);
+  r.check("迟到的事件没有把行重新点亮：最后一次仍是清除", null, await ourTail());
+  r.check("迟到的事件期间没有新增非空的常驻行设置", nonNullBefore, (await statusLog()).filter(([p, t]) => p === AGENT_ID && t !== null).length);
 
   r.group("failed：工具失败 → petdex 的 failed 并带上工具名");
   emitPhase("tool-failure", { tool_name: "cargo test" });
@@ -488,12 +520,13 @@ try {
     await waitUntil(c, `window.__pet.said.some(t => t.includes('cargo test'))`, 15_000),
   );
 
-  r.group("状态卡：开关关闭时不下发敏感内容");
-  // 显式关掉开关再验：插件的开关状态是持久化的，上一轮被中途 kill 会留下「开着」的状态，
-  // 依赖环境干净等于把断言变成随机
-  await setCardConfig(false, false);
+  r.group("隐私：会话标题与命令摘要根本不进插件（旧开关预置成「开着」也不生效）");
   const SECRET_TITLE = "把内部口令 abc123 写进配置";
   const SECRET_CMD = "echo abc123-inner-secret";
+  // A9b 撤掉了两只隐私开关，但**老用户存储里那份 config 还在**。判据不能靠「环境恰好干净」，
+  // 所以先把存储预置成 showTitle/showDetail 都为 true —— 打的就是「读到旧值就当真」那条回退路径。
+  legacySeed = seedLegacyConfig(true, true);
+  const seededBytes = legacySeed.read();
   emitPhase("user-prompt", { prompt: SECRET_TITLE });
   emitPhase("pre", { tool_name: "Bash", tool_input: { command: SECRET_CMD } });
   r.check(
@@ -506,10 +539,27 @@ try {
     true,
     await waitUntil(c, `(window.__topics.slice().some(([k,p]) => k === 'host-event' && p.steps >= 1))`, 12_000),
   );
-  r.check("会话进行中悬浮卡可见", true, await overlayVisible(true));
-  r.check("卡片 widget 挂进 overlay 区", true, await overlayMounted());
+  r.check(
+    "会话进行中常驻行挂上了（本插件那条非空）",
+    true,
+    await waitUntil(c, `(() => { const s = window.__pet.status; for (let i = s.length - 1; i >= 0; i--) if (s[i][0] === ${JSON.stringify(AGENT_ID)}) return s[i][1] !== null; return false; })()`, 12_000),
+  );
+  await waitStatusSlot(); // 台词（上一轮的「这边需要你确认一下」）会占槽 3.6s，不等就读到的是它
+  const lineOn = await bubbleNow();
+  const ourLine = await ourLastLine();
+  r.check("气泡显示的正是本插件那一行（内容 + 单行化类）", [true, ourLine], [lineOn.show && lineOn.status === true, lineOn.text]);
+  r.check("常驻行不含会话标题那串口令", false, String(ourLine ?? "").includes("abc123"));
+  r.check("常驻行不含命令摘要那串口令", false, String(ourLine ?? "").includes("abc123-inner"));
+  const viewOn = await lastView();
+  r.check("下发给 badge/设置页的数据里没有 title/detail 字段", [], Object.keys(viewOn ?? {}).filter((k) => k === "title" || k === "detail"));
+  r.check("老开关开着也没让那两串进到插件这一层", false, JSON.stringify(viewOn ?? "").includes("abc123"));
+  r.check(
+    "升级不动用户配置：事件跑完之后存储文件字节一致",
+    true,
+    legacySeed.read() === seededBytes,
+  );
 
-  r.group("两扇悬浮窗互不抢占：按各自请求的坐标同时存在");
+  r.group("悬浮窗按插件分开：心率那扇照旧，本插件一扇都不开");
   const HR_ID = "com.pet.hr-ble";
   const HR_LABEL = overlayLabelFor(HR_ID);
   // 直接打宿主命令：验的是「窗口按插件分开」这条宿主规则本身，不依赖蓝牙硬件。
@@ -527,95 +577,259 @@ try {
     if (!overlayGranted) await sleep(500);
   }
   r.check("心率插件经同意框拿到 overlay 授权", true, overlayGranted);
-  await invoke("overlay_show", { pluginId: HR_ID, x: 24, y: 24, height: 200 });
-  r.check(
-    "两张卡片同时可见",
-    true,
-    await waitUntil(
-      c,
-      `(async () => {
-        const l = await window.__TAURI_INTERNALS__.invoke('overlay_list');
-        const on = (id) => l.some(([p, v]) => p === id && v);
-        return on(${JSON.stringify(AGENT_ID)}) && on(${JSON.stringify(HR_ID)});
-      })()`,
-      12_000,
-    ),
-  );
-  // ADR-0010 决策 3：「宠物头顶」那一档已删。agent 桥的插件此刻仍在传 placement:"above-pet"，
-  // 宿主接受并忽略 —— 落点回到缺省 (24,24)。这条钉的是「废弃但不报错、也不再把窗抬到头顶」。
+  // ADR-0010 决策 3：「宠物头顶」那一档已删 —— 宿主接受 placement 并忽略，落点回到缺省 (24,24)。
+  // 原来这条的夹具是本插件的状态卡（插件自己传 above-pet），A9b 之后卡片没了：
+  // 实质（宿主对废弃入参的处理）一个字没变，夹具换成心率的窗，由测试直接打宿主命令。
   const dpr = Number(await c.ev("window.devicePixelRatio")) || 1;
-  const posAgentLegacy = await invoke("plugin:window|outer_position", { label: OVERLAY_LABEL });
+  await invoke("overlay_show", { pluginId: HR_ID, placement: "above-pet", height: 200 });
+  const hrDefault = await invoke("plugin:window|outer_position", { label: HR_LABEL });
   r.check(
-    "传 above-pet 只落回宿主缺省坐标（头顶档已废弃）",
+    "传 above-pet 不报错且落回宿主缺省坐标（头顶档已废弃）",
     true,
-    Math.abs((posAgentLegacy.v?.x ?? 1e9) - 24 * dpr) <= 6 &&
-      Math.abs((posAgentLegacy.v?.y ?? 1e9) - 24 * dpr) <= 6,
+    Math.abs((hrDefault.v?.x ?? 1e9) - 24 * dpr) <= 6 && Math.abs((hrDefault.v?.y ?? 1e9) - 24 * dpr) <= 6,
   );
   // 同一扇**已存在**的窗再 show 一次并带新坐标：钉 U01 补的「已存在窗也要按新坐标重定位」，
   // 否则「插件改了位置再显示」只在第一次建窗生效
-  await invoke("overlay_show", { pluginId: AGENT_ID, x: 520, y: 260, height: 104 });
-  const posAgent = await invoke("plugin:window|outer_position", { label: OVERLAY_LABEL });
-  const posHr = await invoke("plugin:window|outer_position", { label: HR_LABEL });
+  await invoke("overlay_show", { pluginId: HR_ID, x: 520, y: 260, height: 104 });
+  const hrMoved = await invoke("plugin:window|outer_position", { label: HR_LABEL });
   r.check(
     "已存在的窗按新请求坐标重定位（outer_position 是物理像素，按 dpr 换算）",
     true,
-    Math.abs((posAgent.v?.x ?? 1e9) - 520 * dpr) <= 6 && Math.abs((posAgent.v?.y ?? 1e9) - 260 * dpr) <= 6,
+    Math.abs((hrMoved.v?.x ?? 1e9) - 520 * dpr) <= 6 && Math.abs((hrMoved.v?.y ?? 1e9) - 260 * dpr) <= 6,
   );
-  r.check("心率那扇留在桌面左上角", true, (posHr.v?.x ?? 1e9) < 150 && (posHr.v?.y ?? 1e9) < 150);
-  r.check(
-    "两扇窗的位置不是同一个点",
-    true,
-    JSON.stringify(posAgent.v) !== JSON.stringify(posHr.v),
-  );
-  await invoke("overlay_destroy", { pluginId: HR_ID });
-  r.check("销毁只收掉那一扇，状态卡不受影响", true, await overlayVisible(true, 8_000));
   // 页面侧再对一次坐标：window.screenX/screenY 是 CSS（逻辑）像素，与上面那条物理像素的
   // outer_position 互为独立证据（同一 DPI 前提下不需要额外 capability）
-  const cardGeo = await withOverlayPage((oc) => oc.ev(`[window.screenX, window.screenY, window.outerWidth, window.outerHeight]`));
-  r.check(
-    "卡片按请求坐标落座（头顶档删了，逻辑像素不经换算就是 screenX/screenY）",
-    true,
-    !!cardGeo && Math.abs(cardGeo[0] - 520) <= 6 && Math.abs(cardGeo[1] - 260) <= 6,
+  const hrGeo = await withOverlayPageFor(HR_ID, (oc) =>
+    oc.ev(`[window.screenX, window.screenY, window.outerWidth, window.outerHeight]`),
   );
-  r.check("卡片宽度明显小于左上角整屏", true, !!cardGeo && cardGeo[2] <= 360);
+  r.check(
+    "窗按请求坐标落座（逻辑像素不经换算就是 screenX/screenY）",
+    true,
+    !!hrGeo && Math.abs(hrGeo[0] - 520) <= 6 && Math.abs(hrGeo[1] - 260) <= 6,
+  );
+  // 原「卡片宽度明显小于左上角整屏」的实质是「不给桌面蒙一块大板」。窗还在（心率那扇），
+  // 这条宿主侧事实照判；本插件那一侧的同一实质搬到字数上限（下面两条 + 纯函数那组）
+  r.check("心率那扇宽度明显小于整屏（不占满桌面的实质仍在窗口这一侧）", true, !!hrGeo && hrGeo[2] <= 360);
 
-  r.group("游戏模式隐身时卡片一起收，恢复后按会话状态回来");
+  // A9b 的反向判据：本插件不再开任何悬浮窗。三条互相独立的证据 —— 授权表、宿主的 overlay
+  // 登记表、CDP 的页面列表。只判「看不见」会被「建了但收起」糊过去，所以三条都判存在性。
+  const agentGrants = (await settings.invoke("permission_list")).v?.[AGENT_ID] ?? [];
+  r.check("本插件的授权表里没有 overlay（能力已从 manifest 收回）", false, agentGrants.includes("overlay"));
+  r.check("宿主的 overlay 登记表里根本没有本插件这一条", false, await agentInOverlayTable());
+  r.check("CDP 页面列表里没有本插件的 overlay 页", false, await overlayPagePresent());
+  // 第四路：按标签直接问窗口。曾经的卡那扇应当「查无此窗」，而不是「有窗但收起」——
+  // 后者正是「代码不再调用但窗还留着」这种实现能蒙过去的地方
+  const ghostWindow = await invoke("plugin:window|is_visible", { label: OVERLAY_LABEL });
+  r.check("按标签查本插件那扇窗：查无此窗", false, ghostWindow.ok === true && ghostWindow.v === true);
+  const pluginSrc = ["index.js", "widget.js", "status-line.js"]
+    .map((f) => readFileSync(join(PLUGINS_DIR, AGENT_ID, f), "utf8"))
+    .join("\n");
+  r.check("插件源码里不再出现 overlay 这个词（没有藏在别的调用面上的残留）", false, /overlay/i.test(pluginSrc));
+
+  r.group("销毁别人那扇窗，不影响本插件的常驻行");
+  const lineBeforeDestroy = await ourLastLine();
+  r.check("前置：销毁之前本插件确实挂着一条非空的常驻行", true, lineBeforeDestroy !== null);
+  await invoke("overlay_destroy", { pluginId: HR_ID });
+  r.check("心率的窗确实被收掉了", true, await waitUntil(c, `(async () => { const l = await window.__TAURI_INTERNALS__.invoke('overlay_list'); return !l.some(([id, visible]) => id === ${JSON.stringify(HR_ID)} && visible); })()`, 12_000));
+  await waitStatusSlot();
+  const afterDestroy = await bubbleNow();
+  r.check("销毁只收掉那一扇，本插件的常驻行不受影响", lineBeforeDestroy, afterDestroy.text);
+
+  r.group("游戏模式隐身：常驻行跟着宠物窗看不见，恢复后按当前状态回来");
+  // 隐身的实质（原「卡片一起收掉」）在新接口下 = 「这一行此刻看不见」。
+  // 信号只有一处是真的：隐身走整扇窗 hide（src-tauri/src/window/pet.rs 的 set_pet_hidden），
+  // 气泡 DOM 的 CSS 可见性在隐身期间**不变化** —— 判 DOM 可见性会结构性地红。
+  // document.visibilityState 只取证不判定（没在 runner 上验过的信号不下注）。
+  const visBefore = await invoke("plugin:window|is_visible", { label: PET_WINDOW_LABEL });
+  r.check("前置：隐身之前宠物窗自己是可见的（否则下面两条是空判）", true, visBefore.ok === true && visBefore.v === true);
+  const lineForStealth = await ourLastLine();
+  r.check("前置：隐身之前气泡上就是本插件那一行", lineForStealth, (await bubbleNow()).text);
+  const callsBeforeHide = await ourStatusCalls();
+  petHidden = true;
   await invoke("set_pet_hidden", { hidden: true });
-  r.check("隐身时卡片一起收掉", true, await overlayVisible(false, 8_000));
-  await invoke("set_pet_hidden", { hidden: false });
-  r.check("恢复后卡片按当前会话状态回来", true, await overlayVisible(true, 8_000));
-  const cardOff = await lastCard();
-  r.check("卡片数据含执行中状态", "running", cardOff?.state);
-  r.check("卡片数据含中文标签", "正在执行", cardOff?.label);
-  r.check("卡片数据含工具名", "Bash", cardOff?.toolName);
-  r.check("卡片步数至少 1", true, (cardOff?.steps ?? 0) >= 1);
-  r.check("默认不下发会话标题", "", cardOff?.title);
-  r.check("默认不下发命令内容", "", cardOff?.detail);
-
-  r.group("状态卡：开关打开后才下发敏感内容");
-  await setCardConfig(true, true);
-  const cardOn = await lastCard();
-  r.check("打开后下发会话标题", true, (cardOn?.title ?? "").includes("把内部口令 abc123"));
-  r.check("打开后下发命令摘要", true, (cardOn?.detail ?? "").includes("echo abc123-inner-secret"));
-  // 面板重新挂载时靠这份回灌数据回显；没有它就会显示成默认值，表现成「配置没保存」
-  const echoed = await invoke("bus_peek", { topic: `${AGENT_ID}:widget` });
+  await sleep(700);
+  const visHidden = await invoke("plugin:window|is_visible", { label: PET_WINDOW_LABEL });
+  r.check("隐身时宠物窗不可见（常驻行挂在它身上，因此一并看不见）", true, visHidden.ok === true && visHidden.v === false);
+  r.info("隐身期间的 document.visibilityState（只取证）", String(await c.ev("document.visibilityState ?? ''")));
   r.check(
-    "宿主为面板回灌最近一份卡片数据（含已保存的开关）",
-    true,
-    echoed.v?.showTitle === true && echoed.v?.showDetail === true,
+    "隐身期间插件没有自己实现隐身逻辑：setStatus 调用数一条不多",
+    callsBeforeHide,
+    await ourStatusCalls(),
   );
-  await setCardConfig(false, false);
-  const cardOff2 = await lastCard();
-  r.check("关掉后又变回空", true, (cardOff2?.title ?? "x") === "" && (cardOff2?.detail ?? "x") === "");
+  // 恢复：无论上面判成什么样都必须放回来，中途抛错也别让宠物一直隐身（外层 finally 兜底）
+  await invoke("set_pet_hidden", { hidden: false });
+  petHidden = false;
+  await sleep(700);
+  const visBack = await invoke("plugin:window|is_visible", { label: PET_WINDOW_LABEL });
+  r.check("恢复后宠物窗可见", true, visBack.ok === true && visBack.v === true);
+  await waitStatusSlot();
+  const back = await bubbleNow();
+  r.check("恢复后气泡显示的就是本插件那一行（按当前状态回来）", lineForStealth, back.text);
+  r.check("恢复后这一行仍是单行化显示（.status 在）", true, back.show === true && back.status === true);
+
+  r.group("常驻行与 badge 的数据形状：状态、中文标签、步数在里面，工具名进文案吗");
+  const viewOff = await lastView();
+  r.check("数据含执行中状态", "running", viewOff?.state);
+  r.check("数据含中文标签", "正在执行", viewOff?.label);
+  r.check("数据含步数且至少 1", true, (viewOff?.steps ?? 0) >= 1);
+  r.check("badge 仍然拿得到工具名（只有常驻行的文案不放它）", "Bash", viewOff?.toolName);
+  r.check(
+    "常驻行文本里没有工具名（20 码点预算换掉的，见映射表）",
+    false,
+    String((await ourLastLine()) ?? "").includes("Bash"),
+  );
+  // 原「默认不下发会话标题/命令内容」的实质搬到「这两个字段压根不存在」+ 上面那组不含 abc123
+  r.check("数据里不存在 title 键", false, Object.keys(viewOff ?? {}).includes("title"));
+  r.check("数据里不存在 detail 键", false, Object.keys(viewOff ?? {}).includes("detail"));
+  r.check(
+    "常驻行不超预算（≤20 码点，按码点算）",
+    true,
+    [...String((await ourLastLine()) ?? "")].length <= 20,
+  );
+
+  r.group("限频：同状态下多次工具调用只戳宿主一次量级");
+  const callsBeforeBurst = await ourStatusCalls();
+  for (const [phase, tool] of [["pre", "Edit"], ["post", "Edit"], ["pre", "Grep"], ["post", "Grep"], ["pre", "Bash"]]) {
+    emitPhase(phase, { tool_name: tool });
+    await sleep(120);
+  }
+  await sleep(1_600); // 越过 1 秒窗口，让合并的那次也发出来
+  const burstCalls = (await ourStatusCalls()) - callsBeforeBurst;
+  r.check(
+    "5 次同类事件的新增调用 ≤2（即时一次 + 窗口到点合并一次；去掉合并就会红）",
+    true,
+    burstCalls > 0 && burstCalls <= 2,
+  );
+  r.check("合并之后显示的是最新步数", true, (await lastView()).steps >= 1);
+
+  // 下面两组是 Node 侧的纯函数判据：不开窗口、不占 CDP、不赌机器快慢。
+  // 为什么放在这个套件里而不是 tests/unit/：`tests/unit/` 不在 A04 的允许写入路径内，
+  // 而这两组判据是**插件自己的**文案与节流口径，跟着插件走同样能反复跑。
+  r.group("常驻行文案：码点预算逐档（纯函数）");
+  const SL = await import(pathToFileURL(join(PLUGINS_DIR, AGENT_ID, "status-line.js")).href);
+  const cps = (s) => [...String(s ?? "")].length;
+  // 宿主输入侧也有一把 20 的尺（bridge.ts 的 STATUS_MAX_CHARS）。两把尺不同值 = 插件算好的行
+  // 到了宿主那里又被裁一刀，裁出来的就是看不懂的半截 —— 这条钉住两个常数同源。
+  const hostCap = (() => {
+    const src = readFileSync(resolve(import.meta.dirname, "../../src/runtime/bridge.ts"), "utf8");
+    const m = /STATUS_MAX_CHARS\s*=\s*(\d+)/.exec(src);
+    return m ? Number(m[1]) : null;
+  })();
+  r.check("插件侧预算与宿主的截断常量同值", hostCap, SL.MAX_CODEPOINTS);
+  r.check("短名带步数：整行放得下", "Qoder · 正在执行 · 12步", SL.statusLine({ agent: "Qoder", label: "正在执行", steps: 12 }));
+  r.check("长名带步数：整段丢掉步数，绝不裁半个词", "WorkBuddy · 等你确认", SL.statusLine({ agent: "WorkBuddy", label: "等你确认", steps: 128 }));
+  r.check("恰好 20 码点这一档保留步数", "ABCDEFGH · 正在执行 · 5步", SL.statusLine({ agent: "ABCDEFGH", label: "正在执行", steps: 5 }));
+  r.check("边界那一档确实是 20（不是 19 也不是 21）", 20, cps(SL.statusLine({ agent: "ABCDEFGH", label: "正在执行", steps: 5 })));
+  r.check("再多一个码点就装不下：丢的是步数段", "ABCDEFGHI · 正在执行", SL.statusLine({ agent: "ABCDEFGHI", label: "正在执行", steps: 5 }));
+  r.check("名字加标签本身就超限时退化成只显示标签", "正在执行 · 5步", SL.statusLine({ agent: "N".repeat(20), label: "正在执行", steps: 5 }));
+  r.check("没有标签就没有这一行（调用方据此清掉自己那条）", null, SL.statusLine({ agent: "Qoder", label: "", steps: 3 }));
+  r.check("步数为 0 / 负 / 非数时不带步数段", "Qoder · 待命", SL.statusLine({ agent: "Qoder", label: "待命", steps: 0 }));
+  r.check("步数非数也不带", "Qoder · 待命", SL.statusLine({ agent: "Qoder", label: "待命", steps: "12" }));
+  r.check("按码点计数，不是 UTF-16 长度", 2, SL.codepoints("🐱🐱"));
+  r.check("宽字符那一档整行仍不超预算", true, cps(SL.statusLine({ agent: "🐱".repeat(12), label: "正在执行", steps: 9 })) <= 20);
+  r.check("含代理对时按码点算才会留得下（length 会多算）", true, "🐱🐱".length === 4 && SL.codepoints("🐱🐱") === 2);
+
+  r.group("限频器：手动时钟逐档（不 sleep）");
+  const mkPacer = () => {
+    const sent = [];
+    const jobs = [];
+    let t = 0;
+    const p = SL.createStatusPacer({
+      now: () => t,
+      send: (x) => sent.push([t, x]),
+      schedule: (fn, ms) => {
+        const j = { fn, at: t + ms, done: false, dead: false };
+        jobs.push(j);
+        return () => {
+          j.dead = true;
+        };
+      },
+    });
+    return {
+      p,
+      sent,
+      tick: (ms) => {
+        t += ms;
+      },
+      fire: () => {
+        const j = jobs.find((x) => !x.done && !x.dead);
+        if (!j) return null;
+        j.done = true;
+        t = j.at;
+        j.fn();
+        return j.at;
+      },
+    };
+  };
+  {
+    const h = mkPacer();
+    h.p.set("A");
+    r.check("第一次变化立刻发出去", "0|A", `${h.sent[0]?.[0]}|${h.sent[0]?.[1]}`);
+    h.p.set("A");
+    h.p.set("A");
+    r.check("内容没变就不戳宿主（去变化判断的杀手）", 1, h.sent.length);
+    h.tick(200);
+    h.p.set("B");
+    h.tick(200);
+    h.p.set("C");
+    r.check("1 秒窗口内的两次变化当场都不发（去限频的杀手）", 1, h.sent.length);
+    const at = h.fire();
+    r.check("窗口到点只发最后一次", "1000|C", `${at}|${h.sent[1]?.[1]}`);
+    r.check("延迟按「上次发出 + gap」算，不给每次变化重起一圈", 800, at - 200);
+    r.check("到点之后没有第二条待发的", null, h.fire());
+  }
+  {
+    const h = mkPacer();
+    h.p.set("A");
+    h.tick(300);
+    h.p.set("B"); // 落在窗口里，待发
+    h.tick(100);
+    h.p.set("C", { immediate: true }); // 状态翻转：立刻发，不等窗口
+    r.check("状态翻转无条件立刻发（PM 口径：立刻且带最新步数）", "C", h.sent[1]?.[1]);
+    r.check("翻转把待发的尾巴作废了，到点不多发一条", null, h.fire());
+  }
+  {
+    const h = mkPacer();
+    h.p.set("A");
+    h.tick(200);
+    h.p.set(null); // 清除落在窗口内
+    const at = h.fire();
+    r.check("清除（null）落在窗口里也要到点发出去", "null", JSON.stringify(h.sent[1]?.[1] ?? "没发"));
+    r.check("那条清除发在窗口终点而不是拖到下一次", 1000, at);
+  }
+  {
+    const h = mkPacer();
+    h.p.set("A");
+    h.tick(200);
+    h.p.set("B");
+    h.tick(300);
+    h.p.set("A"); // 与上一次**实际发出**的内容相同 → 早退，不许借此把窗口拉长
+    const at = h.fire();
+    r.check("同内容的迟到 set 不改写窗口里待发的那一条", "B", h.sent[1]?.[1]);
+    r.check("窗口也没有被它重新拉长（仍在 1000 那一刻发）", 1000, at);
+  }
+  {
+    const h = mkPacer();
+    h.p.set("A");
+    h.tick(200);
+    h.p.set("B");
+    h.p.stop(); // 插件停用：尾巴丢掉
+    r.check("停用之后没发出去的尾巴不再戳宿主", null, h.fire());
+    r.check("停用时只发过那一条", 1, h.sent.length);
+  }
 
   r.group("会话结束后回落 idle");
+  const lineAtEnd = await ourLastLine();
   emitPhase("session-end", { session_id: "verify-sess" });
   r.check(
     "宿主广播了 idle",
     true,
     await waitUntil(c, `(window.__topics.slice().reverse().some(([k,p]) => k === 'host-state' && p.state === 'idle'))`, 25_000),
   );
-  r.check("会话结束后悬浮卡收起", true, await overlayVisible(false, 15_000));
+  r.check("会话结束后常驻行清成 null（只清自己那条）", true, await waitOurClear(15_000));
+  await waitStatusSlot();
+  const endBubble = await bubbleNow();
+  r.check("清除之后气泡上不再挂着本插件那一行", false, endBubble.show === true && endBubble.text === lineAtEnd);
 
   r.group("hook 命令的调用面：宠物窗被拒，宿主路径（设置窗）放行");
   const status = await invoke("agent_hooks_status");
@@ -829,10 +1043,27 @@ try {
     const foreignBeforeToggle = `${foreignOf(cfgA)}|${foreignOf(cfgB)}`;
 
     const disabledIds = origEnabled.filter((id) => id !== AGENT_ID);
+    // 停用之前先让插件手里确实挂着一条常驻行 —— 不预置这条基线，「停用把行摘掉」就成了空判
+    emitPhase("pre", { tool_name: "Bash", session_id: "verify-line" });
+    r.check(
+      "停用前基线：本插件挂着一条非空的常驻行",
+      true,
+      await waitUntil(
+        c,
+        `(() => { const s = window.__pet.status; for (let i = s.length - 1; i >= 0; i--) if (s[i][0] === ${JSON.stringify(AGENT_ID)}) return s[i][1] !== null; return false; })()`,
+        12_000,
+      ),
+    );
     await writeEnabledIds(settings.invoke, disabledIds);
     r.check("停用插件后自家条目归零", [0, 0], [ours(cfgA), ours(cfgB)]);
     r.check("停用插件不动用户自己的 hook 条目", foreignBeforeToggle, `${foreignOf(cfgA)}|${foreignOf(cfgB)}`);
     r.check("停用不清空 agent 字段（再启用全靠它恢复）", "qoder", agentField());
+    // 原「停用后 overlay.destroy()」的实质（插件下线就别把东西留在桌面上）搬到常驻行上：
+    // deactivate 里那一次 setStatus(null) 是插件自己摘的，宿主那条 5 秒兜底在 B3 的套件里
+    r.check("停用插件时把自家那条常驻行摘掉（最后一次 set 是 null）", null, await ourTail());
+    await waitStatusSlot();
+    const afterOff = await bubbleNow();
+    r.check("停用之后气泡没有还挂着一条单行化的常驻行", false, afterOff.show === true && afterOff.status === true);
 
     // 暂停广播：停用期间落一条事件，watcher 只该推进偏移量 —— 不发 agent:event、不进状态机。
     // 再启用后再写一条并真的跑一轮：只有新那条该被广播，停用期间那条永远不重放
@@ -856,6 +1087,15 @@ try {
       "再启用只广播新事件、不重放停用期间那条",
       eventsBeforePause + 1,
       await eventCount(),
+    );
+    r.check(
+      "再启用之后事件一来常驻行就回来",
+      true,
+      await waitUntil(
+        c,
+        `(() => { const s = window.__pet.status; for (let i = s.length - 1; i >= 0; i--) if (s[i][0] === ${JSON.stringify(AGENT_ID)}) return s[i][1] !== null; return false; })()`,
+        12_000,
+      ),
     );
 
     // ⑦ 来源过滤（A02）：与当前 Agent 不一致的事件只推进偏移量，不进状态机也不广播。
@@ -1390,6 +1630,22 @@ try {
   r.check("脚本未抛异常", true, false);
   console.error("\n验证中断: " + String(err?.message ?? err).split("\n").slice(0, 3).join(" | "));
 } finally {
+  // 隐身判据中途抛错也绝不能把宠物窗留在隐身态（用户桌上会一片空白）：先放回来再谈别的收尾
+  if (petHidden && c) {
+    await hostInvoke(c)("set_pet_hidden", { hidden: false }).catch(() => undefined);
+    petHidden = false;
+    r.info("隐身兜底恢复", "执行了（正常路径不该走到这里）");
+  }
+  // 本跑预置进插件存储的那份老配置：恢复成本跑之前的样子（原来不存在就删掉），不给这台机器留残file
+  if (legacySeed) {
+    try {
+      legacySeed.restore();
+      r.info("插件存储已恢复成本跑之前的样子", "是");
+    } catch (e) {
+      r.info("插件存储恢复失败（需要手工清的落点）", String(e).slice(0, 120));
+    }
+    legacySeed = null;
+  }
   // 收尾顺序：停同意框应答 → 趁一切还在把插件下线（不要拿重载当下线手段）→ 撤销授权
   // → 最后重载换新文档，把本跑的 console 输出连同旧文档一起丢掉，别污染下一次 attach
   consentPump.stop();
