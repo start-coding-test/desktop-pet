@@ -2112,6 +2112,44 @@ export function deactivate() { live = false; }
     [b3NoGrantRes.ok === false, (await bubbleNow()).text === "偷挂行"].join("|"),
   );
 
+  // B04：确定性闲置拍子（捕获 45s 回调后同步调用，不赌时序；PM #D-GO 方案）
+  r.group("B3 随机台词让路：确定性闲置拍子（B04）");
+  await statusCall(STATUS_B, "set", "B行·拍子");
+  const b4Idle = await waitUntil(c, `window.__pet?.action === "idle"`, 10_000).catch(() => false);
+  r.check("拍子前置：pet 处于 idle（拍子判据要求）", true, b4Idle);
+  const b4Install = await c.ev(`(() => {
+    if (window.__b4) return "already";
+    window.__b4 = { cb: null, calls: 0, origSet: window.setInterval };
+    const origSet = window.setInterval;
+    window.setInterval = function (fn, ms) { const id = origSet.call(window, fn, ms); if (ms === 45000) window.__b4.cb = fn; return id; };
+    const setHidden = (v) => Object.defineProperty(document, "hidden", { get: () => v, configurable: true });
+    setHidden(true); document.dispatchEvent(new Event("visibilitychange"));
+    setHidden(false); document.dispatchEvent(new Event("visibilitychange"));
+    return window.__b4.cb ? "captured" : "missed";
+  })()`);
+  r.check("拍子回调已捕获（visibilitychange 重建后）", "captured", b4Install);
+  const b4Trigger = `(() => {
+    const w = window.__b4; const orig = Math.random; w.calls++;
+    Math.random = () => 0;
+    try { w.cb(); } finally { Math.random = orig; }
+    return w.calls;
+  })()`;
+  const b4Calls = await c.ev(b4Trigger);
+  r.check("拍子同步调用已发生（调用次数差 = 1）", 1, b4Calls);
+  const b4Bubble = await bubbleNow();
+  r.check("有常驻行时，拍子落下不弹台词", true, !(b4Bubble.show && !b4Bubble.status));
+  r.check("拍子落下后常驻行仍在", "B行·拍子", b4Bubble.status ? b4Bubble.text : "");
+  await statusCall(STATUS_B, "clear");
+  const b4IdleForControl = await waitUntil(c, `window.__pet?.action === "idle"`, 10_000).catch(() => false);
+  r.check("正向对照前置：pet 处于 idle", true, b4IdleForControl);
+  if (b4IdleForControl) await c.ev(b4Trigger);
+  const b4Control = await waitUntil(
+    c,
+    `(() => { const b = document.getElementById('pet-bubble'); return b.classList.contains('show') && !b.classList.contains('status'); })()`,
+    5_000,
+  ).catch(() => false);
+  r.check("正向对照：无常驻行时同一拍子必弹台词", true, b4Control);
+  await c.ev(`(() => { if (window.__b4?.origSet) window.setInterval = window.__b4.origSet; return true; })()`);
   // 回收：停用要走**真的下线路径**。裸写启停清单不会让宠物窗 reconcile（watchEnabled 只缓存，
   // reconcile 只在启动与 host:plugin-toggled 时跑）—— 上一轮就是这么「停用」了个寂寞。
   // 这里直接调运行时导出的 deactivatePlugin：它和用户点开关最终进的是同一个 doDeactivate（disposeAll 在那里）。
