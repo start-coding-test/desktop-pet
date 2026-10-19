@@ -677,6 +677,13 @@ try {
     return false;
   };
 
+  /** 本插件被 activate 过几次：`activate()` 尾巴上那句状态文案是唯一痕迹
+   *  （`index.js` 的 `status("已接管宿主 Agent 事件")` 走 `${PID}:status`，被 __topics 记着）。
+   *  隐身那条计数判据的前提是「这段时间里插件没被停用/重启过」—— 光看 setStatus 只盖住了停用
+   *  （deactivate 会送一次 null），重启不留痕迹，所以得单独数 activate。 */
+  const activateCount = () =>
+    c.ev(`window.__topics.filter(([k, p]) => k === 'status' && String(p?.text ?? '').includes('已接管')).length`);
+
   r.group("游戏模式隐身：常驻行跟着宠物窗看不见，恢复后按当前状态回来");
   // 隐身的实质（原「卡片一起收掉」）在新接口下 = 「这一行此刻看不见」。
   // 信号只有一处是真的：隐身走整扇窗 hide（src-tauri/src/window/pet.rs 的 set_pet_hidden），
@@ -699,15 +706,20 @@ try {
   await waitStatusSlot();
   r.check("前置：隐身之前气泡上就是本插件那一行", lineForStealth, (await bubbleNow()).text);
   const callsBeforeHide = await ourStatusCalls();
+  const activatesBeforeHide = await activateCount();
   petHidden = true;
   await invoke("set_pet_hidden", { hidden: true });
   r.check("隐身时宠物窗不可见（常驻行挂在它身上，因此一并看不见）", true, await petVisible(false));
   r.info("隐身期间的 document.visibilityState（只取证）", String(await c.ev("document.visibilityState ?? ''")));
+  // 先钉前提再下结论（PM 的 A04-D4 第 2 条）：下面那条计数判据要成立，隐身窗口里本插件必须
+  // 既没被停用也没被重启 —— 停用会多一次 setStatus(null)，重启会多一次 activate 的痕迹。
   r.check(
-    "隐身期间插件没有自己实现隐身逻辑：setStatus 调用数一条不多",
-    callsBeforeHide,
-    await ourStatusCalls(),
+    "前提：隐身窗口内本插件仍在运行（isActive 为 true）",
+    true,
+    await c.ev(`(async () => { const rt = await import('/src/runtime/plugin-runtime.ts'); return rt.isActive(${JSON.stringify(AGENT_ID)}); })()`),
   );
+  r.check("隐身期间插件没有自己实现隐身逻辑：setStatus 调用数一条不多", callsBeforeHide, await ourStatusCalls());
+  r.check("前提：隐身期间本插件没有被重新 activate 过（activate 次数没涨）", activatesBeforeHide, await activateCount());
   // 恢复：无论上面判成什么样都必须放回来，中途抛错也别让宠物一直隐身（外层 finally 兜底）
   await invoke("set_pet_hidden", { hidden: false });
   petHidden = false;
@@ -752,7 +764,7 @@ try {
     true,
     burstCalls > 0 && burstCalls <= 3,
   );
-  r.check("合并之后显示的是最新步数", true, (await lastView()).steps >= 1);
+  r.check("合并之后下发给 widget 的仍是最新步数", true, (await lastView())?.steps >= 1);
 
   // 下面两组是 Node 侧的纯函数判据：不开窗口、不占 CDP、不赌机器快慢。
   // 为什么放在这个套件里而不是 tests/unit/：`tests/unit/` 不在 A04 的允许写入路径内，
@@ -846,7 +858,7 @@ try {
     h.tick(200);
     h.p.set(null); // 清除落在窗口内
     const at = h.fire();
-    r.check("清除（null）落在窗口里也要到点发出去", "null", JSON.stringify(h.sent[1]?.[1] ?? "没发"));
+    r.check("清除（null）落在窗口里也要到点发出去", null, h.sent[1]?.[1]);
     r.check("那条清除发在窗口终点而不是拖到下一次", 1000, at);
   }
   {
