@@ -133,6 +133,20 @@ export async function attach(port, match, timeoutMs = 90_000) {
   };
 }
 
+/**
+ * 在 GitHub Actions 里把套件汇总行同时发成一条工作流注解（`::notice` / `::error`）。
+ * 为什么：job 日志对未登录的读者是 403，而 check-run 注解经公开 API 可读 ——
+ * 评审方（云端 PM）靠它核对「每个套件到底几过几挂」，不必再靠开发者抄汇总行。
+ * 只在 GITHUB_ACTIONS=true 时输出，本地跑与 verify:release 的终端输出不变。
+ * 注意：注解参数里的 `%`、换行必须转义，否则会被截断或吞掉。
+ */
+function announceSummary(title, pass, fail, failures) {
+  if (process.env.GITHUB_ACTIONS !== "true") return;
+  const esc = (s) => String(s).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+  const msg = `${title} | ${pass} passed, ${fail} failed` + (failures.length ? ` | 失败项: ${failures.slice(0, 8).join(" ; ")}` : "");
+  console.log(`::${fail ? "error" : "notice"} title=E2E 汇总::${esc(msg)}`);
+}
+
 /** 断言收集器：全部跑完再统一报告，非零退出码反映给 CI/npm */
 export function createReport(title) {
   let pass = 0;
@@ -154,6 +168,7 @@ export function createReport(title) {
     summary() {
       console.log(`\n${pass} passed, ${fail} failed`);
       if (failures.length) console.log("失败项：\n  " + failures.join("\n  "));
+      announceSummary(title, pass, fail, failures);
       return fail;
     },
   };
