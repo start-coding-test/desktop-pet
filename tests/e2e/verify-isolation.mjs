@@ -2114,9 +2114,6 @@ export function deactivate() { live = false; }
 
   // B04：确定性闲置拍子（捕获 45s 回调后同步调用，不赌时序；PM #D-GO 方案）
   r.group("B3 随机台词让路：确定性闲置拍子（B04）");
-  await statusCall(STATUS_B, "set", "B行·拍子");
-  const b4Idle = await waitUntil(c, `window.__pet?.action === "idle"`, 10_000).catch(() => false);
-  r.check("拍子前置：pet 处于 idle（拍子判据要求）", true, b4Idle);
   const b4Install = await c.ev(`(() => {
     if (window.__b4) return "already";
     window.__b4 = { cb: null, calls: 0, origSet: window.setInterval };
@@ -2134,21 +2131,24 @@ export function deactivate() { live = false; }
     try { w.cb(); } finally { Math.random = orig; }
     return w.calls;
   })()`;
-  const b4Calls = await c.ev(b4Trigger);
-  r.check("拍子同步调用已发生（调用次数差 = 1）", 1, b4Calls);
-  const b4Bubble = await bubbleNow();
-  r.check("有常驻行时，拍子落下不弹台词", true, !(b4Bubble.show && !b4Bubble.status));
-  r.check("拍子落下后常驻行仍在", "B行·拍子", b4Bubble.status ? b4Bubble.text : "");
-  await statusCall(STATUS_B, "clear");
-  const b4IdleForControl = await waitUntil(c, `window.__pet?.action === "idle"`, 10_000).catch(() => false);
-  r.check("正向对照前置：pet 处于 idle", true, b4IdleForControl);
-  if (b4IdleForControl) await c.ev(b4Trigger);
+  // 正向对照先行：此刻无常驻行 —— 同一拍子必弹台词；它同时是「拍子落在 idle」的唯一见证
+  const b4Calls0 = await c.ev(b4Trigger);
+  r.check("拍子同步调用已发生（调用次数差 = 1）", 1, b4Calls0);
   const b4Control = await waitUntil(
     c,
     `(() => { const b = document.getElementById('pet-bubble'); return b.classList.contains('show') && !b.classList.contains('status'); })()`,
     5_000,
   ).catch(() => false);
-  r.check("正向对照：无常驻行时同一拍子必弹台词", true, b4Control);
+  r.check("正向对照：无常驻行时同一拍子必弹台词（同时证明拍子落在 idle）", true, b4Control);
+  await waitUntil(c, `!document.getElementById('pet-bubble').classList.contains('show')`, 5_000).catch(() => false);
+  // A2/A3：常驻行在时，同一拍子不弹台词；常驻行不被误清
+  await statusCall(STATUS_B, "set", "B行·拍子");
+  const b4Calls1 = await c.ev(b4Trigger);
+  r.check("拍子同步调用已发生（第二拍）", 2, b4Calls1);
+  const b4Bubble = await bubbleNow();
+  r.check("有常驻行时，拍子落下不弹台词", true, !(b4Bubble.show && !b4Bubble.status));
+  r.check("拍子落下后常驻行仍在", "B行·拍子", b4Bubble.status ? b4Bubble.text : "");
+  await statusCall(STATUS_B, "clear");
   await c.ev(`(() => { if (window.__b4?.origSet) window.setInterval = window.__b4.origSet; return true; })()`);
   // 回收：停用要走**真的下线路径**。裸写启停清单不会让宠物窗 reconcile（watchEnabled 只缓存，
   // reconcile 只在启动与 host:plugin-toggled 时跑）—— 上一轮就是这么「停用」了个寂寞。
