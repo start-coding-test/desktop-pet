@@ -339,6 +339,7 @@ try {
   r.group("宿主自身激活路径");
   const prevEnabled = await readEnabledIds(invoke_);
   await setEnabled([PROBE_ID]);
+    await c.ev(`localStorage.setItem("b4-greet", "1")`);
   await reloadAndWait(c);
   const badgeSelector = `#widget-badge > div[data-plugin-id=${JSON.stringify(PROBE_ID)}]`;
   const mountedByHost = await waitUntil(c, `!!document.querySelector(${JSON.stringify(badgeSelector)})`);
@@ -370,6 +371,7 @@ try {
   // 只删那个旧键：localStorage.clear() 会连游戏模式开关等别的 WebView 状态一起抹掉，
   // 那不是本条要证的，也不该在回归里顺手改用户设置
   await c.ev(`localStorage.removeItem('host:enabled-plugins'); true`);
+    await c.ev(`localStorage.removeItem("b4-greet")`);
   await reloadAndWait(c);
   r.check(
     "旧键删掉并重启后，清单原样还在",
@@ -1881,6 +1883,7 @@ export async function activate(ctx) {
   // 下线之后不再回包：否则在途/迟到的那条 :res 会在下一套件里变成
   // 'bus relay failed: … 插件没有安装'（verify:worker 的零噪音门会红）
   const reply = (id, body) => { if (live) ctx.bus.publish(pid + ":res", Object.assign({ id: id }, body)); };
+  if (localStorage.getItem("b4-greet")) { ctx.pet.setStatus("B行·问候").catch(() => undefined); }
   ctx.bus.subscribe(pid + ":cmd", async (msg) => {
     try {
       if (msg.action === "set") reply(msg.id, { ok: true, v: await ctx.pet.setStatus(msg.text) });
@@ -2220,13 +2223,12 @@ export function deactivate() { live = false; }
     const b4Greet = await c.ev(`window.__greet ?? null`);
     r.check("700ms 问候回调已截住（未执行）", true, !!b4Greet?.cb && b4Greet.calls >= 1);
     r.check("截住的回调来自 main（stack 含 /src/main）", true, /src\/main/.test(String(b4Greet?.stack ?? "")));
-    const b4Set = await statusCall(STATUS_B, "set", "B行·问候");
     const b4Line = await waitUntil(
       c,
       `(() => { const b = document.getElementById('pet-bubble'); return b.classList.contains('status') && b.textContent === 'B行·问候'; })()`,
       5_000,
     ).catch(() => false);
-    r.check("reload 后常驻行已在（前置）", "true|true", [b4Set.ok === true, b4Line].join("|"));
+    r.check("reload 后 fixture 自挂的常驻行已在（前置）", true, b4Line);
     await c.ev(`(() => { window.__greet.cb(); return true; })()`);
     const b4Bubble = await bubbleNow();
     r.check("有常驻行时，启动问候不弹台词", true, !(b4Bubble.show && !b4Bubble.status));
@@ -2243,6 +2245,7 @@ export function deactivate() { live = false; }
     ).catch(() => false);
     r.check("正向对照：无常驻行时同一问候回调必弹台词", true, b4Control);
   } finally {
+    await c.ev(`localStorage.removeItem("b4-greet")`).catch(() => undefined);
     if (b4Script && b4Script.identifier) {
       await c.send("Page.removeScriptToEvaluateOnNewDocument", { identifier: b4Script.identifier }).catch(() => undefined);
     }
