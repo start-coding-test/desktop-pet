@@ -378,21 +378,6 @@ try {
       return rt.isActive(${JSON.stringify(AGENT_ID)});
     })()`),
   );
-  // 旧配置得真的「被激活看见一次」：已在跑的插件再调一次 activatePlugin 是空转，
-  // 所以这里显式走一轮 停用 → 再激活 —— 这一轮跑在预置之后的盘上，
-  // 后面那条「预置开着也不下发」才不是判在一个没重读过配置的实例上。
-  r.check(
-    "预置之后重新走了一轮停用 → 激活（旧配置确实被 activate 看过一次）",
-    true,
-    await c.ev(`(async () => {
-      const rt = await import('/src/runtime/plugin-runtime.ts');
-      await rt.deactivatePlugin(${JSON.stringify(AGENT_ID)});
-      const manifests = await window.__TAURI_INTERNALS__.invoke('plugins_list');
-      const manifest = manifests.find((m) => m.id === ${JSON.stringify(AGENT_ID)});
-      await rt.activatePlugin(manifest);
-      return rt.isActive(${JSON.stringify(AGENT_ID)});
-    })()`),
-  );
 
   // 截获本体入口：气泡 DOM 3.6 秒就收起来，记在入口处更稳
   r.check(
@@ -423,6 +408,22 @@ try {
         return setStatus0(pid, text);
       };
       return true;
+    })()`),
+  );
+  // 旧配置得真的「被激活看见一次」：已在跑的插件再调一次 activatePlugin 是空转，所以这里显式走
+  // 一轮 停用 → 再激活 —— 这一轮跑在预置之后的盘上，后面那条「预置开着也不下发」才不是判在
+  // 一个没重读过配置的实例上。**必须排在截获之后**：`activate()` 末尾那句状态文案是
+  // 「activate 计数器是活的」那条前提的观测对象，装在截获之前计数器就一直是 0，那条判据会空红。
+  r.check(
+    "预置之后重新走了一轮停用 → 激活（旧配置确实被 activate 看过一次）",
+    true,
+    await c.ev(`(async () => {
+      const rt = await import('/src/runtime/plugin-runtime.ts');
+      await rt.deactivatePlugin(${JSON.stringify(AGENT_ID)});
+      const manifests = await window.__TAURI_INTERNALS__.invoke('plugins_list');
+      const manifest = manifests.find((m) => m.id === ${JSON.stringify(AGENT_ID)});
+      await rt.activatePlugin(manifest);
+      return rt.isActive(${JSON.stringify(AGENT_ID)});
     })()`),
   );
   const acts = () => c.ev(`window.__pet.acts.slice()`);
@@ -847,7 +848,10 @@ try {
     r.check("第一次变化立刻发出去", "0|A", `${h.sent[0]?.[0]}|${h.sent[0]?.[1]}`);
     h.p.set("A");
     h.p.set("A");
-    r.check("内容没变就不戳宿主（去变化判断的杀手）", 1, h.sent.length);
+    r.check("内容没变就不戳宿主（当场不多发）", 1, h.sent.length);
+    // 只判当场数量是不够的：早退被删掉时，重复的 set 只是把值塞进待发，到点才多发一条。
+    // 到点这一枪必须开 —— 没有作业被排上，`fire()` 就该回 null。
+    r.check("内容没变就不戳宿主（去变化判断的杀手：到点也不得多发一条）", null, h.fire());
     h.tick(200);
     h.p.set("B");
     h.tick(200);
