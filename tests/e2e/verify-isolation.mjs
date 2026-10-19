@@ -1886,7 +1886,6 @@ export async function activate(ctx) {
       if (msg.action === "set") reply(msg.id, { ok: true, v: await ctx.pet.setStatus(msg.text) });
       else if (msg.action === "clear") reply(msg.id, { ok: true, v: await ctx.pet.setStatus(null) });
       else if (msg.action === "say") { await ctx.pet.say(String(msg.text)); reply(msg.id, { ok: true }); }
-      else if (msg.action === "react") { ctx.pet.react(String(msg.text)); reply(msg.id, { ok: true }); }
       else if (msg.action === "boom") { reply(msg.id, { ok: true }); setTimeout(() => { throw new Error("B3 崩溃探针：故意未捕获"); }, 0); }
       else reply(msg.id, { ok: false, e: "未知 action" });
     } catch (e) {
@@ -1902,7 +1901,7 @@ export function deactivate() { live = false; }
       name: `常驻行探针 ${id}`,
       version: "0.0.0",
       entry: "index.js",
-      permissions: ["pet:say", "pet:react", "bus:publish", "bus:subscribe"],
+      permissions: ["pet:say", "bus:publish", "bus:subscribe"],
       description: "验证气泡常驻行的显示、仲裁与回收（B3）。",
     });
   for (const id of [STATUS_A, STATUS_B]) {
@@ -2113,53 +2112,6 @@ export function deactivate() { live = false; }
     [b3NoGrantRes.ok === false, (await bubbleNow()).text === "偷挂行"].join("|"),
   );
 
-  // B04：确定性闲置拍子（捕获 45s 回调后同步调用，不赌时序；PM #D-GO 方案）
-  r.group("B3 随机台词让路：确定性闲置拍子（B04）");
-  const b4Install = await c.ev(`(() => {
-    if (window.__b4) return "already";
-    window.__b4 = { cb: null, calls: 0, origSet: window.setInterval };
-    const origSet = window.setInterval;
-    window.setInterval = function (fn, ms) { const id = origSet.call(window, fn, ms); if (ms === 45000) window.__b4.cb = fn; return id; };
-    const setHidden = (v) => Object.defineProperty(document, "hidden", { get: () => v, configurable: true });
-    setHidden(true); document.dispatchEvent(new Event("visibilitychange"));
-    setHidden(false); document.dispatchEvent(new Event("visibilitychange"));
-    return window.__b4.cb ? "captured" : "missed";
-  })()`);
-  r.check("拍子回调已捕获（visibilitychange 重建后）", "captured", b4Install);
-  const b4Trigger = `(() => {
-    const w = window.__b4; const orig = Math.random; w.calls++;
-    Math.random = () => 0;
-    try { w.cb(); } finally { Math.random = orig; }
-    return w.calls;
-  })()`;
-  const b4Calls0 = await c.ev(`window.__b4.calls`);
-  // 先唤醒：waiting 状态下任何 poke 才回 idle；用 fixture 的 pet:react 做确定性唤醒
-  const b4ReactP = statusCall(STATUS_B, "react", "waving").catch((err) => ({ ok: false, e: String(err?.message ?? err) }));
-  const b4Consent = await driveConsent("grant", STATUS_B).catch(() => null);
-  const b4React = await b4ReactP;
-  r.info("B04 唤醒（react）", b4Consent ? `弹了同意框（已授）· ${JSON.stringify(b4React)}` : JSON.stringify(b4React));
-  // 正向对照：无常驻行时，同一拍子（重试 ≤10s 等 waving 回 idle）必弹台词；它同时是「拍子落在 idle」的见证
-  let b4Control = false;
-  for (let i = 0; i < 10 && !b4Control; i++) {
-    await c.ev(b4Trigger);
-    b4Control = await waitUntil(
-      c,
-      `(() => { const b = document.getElementById('pet-bubble'); return b.classList.contains('show') && !b.classList.contains('status'); })()`,
-      1_000,
-    ).catch(() => false);
-  }
-  const b4Calls1 = await c.ev(`window.__b4.calls`);
-  r.check("拍子同步调用已发生（调用次数差 ≥ 1）", true, b4Calls1 > b4Calls0);
-  r.check("正向对照：无常驻行时同一拍子必弹台词（同时证明拍子落在 idle）", true, b4Control);
-  await waitUntil(c, `!document.getElementById('pet-bubble').classList.contains('show')`, 5_000).catch(() => false);
-  // A2/A3：常驻行在时，同一拍子不弹台词；常驻行不被误清
-  await statusCall(STATUS_B, "set", "B行·拍子");
-  await c.ev(b4Trigger);
-  const b4Bubble = await bubbleNow();
-  r.check("有常驻行时，拍子落下不弹台词", true, !(b4Bubble.show && !b4Bubble.status));
-  r.check("拍子落下后常驻行仍在", "B行·拍子", b4Bubble.status ? b4Bubble.text : "");
-  await statusCall(STATUS_B, "clear");
-  await c.ev(`(() => { if (window.__b4?.origSet) window.setInterval = window.__b4.origSet; return true; })()`);
   // 回收：停用要走**真的下线路径**。裸写启停清单不会让宠物窗 reconcile（watchEnabled 只缓存，
   // reconcile 只在启动与 host:plugin-toggled 时跑）—— 上一轮就是这么「停用」了个寂寞。
   // 这里直接调运行时导出的 deactivatePlugin：它和用户点开关最终进的是同一个 doDeactivate（disposeAll 在那里）。
@@ -2251,6 +2203,50 @@ export function deactivate() { live = false; }
   await statusCall(STATUS_B, "boom");
   await b3LineGoneWithin5s("Worker 崩溃后");
 
+  // B04：确定性启动问候（Page.addScriptToEvaluateOnNewDocument 截住 700ms 回调，不执行、之后同步调用）
+  r.group("B3 随机台词让路：确定性启动问候（B04）");
+  const b4Injection = `(() => {
+    const orig = window.setTimeout;
+    window.__greet = { cb: null, calls: 0, stack: "" };
+    window.setTimeout = function (fn, ms) {
+      if (ms === 700) { window.__greet.cb = fn; window.__greet.calls++; try { window.__greet.stack = String(new Error().stack); } catch (e) {} return 0; }
+      return orig.apply(window, arguments);
+    };
+  })();`;
+  const b4Script = await c.send("Page.addScriptToEvaluateOnNewDocument", { source: b4Injection });
+  try {
+    await reloadAndWait(c);
+    await c.ev(installedCollectors).catch(() => undefined);
+    const b4Greet = await c.ev(`window.__greet ?? null`);
+    r.check("700ms 问候回调已截住（未执行）", true, !!b4Greet?.cb && b4Greet.calls >= 1);
+    r.check("截住的回调来自 main（stack 含 /src/main）", true, /src\/main/.test(String(b4Greet?.stack ?? "")));
+    const b4Set = await statusCall(STATUS_B, "set", "B行·问候");
+    const b4Line = await waitUntil(
+      c,
+      `(() => { const b = document.getElementById('pet-bubble'); return b.classList.contains('status') && b.textContent === 'B行·问候'; })()`,
+      5_000,
+    ).catch(() => false);
+    r.check("reload 后常驻行已在（前置）", "true|true", [b4Set.ok === true, b4Line].join("|"));
+    await c.ev(`(() => { window.__greet.cb(); return true; })()`);
+    const b4Bubble = await bubbleNow();
+    r.check("有常驻行时，启动问候不弹台词", true, !(b4Bubble.show && !b4Bubble.status));
+    r.check("问候落空后常驻行仍在", "B行·问候", b4Bubble.status ? b4Bubble.text : "");
+    await reloadAndWait(c);
+    await c.ev(installedCollectors).catch(() => undefined);
+    const b4Greet2 = await c.ev(`window.__greet ?? null`);
+    r.check("第二次 reload 也截住了问候回调", true, !!b4Greet2?.cb);
+    await c.ev(`(() => { window.__greet.cb(); return true; })()`);
+    const b4Control = await waitUntil(
+      c,
+      `(() => { const b = document.getElementById('pet-bubble'); return b.classList.contains('show') && !b.classList.contains('status'); })()`,
+      5_000,
+    ).catch(() => false);
+    r.check("正向对照：无常驻行时同一问候回调必弹台词", true, b4Control);
+  } finally {
+    if (b4Script && b4Script.identifier) {
+      await c.send("Page.removeScriptToEvaluateOnNewDocument", { identifier: b4Script.identifier }).catch(() => undefined);
+    }
+  }
   // 收尾：改回原清单、撤销授权。fixture 目录**留到 finally 再删** —— 组尾就删会让
   // 超时调用的迟到回包变成 `bus relay failed: … 没有安装`（verify:worker 的零噪音门会红）。
   await setEnabled(enabledBeforeB3);
