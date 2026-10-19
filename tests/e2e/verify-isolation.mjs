@@ -2229,6 +2229,38 @@ export function deactivate() { live = false; }
   // 探针留在宿主 realm 那条例外只服务于本套件的页面全局断言，不该活到下一轮真实使用里
   await c?.ev(`localStorage.removeItem('host:realm-plugin-host')`).catch(() => undefined);
   await c?.ev(`localStorage.removeItem('host:widget-realm-plugin-host')`).catch(() => undefined);
+  // B05：收尾清理自己留下的崩溃探针噪音 —— 后跑套件 enable 时会把宠物页既存日志重放
+  // （S1 核对：Log.entryAdded 与 Runtime.consoleAPICalled 两路都会进 noise）
+  let b5CleanupErr = null;
+  try {
+    await c?.send("Log.clear");
+    await c?.send("Runtime.discardConsoleEntries");
+  } catch (e) {
+    b5CleanupErr = String(e?.message ?? e);
+  }
+  const b5Probe = (n) => n.includes("派发递归") || n.includes("B3 崩溃探针");
+  const b5Sentinel = "B05 哨兵：非探针噪音";
+  c?.noise.push(b5Sentinel);
+  const b5NonProbeBefore = (c?.noise ?? []).filter((n) => !b5Probe(n));
+  if (c) {
+    for (const arr of [c.noise, c.transitionNoise]) {
+      for (let i = arr.length - 1; i >= 0; i--) if (b5Probe(arr[i])) arr.splice(i, 1);
+    }
+  }
+  const b5NonProbeAfter = (c?.noise ?? []).filter((n) => !b5Probe(n));
+  r.check(
+    "B05 收尾后共享 noise 里不含探针记录（清理未失败）",
+    "true|true|true",
+    [!(c?.noise ?? []).some(b5Probe), !(c?.transitionNoise ?? []).some(b5Probe), b5CleanupErr === null].join("|"),
+  );
+  r.check(
+    "B05 清理未吞掉其他噪音（非探针条目逐条一致，含哨兵）",
+    "true|true",
+    [JSON.stringify(b5NonProbeBefore) === JSON.stringify(b5NonProbeAfter), b5NonProbeAfter.includes(b5Sentinel)].join("|"),
+  );
+  const b5Idx = c?.noise.indexOf(b5Sentinel) ?? -1;
+  if (b5Idx >= 0) c.noise.splice(b5Idx, 1);
+  if (b5CleanupErr) console.error("B05 清理失败: " + b5CleanupErr);
   settings?.close();
   c?.close();
   // 等 websocket 真正关掉再退出，否则 Windows 上 Node 会在 stderr 抛一句 libuv 断言
