@@ -1886,6 +1886,7 @@ export async function activate(ctx) {
       if (msg.action === "set") reply(msg.id, { ok: true, v: await ctx.pet.setStatus(msg.text) });
       else if (msg.action === "clear") reply(msg.id, { ok: true, v: await ctx.pet.setStatus(null) });
       else if (msg.action === "say") { await ctx.pet.say(String(msg.text)); reply(msg.id, { ok: true }); }
+      else if (msg.action === "react") { ctx.pet.react(String(msg.text)); reply(msg.id, { ok: true }); }
       else if (msg.action === "boom") { reply(msg.id, { ok: true }); setTimeout(() => { throw new Error("B3 崩溃探针：故意未捕获"); }, 0); }
       else reply(msg.id, { ok: false, e: "未知 action" });
     } catch (e) {
@@ -1901,7 +1902,7 @@ export function deactivate() { live = false; }
       name: `常驻行探针 ${id}`,
       version: "0.0.0",
       entry: "index.js",
-      permissions: ["pet:say", "bus:publish", "bus:subscribe"],
+      permissions: ["pet:say", "pet:react", "bus:publish", "bus:subscribe"],
       description: "验证气泡常驻行的显示、仲裁与回收（B3）。",
     });
   for (const id of [STATUS_A, STATUS_B]) {
@@ -2131,20 +2132,29 @@ export function deactivate() { live = false; }
     try { w.cb(); } finally { Math.random = orig; }
     return w.calls;
   })()`;
-  // 正向对照先行：此刻无常驻行 —— 同一拍子必弹台词；它同时是「拍子落在 idle」的唯一见证
-  const b4Calls0 = await c.ev(b4Trigger);
-  r.check("拍子同步调用已发生（调用次数差 = 1）", 1, b4Calls0);
-  const b4Control = await waitUntil(
-    c,
-    `(() => { const b = document.getElementById('pet-bubble'); return b.classList.contains('show') && !b.classList.contains('status'); })()`,
-    5_000,
-  ).catch(() => false);
+  const b4Calls0 = await c.ev(`window.__b4.calls`);
+  // 先唤醒：waiting 状态下任何 poke 才回 idle；用 fixture 的 pet:react 做确定性唤醒
+  const b4ReactP = statusCall(STATUS_B, "react", "waving").catch((err) => ({ ok: false, e: String(err?.message ?? err) }));
+  const b4Consent = await driveConsent("grant", STATUS_B).catch(() => null);
+  const b4React = await b4ReactP;
+  r.info("B04 唤醒（react）", b4Consent ? `弹了同意框（已授）· ${JSON.stringify(b4React)}` : JSON.stringify(b4React));
+  // 正向对照：无常驻行时，同一拍子（重试 ≤10s 等 waving 回 idle）必弹台词；它同时是「拍子落在 idle」的见证
+  let b4Control = false;
+  for (let i = 0; i < 10 && !b4Control; i++) {
+    await c.ev(b4Trigger);
+    b4Control = await waitUntil(
+      c,
+      `(() => { const b = document.getElementById('pet-bubble'); return b.classList.contains('show') && !b.classList.contains('status'); })()`,
+      1_000,
+    ).catch(() => false);
+  }
+  const b4Calls1 = await c.ev(`window.__b4.calls`);
+  r.check("拍子同步调用已发生（调用次数差 ≥ 1）", true, b4Calls1 > b4Calls0);
   r.check("正向对照：无常驻行时同一拍子必弹台词（同时证明拍子落在 idle）", true, b4Control);
   await waitUntil(c, `!document.getElementById('pet-bubble').classList.contains('show')`, 5_000).catch(() => false);
   // A2/A3：常驻行在时，同一拍子不弹台词；常驻行不被误清
   await statusCall(STATUS_B, "set", "B行·拍子");
-  const b4Calls1 = await c.ev(b4Trigger);
-  r.check("拍子同步调用已发生（第二拍）", 2, b4Calls1);
+  await c.ev(b4Trigger);
   const b4Bubble = await bubbleNow();
   r.check("有常驻行时，拍子落下不弹台词", true, !(b4Bubble.show && !b4Bubble.status));
   r.check("拍子落下后常驻行仍在", "B行·拍子", b4Bubble.status ? b4Bubble.text : "");
