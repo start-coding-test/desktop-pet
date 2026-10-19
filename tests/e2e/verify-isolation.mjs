@@ -371,7 +371,6 @@ try {
   // 那不是本条要证的，也不该在回归里顺手改用户设置
   await c.ev(`localStorage.removeItem('host:enabled-plugins'); true`);
   await reloadAndWait(c);
-    await statusCall(STATUS_B, "clear");
   r.check(
     "旧键删掉并重启后，清单原样还在",
     JSON.stringify(beforeClear),
@@ -2234,6 +2233,7 @@ export function deactivate() { live = false; }
     r.check("问候落空后常驻行仍在", "B行·问候", b4Bubble.status ? b4Bubble.text : "");
     await reloadAndWait(c);
     await c.ev(installedCollectors).catch(() => undefined);
+    await statusCall(STATUS_B, "clear");
     const b4Greet2 = await c.ev(`window.__greet ?? null`);
     r.check("第二次 reload 也截住了问候回调", true, !!b4Greet2?.cb);
     await c.ev(`(() => { window.__greet.cb(); return true; })()`);
