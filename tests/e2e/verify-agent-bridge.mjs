@@ -666,21 +666,42 @@ try {
   const afterDestroy = await bubbleNow();
   r.check("销毁只收掉那一扇，本插件的常驻行不受影响", lineBeforeDestroy, afterDestroy.text);
 
+  /** 宠物窗的可见性：轮询到想要的那一侧（本套件的既有做法，不拿固定 sleep 当判据） */
+  const petVisible = async (want, timeoutMs = 8_000) => {
+    const until = Date.now() + timeoutMs;
+    while (Date.now() < until) {
+      const v = await invoke("plugin:window|is_visible", { label: PET_WINDOW_LABEL });
+      if (v.ok && v.v === want) return true;
+      await sleep(300);
+    }
+    return false;
+  };
+
   r.group("游戏模式隐身：常驻行跟着宠物窗看不见，恢复后按当前状态回来");
   // 隐身的实质（原「卡片一起收掉」）在新接口下 = 「这一行此刻看不见」。
   // 信号只有一处是真的：隐身走整扇窗 hide（src-tauri/src/window/pet.rs 的 set_pet_hidden），
   // 气泡 DOM 的 CSS 可见性在隐身期间**不变化** —— 判 DOM 可见性会结构性地红。
   // document.visibilityState 只取证不判定（没在 runner 上验过的信号不下注）。
-  const visBefore = await invoke("plugin:window|is_visible", { label: PET_WINDOW_LABEL });
-  r.check("前置：隐身之前宠物窗自己是可见的（否则下面两条是空判）", true, visBefore.ok === true && visBefore.v === true);
-  const lineForStealth = await ourLastLine();
+  // 先补一条事件：前面几组花掉的时间可能已经让宿主的会话表把这条会话过期掉（过期 = idle = 行被清），
+  // 那时候下面判的就不是「隐身不打扰」，而是「压根没东西可藏」。
+  emitPhase("pre", { tool_name: "Bash" });
+  r.check(
+    "前置：本插件手上有一条非空的常驻行",
+    true,
+    await waitUntil(
+      c,
+      `(() => { const s = window.__pet.status; for (let i = s.length - 1; i >= 0; i--) if (s[i][0] === ${JSON.stringify(AGENT_ID)}) return typeof s[i][1] === 'string' && s[i][1].length > 0; return false; })()`,
+      10_000,
+    ),
+  );
+  r.check("前置：隐身之前宠物窗自己是可见的（否则下面两条是空判）", true, await petVisible(true));
+  const lineForStealth = await ourTail();
+  await waitStatusSlot();
   r.check("前置：隐身之前气泡上就是本插件那一行", lineForStealth, (await bubbleNow()).text);
   const callsBeforeHide = await ourStatusCalls();
   petHidden = true;
   await invoke("set_pet_hidden", { hidden: true });
-  await sleep(700);
-  const visHidden = await invoke("plugin:window|is_visible", { label: PET_WINDOW_LABEL });
-  r.check("隐身时宠物窗不可见（常驻行挂在它身上，因此一并看不见）", true, visHidden.ok === true && visHidden.v === false);
+  r.check("隐身时宠物窗不可见（常驻行挂在它身上，因此一并看不见）", true, await petVisible(false));
   r.info("隐身期间的 document.visibilityState（只取证）", String(await c.ev("document.visibilityState ?? ''")));
   r.check(
     "隐身期间插件没有自己实现隐身逻辑：setStatus 调用数一条不多",
@@ -690,9 +711,7 @@ try {
   // 恢复：无论上面判成什么样都必须放回来，中途抛错也别让宠物一直隐身（外层 finally 兜底）
   await invoke("set_pet_hidden", { hidden: false });
   petHidden = false;
-  await sleep(700);
-  const visBack = await invoke("plugin:window|is_visible", { label: PET_WINDOW_LABEL });
-  r.check("恢复后宠物窗可见", true, visBack.ok === true && visBack.v === true);
+  r.check("恢复后宠物窗可见", true, await petVisible(true));
   await waitStatusSlot();
   const back = await bubbleNow();
   r.check("恢复后气泡显示的就是本插件那一行（按当前状态回来）", lineForStealth, back.text);
@@ -726,10 +745,12 @@ try {
   }
   await sleep(1_600); // 越过 1 秒窗口，让合并的那次也发出来
   const burstCalls = (await ourStatusCalls()) - callsBeforeBurst;
+  // 上限给到 3 而不是 2：这 5 条事件里宿主随时可能翻一次总状态，那是一次**该发**的即时调用，
+  // 不该被判成刷屏。去掉限频（M4b）会直接冲到 5～6 次，照样红 —— 容忍一格不削弱它对变异的杀伤。
   r.check(
-    "5 次同类事件的新增调用 ≤2（即时一次 + 窗口到点合并一次；去掉合并就会红）",
+    "5 次同类事件的新增调用 ≤3（合并生效；去掉合并就是 5～6 次）",
     true,
-    burstCalls > 0 && burstCalls <= 2,
+    burstCalls > 0 && burstCalls <= 3,
   );
   r.check("合并之后显示的是最新步数", true, (await lastView()).steps >= 1);
 
