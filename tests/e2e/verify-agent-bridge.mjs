@@ -347,6 +347,18 @@ try {
     };
   }
 
+  // 预置「升级前把那两只隐私开关打开过」的老用户存储，**在插件激活之前**写进去：
+  // A9b 之后插件根本不读它，但判据要打的正是「读到旧值就当真」那条回退路径 ——
+  // 先写后激活，才保证下面每一次 activate() 都看得见这份盘上的旧值（PM 的条件 3）。
+  legacySeed = seedLegacyConfig(true, true);
+  const seededBytes = legacySeed.read();
+  const seededCfg = JSON.parse(seededBytes ?? "{}").config ?? {};
+  r.check(
+    "预置的旧开关确实在盘上（不先钉这条，后面的「前后字节一致」就是空判）",
+    "true|true",
+    [String(seededCfg.showTitle), String(seededCfg.showDetail)].join("|"),
+  );
+
   r.group("启用插件");
   // 经运行时启停，不靠重载：重载会切断页面在途的 IPC（点击穿透每 250ms 问一次光标位置），
   // 宿主随后把「孤儿回调」告警喷到页面上，被后面的零噪音断言算作本跑噪音。
@@ -362,6 +374,21 @@ try {
       const manifest = manifests.find((m) => m.id === ${JSON.stringify(AGENT_ID)});
       if (!manifest) throw new Error('宿主没扫到插件');
       await rt.loadEnabled();
+      await rt.activatePlugin(manifest);
+      return rt.isActive(${JSON.stringify(AGENT_ID)});
+    })()`),
+  );
+  // 旧配置得真的「被激活看见一次」：已在跑的插件再调一次 activatePlugin 是空转，
+  // 所以这里显式走一轮 停用 → 再激活 —— 这一轮跑在预置之后的盘上，
+  // 后面那条「预置开着也不下发」才不是判在一个没重读过配置的实例上。
+  r.check(
+    "预置之后重新走了一轮停用 → 激活（旧配置确实被 activate 看过一次）",
+    true,
+    await c.ev(`(async () => {
+      const rt = await import('/src/runtime/plugin-runtime.ts');
+      await rt.deactivatePlugin(${JSON.stringify(AGENT_ID)});
+      const manifests = await window.__TAURI_INTERNALS__.invoke('plugins_list');
+      const manifest = manifests.find((m) => m.id === ${JSON.stringify(AGENT_ID)});
       await rt.activatePlugin(manifest);
       return rt.isActive(${JSON.stringify(AGENT_ID)});
     })()`),
@@ -523,10 +550,7 @@ try {
   r.group("隐私：会话标题与命令摘要根本不进插件（旧开关预置成「开着」也不生效）");
   const SECRET_TITLE = "把内部口令 abc123 写进配置";
   const SECRET_CMD = "echo abc123-inner-secret";
-  // A9b 撤掉了两只隐私开关，但**老用户存储里那份 config 还在**。判据不能靠「环境恰好干净」，
-  // 所以先把存储预置成 showTitle/showDetail 都为 true —— 打的就是「读到旧值就当真」那条回退路径。
-  legacySeed = seedLegacyConfig(true, true);
-  const seededBytes = legacySeed.read();
+  // 旧 config 在启用插件之前就预置好了（见上面的 seedLegacyConfig），而且已经让 activate 重读过一次
   emitPhase("user-prompt", { prompt: SECRET_TITLE });
   emitPhase("pre", { tool_name: "Bash", tool_input: { command: SECRET_CMD } });
   r.check(
@@ -596,6 +620,13 @@ try {
     "已存在的窗按新请求坐标重定位（outer_position 是物理像素，按 dpr 换算）",
     true,
     Math.abs((hrMoved.v?.x ?? 1e9) - 520 * dpr) <= 6 && Math.abs((hrMoved.v?.y ?? 1e9) - 260 * dpr) <= 6,
+  );
+  // 原「两扇窗的位置不是同一个点」的实质是「两次请求落到两个点，宿主不把它们并成一个」。
+  // 夹具从「agent 卡 + 心率」换成「同一扇心率窗的两次请求」：可比的两点还在，判据不降级。
+  r.check(
+    "两次请求的两个落点不是同一个点",
+    true,
+    !!hrDefault.v && !!hrMoved.v && JSON.stringify(hrDefault.v) !== JSON.stringify(hrMoved.v),
   );
   // 页面侧再对一次坐标：window.screenX/screenY 是 CSS（逻辑）像素，与上面那条物理像素的
   // outer_position 互为独立证据（同一 DPI 前提下不需要额外 capability）
@@ -1619,6 +1650,14 @@ try {
     rmSync(wdir, { recursive: true, force: true });
     r.check("WorkBuddy 夹具目录已自删", false, existsSync(wdir));
   }
+
+  // 整轮跑完（含 ⑥ 那组一次真的停用 → 再激活）之后再对一次字节：
+  // 只在事件之后对，就漏掉了「激活时顺手写回 config」这条路径（M9 打的正是它）
+  r.check(
+    "整轮跑完之后存储仍是预置那一份字节（插件一次都没写它）",
+    true,
+    legacySeed.read() === seededBytes,
+  );
 
   r.group("收尾前的完整性");
   r.check("测试期间宠物窗未被重载", token, await c.ev(`window.__verifyToken ?? null`));

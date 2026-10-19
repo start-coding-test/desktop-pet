@@ -62,6 +62,7 @@ export function createStatusPacer({ now, send, gapMs = 1000, schedule = defaultS
   let lastSentAt = -Infinity;
   let lastSent = null;
   // 用哨兵而不是 null：`null` 是合法值（「把这一行清掉」），拿它当「没有待发的」会让收尾那次清除被吞掉
+  /** @type {string | null | typeof NOTHING} */
   let pending = NOTHING;
   let cancelTimer = null;
   const cancel = () => {
