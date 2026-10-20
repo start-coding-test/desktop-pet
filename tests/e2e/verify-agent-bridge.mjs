@@ -4,7 +4,7 @@
 //   1) hook 分支 —— 真的用 exe 跑一次 `--pet-hook <phase>`，验证 stdin 落成一行 JSONL；
 //   2) 采集→归一化→宠物 —— 往收件目录追加事件，断言宠物动作、台词、总线 topic 与去重。
 // 不依赖 petdex，也不需要 Qoder 真跑起来：事件是按其 hook 形状直接造的。
-import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { argv, env } from "node:process";
@@ -410,19 +410,6 @@ try {
         window.__pet.status.push([pid, text]);
         return setStatus0(pid, text);
       };
-      // A07/M9：观测「插件到底有没有发起过存储调用」。字节判据管得住「内容变了」，管不住
-      // 「读回来原样写一次」（A04 的 M9 就是那样活下来的），所以这一路改判**调用**而不是判盘。
-      // 包在 window.__TAURI_INTERNALS__.invoke 上而不是包在 hostCall 上，是因为
-      // @tauri-apps/api/core 的 invoke 每次调用时才取这个属性（core.js:327-329），装好之后
-      // 所有 hostCall 都经过这里；插件与本页同 realm（plugin-runtime.ts 加载 index.js）。
-      // 包装必须透明：只记 (命令, pluginId) 两个值，原样转发、原样返回或抛错，零 console 输出。
-      window.__invokeLog = [];
-      const inv0 = window.__TAURI_INTERNALS__.invoke;
-      window.__TAURI_INTERNALS__.invoke = (cmd, args, options) => {
-        const pid = args && (args.pluginId ?? args.plugin_id);
-        window.__invokeLog.push([String(cmd), typeof pid === "string" ? pid : null]);
-        return inv0.apply(window.__TAURI_INTERNALS__, [cmd, args, options]);
-      };
       return true;
     })()`),
   );
@@ -480,21 +467,6 @@ try {
     "预置之后重新走了一轮停用 → 激活（旧配置确实被 activate 看过一次）",
     "ok",
     await restartPlugin(),
-  );
-  // A07/M9 的前置（两条合起来判，缺任何一条后面那条「零调用」就是空判）：
-  // ① 包装确实在链路上（整轮跑到这里，`__invokeLog` 不可能还是空的）；
-  // ② `pluginId` 过滤不是空判 —— 本插件自己的调用（`permission_check` / `plugins_list` 一类带
-  //    `pluginId` 的）必须已经被抓到过。实参名原文是 `pluginId`（`src/runtime/bridge.ts:155/157`
-  //    的 `hostCall("store_get", { pluginId: pid, key })`），过滤同时兼容 `plugin_id` 以防宿主改口。
-  const m9Pre = await c.ev(
-    `(() => { const l = window.__invokeLog || [];
-      return [l.length > 0, l.some(([cmd, pid]) => pid === ${JSON.stringify(AGENT_ID)} && (cmd === 'permission_check' || cmd === 'store_get' || cmd === 'store_set'))]
-        .map(String).join('|'); })()`,
-  );
-  r.check(
-    "前提：invoke 观测包装在链路上，且按 pluginId 过滤不是空判（本插件自己的调用已被抓到）",
-    "true|true",
-    m9Pre,
   );
 
   /**
@@ -1958,20 +1930,40 @@ try {
     true,
     legacySeed.read() === seededBytes,
   );
-  // A07/M9 的主杀手，放在整轮末尾读：上面那条字节判据管得住「内容变了」，管不住
-  // 「读回来原样写一次」—— 宿主用 `serde_json::to_string_pretty` + `preserve_order`
-  // （`services/store.rs:100-103`、`Cargo.toml:32`），键序按文件插入序，与原样重写的字节完全相同，
-  // A04 的 M9 正是这样活下来的。这条改判**调用**：读和写都算违规，一次都不许有。
-  // 覆盖面如实写明：包装装在宠物窗 realm（`index.js` 就在这里跑），widget worker realm 的调用
-  // 不在这条的观测范围内 —— 那个 realm 也不持有 `ctx.storage`。
-  const m9StoreCalls = await c.ev(
-    `(() => { const l = window.__invokeLog ?? [];
-      return l.filter(([cmd, pid]) => pid === ${JSON.stringify(AGENT_ID)} && (cmd === 'store_get' || cmd === 'store_set')).map(([cmd, pid]) => cmd); })()`,
+  // A07/M9（按 `#D-FIX` A07-D3 选 A 改成**静态源码判据**）：运行时那两条摘干净，不留观测。
+  // 原因如实记：我对 `window.__TAURI_INTERNALS__.invoke` 的重新赋值在该 realm 静默无效
+  // （正式轮 run 39454676546 实测 `__invokeLog` 一条都没记到，连套件自己打的 plugins_list 都没进），
+  // 留着它只会得到一条「空数组等于 []」的空判绿。
+  // 实质换过一茬，写清楚：静态判据管得住「这个插件的源码里没有任何存储调用面」，
+  // **管不住**运行时绕过 JS 桥另寻途径写存储（同 realm 直接 invoke，或宿主代写）—— 那条路径本卡不覆盖。
+  const m9Manifest = JSON.parse(readFileSync(join(PLUGINS_DIR, AGENT_ID, "manifest.json"), "utf8"));
+  const m9Files = [
+    ...new Set(
+      [m9Manifest.entry, m9Manifest.widget, ...readdirSync(join(PLUGINS_DIR, AGENT_ID)).filter((f) => f.endsWith(".js"))].filter(
+        (f) => typeof f === "string",
+      ),
+    ),
+  ];
+  const m9Stripped = m9Files.map((f) => stripComments(readFileSync(join(PLUGINS_DIR, AGENT_ID, f), "utf8")));
+  // 匹配面用「子串」而不是 `\bstorage\b`：A04 的 M3a 就是因为 needle 少了可选链写法而漏。
+  // `storage` 这个子串把 `ctx.storage` / `storage?.x` / `storage[x]` / `{ storage }` / `storage:`
+  // 全覆盖（当前 HEAD 剥注释后零命中，所以不会因为宽而在干净码上误伤），再加两个宿主命令名。
+  const m9Find = (text) => ["storage", "store_get", "store_set"].filter((needle) => text.includes(needle));
+  const m9Synthetic =
+    'await ctx.storage.get("config").then((c) => c && ctx.storage.set("config", c));';
+  r.check(
+    "前提：M9 静态源码判据不空判（按 manifest 枚举到 js、每份剥注释后非空、同一匹配函数喂 M9 合成串必命中）",
+    "true|true|true",
+    [
+      String(m9Files.length > 0 && m9Files.includes(m9Manifest.entry) && m9Files.includes(m9Manifest.widget)),
+      String(m9Stripped.every((s) => s.trim().length > 0)),
+      String(m9Find(m9Synthetic).length > 0),
+    ].join("|"),
   );
   r.check(
-    "整轮里本插件一次都没调 store_get / store_set（A9b 之后它根本不碰存储；读回来原样写回一次也算违规）",
+    "M9 静态源码判据：本插件被 manifest 引用的每一份 js（剥注释后）都不含任何存储调用面（storage / store_get / store_set）",
     [],
-    m9StoreCalls,
+    m9Files.flatMap((f, i) => m9Find(m9Stripped[i]).map((needle) => `${f}:${needle}`)),
   );
 
   r.group("收尾前的完整性");
