@@ -2228,6 +2228,28 @@ export function deactivate() { live = false; }
   let b4Collectors = false;
   let b4Captured = false;
   let b4Ready = false;
+  let b4Activated = false;
+  /** reload 后先等 STATUS_B 真的进了 active；否则 set 命令会在订阅完成前丢失，表现为「无回包」。 */
+  const b4EnsureActive = async () =>
+    c
+      .ev(`(async () => {
+        try {
+          const rt = await import('/src/runtime/plugin-runtime.ts');
+          const ms = await window.__TAURI_INTERNALS__.invoke('plugins_list');
+          const m = ms.find((x) => x.id === ${JSON.stringify(STATUS_B)});
+          if (!m) return { ok: false, e: 'STATUS_B manifest 不在 plugins_list' };
+          await rt.activatePlugin(m);
+          const until = Date.now() + 10_000;
+          while (Date.now() < until) {
+            if (rt.isActive(${JSON.stringify(STATUS_B)})) return { ok: true };
+            await new Promise((r) => setTimeout(r, 100));
+          }
+          return { ok: false, e: 'STATUS_B 未激活（10s）' };
+        } catch (e) {
+          return { ok: false, e: String(e && e.message ? e.message : e) };
+        }
+      })()`)
+      .catch((e) => ({ ok: false, e: String(e?.message ?? e) }));
   try {
     await reloadAndWait(c);
     await c.ev(installedCollectors).catch(() => undefined);
@@ -2237,20 +2259,27 @@ export function deactivate() { live = false; }
     r.check("700ms 启动问候回调已截住（未执行）", true, b4Captured);
     r.check("截住的回调来自 main（stack 含 /src/main）", true, /src\/main/.test(String(b4Greet?.stack ?? "")));
 
+    const b4Active = await b4EnsureActive();
+    b4Activated = !!b4Active?.ok;
+    r.check("STATUS_B 激活完成（10s 内）", true, b4Activated);
+    if (!b4Activated) r.info("STATUS_B 未激活", String(b4Active?.e ?? "unknown"));
+
     // A3 返回生效文本是后续断言的前置；失败只留这一条红，不连环。
-    const b4Set = await statusCall(STATUS_B, "set", B4_LINE);
-    r.check("设置返回生效后的文本", B4_LINE, b4Set.v);
-    if (b4Set.v === B4_LINE) {
-      await waitStatusSlot();
-      const b4Now = await bubbleNow();
-      r.check(
-        "reload 后常驻行已显示（前置，非激活自挂）",
-        `${B4_LINE}|true`,
-        [b4Now.text, b4Now.status].join("|"),
-      );
-      b4Ready = b4Now.status && b4Now.text === B4_LINE;
-    } else {
-      r.info("B04 前置失败，跳过后续断言", String(b4Set.e ?? b4Set.v));
+    if (b4Activated) {
+      const b4Set = await statusCall(STATUS_B, "set", B4_LINE);
+      r.check("设置返回生效后的文本", B4_LINE, b4Set.v);
+      if (b4Set.v === B4_LINE) {
+        await waitStatusSlot();
+        const b4Now = await bubbleNow();
+        r.check(
+          "reload 后常驻行已显示（前置，非激活自挂）",
+          `${B4_LINE}|true`,
+          [b4Now.text, b4Now.status].join("|"),
+        );
+        b4Ready = b4Now.status && b4Now.text === B4_LINE;
+      } else {
+        r.info("B04 前置失败，跳过后续断言", String(b4Set.e ?? b4Set.v));
+      }
     }
 
     if (b4Captured && b4Ready) {
@@ -2282,7 +2311,11 @@ export function deactivate() { live = false; }
       b4Collectors = true;
       const b4Greet2 = await c.ev(`window.__b4Greet ?? null`);
       r.check("第二次 reload 也截住了问候回调", true, !!b4Greet2?.cb);
-      if (b4Greet2?.cb) {
+      const b4Active2 = await b4EnsureActive();
+      b4Activated = !!b4Active2?.ok;
+      r.check("STATUS_B 第二次激活完成（10s 内）", true, b4Activated);
+      if (!b4Activated) r.info("STATUS_B 第二次未激活", String(b4Active2?.e ?? "unknown"));
+      if (b4Greet2?.cb && b4Activated) {
         await statusCall(STATUS_B, "clear");
         await waitStatusSlot();
         await c.ev(`(() => { window.__b4Greet.cb(); return true; })()`);
@@ -2309,7 +2342,7 @@ export function deactivate() { live = false; }
         .send("Page.removeScriptToEvaluateOnNewDocument", { identifier: b4InjectionId })
         .catch(() => undefined);
     }
-    if (b4Collectors) await statusCall(STATUS_B, "clear").catch(() => undefined);
+    if (b4Collectors && b4Activated) await statusCall(STATUS_B, "clear").catch(() => undefined);
   }
 
   // 收尾：改回原清单、撤销授权。fixture 目录**留到 finally 再删** —— 组尾就删会让
