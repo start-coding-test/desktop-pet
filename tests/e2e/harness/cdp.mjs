@@ -143,8 +143,25 @@ export async function attach(port, match, timeoutMs = 90_000) {
 function announceSummary(title, pass, fail, failures) {
   if (process.env.GITHUB_ACTIONS !== "true") return;
   const esc = (s) => String(s).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
-  const msg = `${title} | ${pass} passed, ${fail} failed` + (failures.length ? ` | 失败项: ${failures.slice(0, 8).join(" ; ")}` : "");
+  // 失败项带「期望/实得」原文（每条截 240 字），评审方经公开 API 就能读到 FAIL 断言，不必再向执行者要日志
+  const cut = (s) => (String(s).length > 240 ? String(s).slice(0, 240) + "…" : String(s));
+  const msg = `${title} | ${pass} passed, ${fail} failed` + (failures.length ? ` | 失败项: ${failures.slice(0, 8).map(cut).join(" ; ")}` : "");
   console.log(`::${fail ? "error" : "notice"} title=E2E 汇总::${esc(msg)}`);
+}
+
+/**
+ * 套件中途抛错（没走到 summary）时也留一条注解：套件标题 + 错误首段。
+ * 只在 GITHUB_ACTIONS=true 时挂；不改变进程退出行为，原异常照常抛出。
+ */
+function announceCrash(title, err) {
+  if (process.env.GITHUB_ACTIONS !== "true") return;
+  try {
+    const esc = (s) => String(s).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+    const text = String(err?.stack ?? err?.message ?? err).slice(0, 1500);
+    console.log(`::error title=E2E 崩溃::${esc(`${title} | 套件未跑完 | ${text}`)}`);
+  } catch {
+    /* 注解失败不影响原异常 */
+  }
 }
 
 /** 断言收集器：全部跑完再统一报告，非零退出码反映给 CI/npm */
@@ -153,6 +170,14 @@ export function createReport(title) {
   let fail = 0;
   const failures = [];
   console.log(`\n=== ${title} ===`);
+  let crashHooked = false;
+  const hookCrash = () => {
+    if (crashHooked || process.env.GITHUB_ACTIONS !== "true") return;
+    crashHooked = true;
+    // Monitor 事件只观察、不接管：原异常的栈输出与退出码保持不变（unhandledRejection 也会转成它）
+    process.once("uncaughtExceptionMonitor", (err) => announceCrash(title, err));
+  };
+  hookCrash();
   return {
     group: (name) => console.log(`\n-- ${name}`),
     check(label, want, got) {
@@ -161,7 +186,7 @@ export function createReport(title) {
       if (ok) pass++;
       else {
         fail++;
-        failures.push(label);
+        failures.push(`${label} — 期望 ${JSON.stringify(want)}，实得 ${JSON.stringify(got)}`);
       }
     },
     info: (label, value) => console.log(`  · ${label}: ${value}`),
