@@ -4,7 +4,7 @@
 //   1) hook 分支 —— 真的用 exe 跑一次 `--pet-hook <phase>`，验证 stdin 落成一行 JSONL；
 //   2) 采集→归一化→宠物 —— 往收件目录追加事件，断言宠物动作、台词、总线 topic 与去重。
 // 不依赖 petdex，也不需要 Qoder 真跑起来：事件是按其 hook 形状直接造的。
-import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { argv, env } from "node:process";
@@ -590,6 +590,63 @@ try {
   );
   r.info("清场用的 停用→激活 结果", await restartPlugin());
 
+  // A07/M6：上面那组杀不掉「删掉 `seenCounter` 单调门」这个变异（A04 批 1 实测 survived）。
+  // 原因有两条，这一组把它们逐一堵死：
+  // ① 陈旧那条与插件当时那行文案可能**逐字相同**，于是被限频器自己的相等早退吞掉（`status-line.js` 的
+  //    `if (text === lastSent) return;`）⇒ 这里给陈旧那条一个**真实链路造不出来的专属步数 88**，
+  //    并先打一条 primer 把 `lastSent` 钉成别的；
+  // ② 判据读的是「宿主收到什么」，一旦两条注入都落进同一个 1 秒合并窗口，后写的待发值会盖掉前一条 ⇒
+  //    这里靠**开场重启**让 pacer 是新对象（`activate()` 里重建，`lastSentAt = -Infinity`、待发位空），
+  //    于是每条被门放行的注入都走 `syncStatus({ immediate: true })` 当场发出（`index.js` 的 onState 末尾），
+  //    合并窗口遮不住它 —— 全程不 sleep。
+  r.group("陈旧 counter 的广播：即时通路下也被插件自己的门吞掉（A07/M6 补强）");
+  const m6Restart = await restartPlugin();
+  const m6TailAfterRestart = await c.ev(
+    `(() => { const s = window.__pet.status; for (let i = s.length - 1; i >= 0; i--) if (s[i][0] === ${JSON.stringify(AGENT_ID)}) return s[i][1] === null; return false; })()`,
+  );
+  const m6Seen = await c.ev(
+    `(window.__topics.slice().reverse().find(([k, p]) => k === 'host-state' && typeof p.counter === 'number')?.[1].counter ?? 0)`,
+  );
+  // primer：把「插件已见过的最大 counter」抬到 m6Seen+1，并把 `lastSent` 钉成一条已知文案，
+  // 于是后面那条陈旧注入（同样 counter=m6Seen+1）既会被门判成陈旧、又不会与 lastSent 逐字相等。
+  // 它也顺手证明「这个通道此刻能把一条广播送到常驻行上」，所以下面那条对照的红才是判据的红。
+  await injectState({ state: "running", counter: m6Seen + 1, steps: 1, agent: "qoder" });
+  const m6Primer = await waitUntil(
+    c,
+    `(() => { const s = window.__pet.status; for (let i = s.length - 1; i >= 0; i--) if (s[i][0] === ${JSON.stringify(AGENT_ID)}) return String(s[i][1] ?? '').includes('1步'); return false; })()`,
+    12_000,
+  );
+  r.check(
+    "前提：开场重启落定、读到数字 counter、primer 已点亮（即时通路与待发位为空由「刚重建的 pacer」保证）",
+    "ok|true|true",
+    [String(m6Restart), String(typeof m6Seen === "number"), String(m6Primer === true)].join("|"),
+  );
+  // 「重启后最后一条是不是清除」不当判据、只当观测：设置页那条 `sync` 会在重新挂载时戳一次
+  // `syncStatus({immediate:true})`，那一行落在哪儿是可查的，但不该把下面的计数判据绑死在它上面。
+  r.info("M6 开场重启后的尾部状态（观测，不判）", m6TailAfterRestart);
+  const m6Mark = await ourStatusCalls();
+  // 陈旧：counter 不前进（等于 primer 刚设的上界），但状态翻到 needs_input ⇒ 若门被删，它必然当场发出
+  await injectState({ state: "needs_input", counter: m6Seen + 1, steps: 88, agent: "qoder" });
+  // 对照：counter 前进一格 ⇒ 必须点亮，兼作 Worker FIFO 的回路屏障（不靠 sleep 证明「上一条已经走完」）
+  await injectState({ state: "running", counter: m6Seen + 2, steps: 89, agent: "qoder" });
+  const m6LitUp = await waitUntil(
+    c,
+    `(() => { const s = window.__pet.status; for (let i = s.length - 1; i >= 0; i--) if (s[i][0] === ${JSON.stringify(AGENT_ID)}) return String(s[i][1] ?? '').includes('89步'); return false; })()`,
+    12_000,
+  );
+  r.check("对照：同一条通道送来更新的 counter 且状态不同时确实点亮（证明下一条不是空判）", true, m6LitUp);
+  const m6Slice = (await statusLog()).slice(m6Mark);
+  r.check(
+    "陈旧 counter 且状态不同的广播被门吞掉：即时通路下新增恰为对照那一条，切片里从没出现过 88步 与等你确认",
+    `false|false|1`,
+    [
+      String(m6Slice.some(([, t]) => String(t ?? "").includes("88步"))),
+      String(m6Slice.some(([, t]) => String(t ?? "").includes("等你确认"))),
+      String(m6Slice.filter(([, t]) => t !== null).length),
+    ].join("|"),
+  );
+  r.info("M6 组尾清场用的 停用→激活 结果", await restartPlugin());
+
   r.group("failed：工具失败 → petdex 的 failed 并带上工具名");
   emitPhase("tool-failure", { tool_name: "cargo test" });
   r.check("宠物收到 failed", true, await waitUntil(c, `window.__pet.acts.includes('failed')`, 15_000));
@@ -632,6 +689,60 @@ try {
   const viewOn = await lastView();
   r.check("下发给 badge/设置页的数据里没有 title/detail 字段", [], Object.keys(viewOn ?? {}).filter((k) => k === "title" || k === "detail"));
   r.check("老开关开着也没让那两串进到插件这一层", false, JSON.stringify(viewOn ?? "").includes("abc123"));
+  // A07/M1：上面那两条「不含口令」杀不掉「把标题接进状态行」这个变异 —— 隐私组这两条事件
+  // （user-prompt / pre）都映射到 running，而 `publish()` 只在**汇总状态变化**时才广播
+  // （`src-tauri/src/services/agent/state.rs:232-241`），标题压根没进过插件（A04 的 M1 正是这样活下来的）。
+  // 所以这里追加一次**真实状态翻转**再判一遍：`approval-request` 映射 needs_input（同文件 :68-79），
+  // 与翻转前的 running 必然不同 ⇒ 一定广播，而广播里带着 `active_summary()` 的 title（:205/:247）。
+  const beforeFlip = await ourLastLine();
+  const stateBeforeFlip = await c.ev(
+    `(window.__topics.slice().reverse().find(([k, p]) => k === 'host-state' && typeof p.state === 'string')?.[1].state ?? null)`,
+  );
+  emitPhase("approval-request", { tool_name: "Bash" });
+  const titleBroadcast = await waitUntil(
+    c,
+    `(() => window.__topics.some(([k, p]) => k === 'host-state' && typeof p.title === 'string' && p.title.includes('abc123')))()`,
+    12_000,
+  );
+  r.check(
+    "前提：追加一次真实状态翻转后 agent:state 的广播里确实带了那句会话标题（读不到就是空判）",
+    // 三件事一起钉：翻转目标状态与翻转前确实不同、广播里读到了带口令的标题、翻转前手上确实挂着一条非空常驻行
+    "true|true|true",
+    [
+      String(stateBeforeFlip !== "needs_input"),
+      String(titleBroadcast === true),
+      String(typeof beforeFlip === "string" && beforeFlip.length > 0),
+    ].join("|"),
+  );
+  await waitStatusSlot(); // 台词会占槽 3.6s（needs_input 那句「这边需要你确认一下」），不等就读到的是台词
+  const onAfterFlip = await bubbleVsOurs();
+  r.check(
+    "真实状态翻转之后，常驻行仍不含会话标题那串口令",
+    false,
+    String(onAfterFlip.last ?? "").includes("abc123"),
+  );
+  r.check(
+    "真实状态翻转之后，常驻行仍不含命令摘要那串口令",
+    false,
+    String(onAfterFlip.last ?? "").includes("abc123-inner"),
+  );
+  const viewAfterFlip = await lastView();
+  r.check(
+    "真实状态翻转之后，下发给 badge/设置页的数据里仍不存在 title/detail 键",
+    [],
+    Object.keys(viewAfterFlip ?? {}).filter((k) => k === "title" || k === "detail"),
+  );
+  // 组尾把状态轨迹还原成 running（后面几组按 running 走），并清掉 M1 变异可能留下的标题残留。
+  // 只做恢复、不新增判据：恢复没落定会被后面那组自己的前置判红，不在这里充数。
+  emitPhase("post", { tool_name: "Bash" });
+  r.info(
+    "M1 组尾恢复到 running 的结果",
+    await waitUntil(
+      c,
+      `(() => { const s = window.__pet.status; for (let i = s.length - 1; i >= 0; i--) if (s[i][0] === ${JSON.stringify(AGENT_ID)}) return String(s[i][1] ?? '').includes('正在执行'); return false; })()`,
+      12_000,
+    ),
+  );
   r.check(
     "升级不动用户配置：事件跑完之后存储文件字节一致",
     true,
@@ -738,12 +849,24 @@ try {
     .map((f) => stripComments(readFileSync(join(PLUGINS_DIR, AGENT_ID, f), "utf8")))
     .join("\n");
   r.check("插件代码（剥掉注释后）里不再出现 overlay 字样", false, /overlay/i.test(codeOnly));
-  // 补充判据（不替换上面那条）：调用面一个都不许留 —— API、三个宿主命令、以及 "overlay" 这个区名
+  // 补充判据（不替换上面那条）：调用面一个都不许留 —— API、三个宿主命令、以及 "overlay" 这个区名。
+  // A07 追加后三项（表内追加，判据名与期望值不变）：A04 批 1 的 M3a 写的是可选链
+  // `await ctx?.overlay?.show?.({…})`，老的六项 needle 全都不含可选链写法 ⇒ 那条判据当年是绿的
+  // （A04-D14 因此只能按「1/2 条静态判据红」裁定）。补上三种可选链写法后，同一变异两条静态判据都红。
   r.check(
     "插件代码里没有任何 overlay 调用面（API / 三个宿主命令 / overlay 区名）",
     [],
-    ["ctx.overlay", "overlay_show", "overlay_destroy", "overlay_list", 'region === "overlay"', "'overlay'"]
-      .filter((needle) => codeOnly.includes(needle)),
+    [
+      "ctx.overlay",
+      "overlay_show",
+      "overlay_destroy",
+      "overlay_list",
+      'region === "overlay"',
+      "'overlay'",
+      "ctx?.overlay",
+      "overlay?.show",
+      "?.show?.?",
+    ].filter((needle) => codeOnly.includes(needle)),
   );
 
   r.group("销毁别人那扇窗，不影响本插件的常驻行");
@@ -1806,6 +1929,41 @@ try {
     "整轮跑完之后存储仍是预置那一份字节（插件一次都没写它）",
     true,
     legacySeed.read() === seededBytes,
+  );
+  // A07/M9（按 `#D-FIX` A07-D3 选 A 改成**静态源码判据**）：运行时那两条摘干净，不留观测。
+  // 原因如实记：我对 `window.__TAURI_INTERNALS__.invoke` 的重新赋值在该 realm 静默无效
+  // （正式轮 run 39454676546 实测 `__invokeLog` 一条都没记到，连套件自己打的 plugins_list 都没进），
+  // 留着它只会得到一条「空数组等于 []」的空判绿。
+  // 实质换过一茬，写清楚：静态判据管得住「这个插件的源码里没有任何存储调用面」，
+  // **管不住**运行时绕过 JS 桥另寻途径写存储（同 realm 直接 invoke，或宿主代写）—— 那条路径本卡不覆盖。
+  const m9Manifest = JSON.parse(readFileSync(join(PLUGINS_DIR, AGENT_ID, "manifest.json"), "utf8"));
+  const m9Files = [
+    ...new Set(
+      [m9Manifest.entry, m9Manifest.widget, ...readdirSync(join(PLUGINS_DIR, AGENT_ID)).filter((f) => f.endsWith(".js"))].filter(
+        (f) => typeof f === "string",
+      ),
+    ),
+  ];
+  const m9Stripped = m9Files.map((f) => stripComments(readFileSync(join(PLUGINS_DIR, AGENT_ID, f), "utf8")));
+  // 匹配面用「子串」而不是 `\bstorage\b`：A04 的 M3a 就是因为 needle 少了可选链写法而漏。
+  // `storage` 这个子串把 `ctx.storage` / `storage?.x` / `storage[x]` / `{ storage }` / `storage:`
+  // 全覆盖（当前 HEAD 剥注释后零命中，所以不会因为宽而在干净码上误伤），再加两个宿主命令名。
+  const m9Find = (text) => ["storage", "store_get", "store_set"].filter((needle) => text.includes(needle));
+  const m9Synthetic =
+    'await ctx.storage.get("config").then((c) => c && ctx.storage.set("config", c));';
+  r.check(
+    "前提：M9 静态源码判据不空判（按 manifest 枚举到 js、每份剥注释后非空、同一匹配函数喂 M9 合成串必命中）",
+    "true|true|true",
+    [
+      String(m9Files.length > 0 && m9Files.includes(m9Manifest.entry) && m9Files.includes(m9Manifest.widget)),
+      String(m9Stripped.every((s) => s.trim().length > 0)),
+      String(m9Find(m9Synthetic).length > 0),
+    ].join("|"),
+  );
+  r.check(
+    "M9 静态源码判据：本插件被 manifest 引用的每一份 js（剥注释后）都不含任何存储调用面（storage / store_get / store_set）",
+    [],
+    m9Files.flatMap((f, i) => m9Find(m9Stripped[i]).map((needle) => `${f}:${needle}`)),
   );
 
   r.group("收尾前的完整性");
