@@ -568,22 +568,23 @@ try {
   const injectState = (payload) =>
     c.ev(`(async () => { const { bus } = await import('/src/runtime/event-bus.ts'); bus.inject('agent:state', ${JSON.stringify(payload)}); return true; })()`);
   await injectState({ state: "running", counter: lastSeenCounter, steps: 42, agent: "qoder" });
-  await sleep(1_500);
-  r.check(
-    "陈旧 counter 的广播被插件自己的门吞掉：行没被点亮、步数也没跟进",
-    `null|${nonNullBefore}`,
-    `${await ourTail()}|${(await statusLog()).filter(([p, t]) => p === AGENT_ID && t !== null).length}`,
-  );
-  // 正向对照：同一条通道给一个更新的 counter，行必须点亮。没有这条，上一条可能只是「通道根本没通」。
-  // 对照会把 seenCounter 抬到 lastSeenCounter+1，宿主的下一个真实广播正好是这个值 ⇒ 会被这道门吞掉一次，
-  // 所以判完立刻 restartPlugin 清场（activate 把 seenCounter 复位到 -1），不把污染带到后面的组。
-  await injectState({ state: "needs_input", counter: lastSeenCounter + 1, steps: 43, agent: "qoder" });
+  // 正向对照兼作**屏障**：Worker 的消息是 FIFO，等这条真点亮了，上一条「本该被门吞掉的」也就走完了
+  // 整条回路 —— 于是「没点亮」这个结论不靠 sleep 猜时间。（对照会把 seenCounter 抬到
+  // lastSeenCounter+1，宿主下一个真实广播正好是这个值 ⇒ 会被吞一次，所以判完立刻清场。）
+  await injectState({ state: "needs_input", counter: lastSeenCounter + 1, steps: 77, agent: "qoder" });
   const litUp = await waitUntil(
     c,
     `(() => { const s = window.__pet.status; for (let i = s.length - 1; i >= 0; i--) if (s[i][0] === ${JSON.stringify(AGENT_ID)}) return String(s[i][1] ?? '').includes('等你确认'); return false; })()`,
     12_000,
   );
-  r.check("对照：同一条通道送来更新的 counter 时确实点亮（证明上一条不是空判）", true, litUp);
+  r.check("对照：同一条通道送来更新的 counter 时确实点亮（证明下一条不是空判，兼作回路屏障）", true, litUp);
+  const staleLeaked = (await statusLog()).some(([p, t]) => p === AGENT_ID && String(t ?? "").includes("42步"));
+  const grewTo = (await statusLog()).filter(([p, t]) => p === AGENT_ID && t !== null).length;
+  r.check(
+    "陈旧 counter 的广播被插件自己的门吞掉：记录里没出现过那次注入的 42 步，宿主也只被戳了对照那一次",
+    `false|${nonNullBefore + 1}`,
+    `${staleLeaked}|${grewTo}`,
+  );
   r.info("清场用的 停用→激活 结果", await restartPlugin());
 
   r.group("failed：工具失败 → petdex 的 failed 并带上工具名");
