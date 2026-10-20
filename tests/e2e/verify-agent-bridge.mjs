@@ -16,6 +16,7 @@ import {
   listPages,
   openSettingsInvoker,
   readEnabledIds,
+  reconcilePetWindow,
   reloadAndWait,
   waitForPage,
   waitUntil,
@@ -117,6 +118,8 @@ let pumpDone = null;
 let legacySeed = null;
 /** 隐身判据把宠物窗藏起来了：中途抛错也得在 finally 里放回来，不能让用户桌上一片空白 */
 let petHidden = false;
+/** 为「页面侧坐标取证」临时启用了心率插件：收尾必须按 origEnabled 还原 */
+let hrTempEnabled = false;
 const grantedCaps = [];
 const consentPump = makeConsentPump(grantedCaps);
 
@@ -410,22 +413,6 @@ try {
       return true;
     })()`),
   );
-  // 旧配置得真的「被激活看见一次」：已在跑的插件再调一次 activatePlugin 是空转，所以这里显式走
-  // 一轮 停用 → 再激活 —— 这一轮跑在预置之后的盘上，后面那条「预置开着也不下发」才不是判在
-  // 一个没重读过配置的实例上。**必须排在截获之后**：`activate()` 末尾那句状态文案是
-  // 「activate 计数器是活的」那条前提的观测对象，装在截获之前计数器就一直是 0，那条判据会空红。
-  r.check(
-    "预置之后重新走了一轮停用 → 激活（旧配置确实被 activate 看过一次）",
-    true,
-    await c.ev(`(async () => {
-      const rt = await import('/src/runtime/plugin-runtime.ts');
-      await rt.deactivatePlugin(${JSON.stringify(AGENT_ID)});
-      const manifests = await window.__TAURI_INTERNALS__.invoke('plugins_list');
-      const manifest = manifests.find((m) => m.id === ${JSON.stringify(AGENT_ID)});
-      await rt.activatePlugin(manifest);
-      return rt.isActive(${JSON.stringify(AGENT_ID)});
-    })()`),
-  );
   const acts = () => c.ev(`window.__pet.acts.slice()`);
   const said = () => c.ev(`window.__pet.said.slice()`);
   /** 本体控制器收到过的常驻行设置记录：[[pluginId, text|null], …]（按发生顺序） */
@@ -456,6 +443,31 @@ try {
       `(() => { const b = document.getElementById('pet-bubble'); return !b.classList.contains('show') || b.classList.contains('status'); })()`,
       8_000,
     ).catch(() => false);
+
+  /** 真把插件的 JS 生命周期走一遍「停用 → 再激活」：
+   *  「写启停清单」只驱动 Rust 侧 reconcile，宠物窗的 JS 不在这条路上（`watchEnabled` 只缓存，
+   *  reconcile 仅在启动与 host:plugin-toggled 时跑 —— 这段教训就写在 verify-isolation 的 B3 组），
+   *  所以判 `deactivate()` 有没有摘掉自己那行必须用这条通路。返回停用/激活是否按预期落定。 */
+  const restartPlugin = () =>
+    c.ev(`(async () => {
+      const rt = await import('/src/runtime/plugin-runtime.ts');
+      const manifests = await window.__TAURI_INTERNALS__.invoke('plugins_list');
+      const manifest = manifests.find((m) => m.id === ${JSON.stringify(AGENT_ID)});
+      if (!manifest) return "没扫到插件";
+      await rt.deactivatePlugin(${JSON.stringify(AGENT_ID)});
+      const off = rt.isActive(${JSON.stringify(AGENT_ID)}) === false;
+      await rt.activatePlugin(manifest);
+      return off && rt.isActive(${JSON.stringify(AGENT_ID)}) ? "ok" : \`停用/激活没落定 off=\${off}\`;
+    })()`);
+  // 旧配置得真的「被激活看见一次」：已在跑的插件再调一次 activatePlugin 是空转，所以这里显式走
+  // 一轮 停用 → 再激活 —— 这一轮跑在预置之后的盘上，后面那条「预置开着也不下发」才不是判在
+  // 一个没重读过配置的实例上。**必须排在截获之后**：`activate()` 末尾那句状态文案是
+  // 「activate 计数器是活的」那条前提的观测对象，装在截获之前计数器就一直是 0，那条判据会空红。
+  r.check(
+    "预置之后重新走了一轮停用 → 激活（旧配置确实被 activate 看过一次）",
+    "ok",
+    await restartPlugin(),
+  );
 
   /**
    * 等某个能力真的被授权。插件在 activate 时第一次 publish、第一次 react 各自会弹一个
@@ -529,7 +541,7 @@ try {
   const waitOurClear = (timeoutMs = 9_000) =>
     waitUntil(c, `(() => { const s = window.__pet.status; for (let i = s.length - 1; i >= 0; i--) if (s[i][0] === ${JSON.stringify(AGENT_ID)}) return s[i][1] === null; return false; })()`, timeoutMs).catch(() => false);
 
-  r.group("一轮结束：常驻行留一会儿就清掉，迟到的 post 不再把它点亮");
+  r.group("一轮结束：常驻行留一会儿就清掉，陈旧 counter 不再把它点亮");
   emitPhase("post", { tool_name: "Bash" }); // 比 stop 晚到，属于常态
   await sleep(2000);
   r.check(
@@ -541,10 +553,38 @@ try {
   // 同一实质落在常驻行上 —— 被清成 null（取代者：B3 的清除语义 + 插件的收尾定时器）
   r.check("轮结束后常驻行被清成 null（收起的实质搬到这里）", true, await waitOurClear());
   const nonNullBefore = (await statusLog()).filter(([p, t]) => p === AGENT_ID && t !== null).length;
-  emitPhase("post", { tool_name: "Edit" }); // 又一个迟到的
-  await sleep(2_000);
-  r.check("迟到的事件没有把行重新点亮：最后一次仍是清除", null, await ourTail());
-  r.check("迟到的事件期间没有新增非空的常驻行设置", nonNullBefore, (await statusLog()).filter(([p, t]) => p === AGENT_ID && t !== null).length);
+  // 「迟到的信息不许把已结束的会话重新点亮」这句实质，原来我是靠再发一条 post 来测 —— 错了：
+  // 宿主的 `STOP_GRACE` 只有 2 秒（`src-tauri/src/services/agent/state.rs:50`，:165 用它实现
+  // 「post 比 stop 晚到属常态，不打回 running」，`grace_tests.rs` 的
+  // `straggler_post_does_not_reopen_a_stopped_session` 钉的就是这 2 秒），而本组等「行被清成 null」
+  // 已经过了插件收尾的 3 秒 —— 那时再发 post，宿主按设计把它当**新一轮活动**（state_for_event("post")
+  // = running，:68-71），插件如实点亮。上面那条 grace 之内的迟到 post 已经把成立的那半句判掉了。
+  // 剩下真正属于插件自己的是 `seenCounter` 这道门，而宿主的 counter 单调递增、真实链路造不出回退，
+  // 所以用运行时**既有**的注入入口造一条陈旧广播：`src/runtime/event-bus.ts` 的 `inject`
+  // （`plugin-runtime.ts:363` 收 Rust 原生事件走的就是它，verify-isolation.mjs 也早已在用）。
+  const lastSeenCounter = await c.ev(
+    `(window.__topics.slice().reverse().find(([k, p]) => k === 'host-state' && typeof p.counter === 'number')?.[1].counter ?? 0)`,
+  );
+  const injectState = (payload) =>
+    c.ev(`(async () => { const { bus } = await import('/src/runtime/event-bus.ts'); bus.inject('agent:state', ${JSON.stringify(payload)}); return true; })()`);
+  await injectState({ state: "running", counter: lastSeenCounter, steps: 42, agent: "qoder" });
+  await sleep(1_500);
+  r.check(
+    "陈旧 counter 的广播被插件自己的门吞掉：行没被点亮、步数也没跟进",
+    `null|${nonNullBefore}`,
+    `${await ourTail()}|${(await statusLog()).filter(([p, t]) => p === AGENT_ID && t !== null).length}`,
+  );
+  // 正向对照：同一条通道给一个更新的 counter，行必须点亮。没有这条，上一条可能只是「通道根本没通」。
+  // 对照会把 seenCounter 抬到 lastSeenCounter+1，宿主的下一个真实广播正好是这个值 ⇒ 会被这道门吞掉一次，
+  // 所以判完立刻 restartPlugin 清场（activate 把 seenCounter 复位到 -1），不把污染带到后面的组。
+  await injectState({ state: "needs_input", counter: lastSeenCounter + 1, steps: 43, agent: "qoder" });
+  const litUp = await waitUntil(
+    c,
+    `(() => { const s = window.__pet.status; for (let i = s.length - 1; i >= 0; i--) if (s[i][0] === ${JSON.stringify(AGENT_ID)}) return String(s[i][1] ?? '').includes('等你确认'); return false; })()`,
+    12_000,
+  );
+  r.check("对照：同一条通道送来更新的 counter 时确实点亮（证明上一条不是空判）", true, litUp);
+  r.info("清场用的 停用→激活 结果", await restartPlugin());
 
   r.group("failed：工具失败 → petdex 的 failed 并带上工具名");
   emitPhase("tool-failure", { tool_name: "cargo test" });
@@ -597,6 +637,15 @@ try {
   r.group("悬浮窗按插件分开：心率那扇照旧，本插件一扇都不开");
   const HR_ID = "com.pet.hr-ble";
   const HR_LABEL = overlayLabelFor(HR_ID);
+  // 页面侧取证要求心率真在跑：overlay 页的 sync 会自我关闭「不在启停清单里」的插件的窗
+  // （上一轮 3&4 两条红就是取到 null —— 窗在、坐标对，页面不在）。isolation 那组在开窗前也有
+  // 同样一段 owner 前置。这里临时把它加进清单，组尾摘掉，finally 再按 origEnabled 兜一次。
+  hrTempEnabled = true;
+  await writeEnabledIds(settings.invoke, [...new Set([...origEnabled, AGENT_ID, HR_ID])]);
+  // 从设置窗写的清单不会自己通知宠物窗（harness 的 reconcilePetWindow 就是补这一步的既有入口，
+  // 它内部按 enabled 逐个 activate/deactivate）；不 reconcile，心率插件在本窗根本没跑起来。
+  await reconcilePetWindow(c);
+  r.check("前置：心率插件已临时进启停清单（它的 overlay 页才不会自我关闭）", true, (await readEnabledIds(invoke)).includes(HR_ID));
   // 直接打宿主命令：验的是「窗口按插件分开」这条宿主规则本身，不依赖蓝牙硬件。
   // S3 之后 overlay_* 在 Rust 侧查 overlay 授权，先走真实同意框把能力要到。
   // permission_request 会阻塞到有人应答，而 CDP 的 evaluate 有 20 秒硬超时 ——
@@ -640,10 +689,17 @@ try {
     !!hrDefault.v && !!hrMoved.v && JSON.stringify(hrDefault.v) !== JSON.stringify(hrMoved.v),
   );
   // 页面侧再对一次坐标：window.screenX/screenY 是 CSS（逻辑）像素，与上面那条物理像素的
-  // outer_position 互为独立证据（同一 DPI 前提下不需要额外 capability）
-  const hrGeo = await withOverlayPageFor(HR_ID, (oc) =>
-    oc.ev(`[window.screenX, window.screenY, window.outerWidth, window.outerHeight]`),
-  );
+  // outer_position 互为独立证据（同一 DPI 前提下不需要额外 capability）。
+  // 页面可能刚被 reconcile 起来，用有界轮询等它可连（沿用本套件既有 overlayMounted 的轮询写法）；
+  // 取不到就直接红在下一条前置上，不许让下面两条判据拿 null 空判（上一轮就是这么红得莫名其妙）。
+  let hrGeo = null;
+  for (let i = 0; i < 20 && !hrGeo; i++) {
+    hrGeo = await withOverlayPageFor(HR_ID, (oc) =>
+      oc.ev(`[window.screenX, window.screenY, window.outerWidth, window.outerHeight]`),
+    );
+    if (!hrGeo) await sleep(500);
+  }
+  r.check("前置：心率那扇 overlay 页可连（取不到页面就直接红，不让下面两条空判）", true, !!hrGeo);
   r.check(
     "窗按请求坐标落座（逻辑像素不经换算就是 screenX/screenY）",
     true,
@@ -663,10 +719,28 @@ try {
   // 后者正是「代码不再调用但窗还留着」这种实现能蒙过去的地方
   const ghostWindow = await invoke("plugin:window|is_visible", { label: OVERLAY_LABEL });
   r.check("按标签查本插件那扇窗：查无此窗", false, ghostWindow.ok === true && ghostWindow.v === true);
-  const pluginSrc = ["index.js", "widget.js", "status-line.js"]
-    .map((f) => readFileSync(join(PLUGINS_DIR, AGENT_ID, f), "utf8"))
+  const pluginSrcFiles = ["index.js", "widget.js", "status-line.js"];
+  // 口径（A04-D9 第 3 条）：**先剥注释**再对三份源码测 `/overlay/i` —— 代码里任何 overlay 字样仍然会红，
+  // 而写在注释里那些「overlay 状态卡已删」的说明文字不算。上一轮这条红就是被自己的注释咬到的。
+  // 剥法只处理成行注释与块注释（本插件的注释都是整行的）；不做词法分析，所以宁可少剥不可多剥：
+  // 少剥只会把代码里的字样判成红（严），多剥才会放过残留（松）。
+  const stripComments = (s) =>
+    s
+      .replace(/\/\*[\s\S]*?\*\//g, " ")
+      .split("\n")
+      .filter((line) => !/^\s*\/\//.test(line))
+      .join("\n");
+  const codeOnly = pluginSrcFiles
+    .map((f) => stripComments(readFileSync(join(PLUGINS_DIR, AGENT_ID, f), "utf8")))
     .join("\n");
-  r.check("插件源码里不再出现 overlay 这个词（没有藏在别的调用面上的残留）", false, /overlay/i.test(pluginSrc));
+  r.check("插件代码（剥掉注释后）里不再出现 overlay 字样", false, /overlay/i.test(codeOnly));
+  // 补充判据（不替换上面那条）：调用面一个都不许留 —— API、三个宿主命令、以及 "overlay" 这个区名
+  r.check(
+    "插件代码里没有任何 overlay 调用面（API / 三个宿主命令 / overlay 区名）",
+    [],
+    ["ctx.overlay", "overlay_show", "overlay_destroy", "overlay_list", 'region === "overlay"', "'overlay'"]
+      .filter((needle) => codeOnly.includes(needle)),
+  );
 
   r.group("销毁别人那扇窗，不影响本插件的常驻行");
   const beforeDestroy = await bubbleVsOurs();
@@ -1147,11 +1221,19 @@ try {
       ),
     );
     await writeEnabledIds(settings.invoke, disabledIds);
+    // 宠物窗不会收到 host:plugin-toggled（脚本是从设置窗写的），所以 JS 生命周期得靠既有入口
+    // reconcile 一下 —— `rt.reconcile` 内部就是对未启用者调 `deactivatePlugin`、对启用者调
+    // `activatePlugin`（plugin-runtime.ts:333-348）。上一轮 6&7 两条红就是漏了这一步：
+    // Rust 侧 reconcile 把 hook 条目卸干净了（下面那条绿），但宠物窗里的 JS 还活着。
+    await reconcilePetWindow(c);
     r.check("停用插件后自家条目归零", [0, 0], [ours(cfgA), ours(cfgB)]);
     r.check("停用插件不动用户自己的 hook 条目", foreignBeforeToggle, `${foreignOf(cfgA)}|${foreignOf(cfgB)}`);
     r.check("停用不清空 agent 字段（再启用全靠它恢复）", "qoder", agentField());
-    // 原「停用后 overlay.destroy()」的实质（插件下线就别把东西留在桌面上）搬到常驻行上：
-    // deactivate 里那一次 setStatus(null) 是插件自己摘的，宿主那条 5 秒兜底在 B3 的套件里
+    // 原「停用后 overlay.destroy()」的实质（插件下线就别把东西留在桌面上）搬到常驻行上。
+    // 归因要说清（A04-D9 第 4 条）：这条读的是**记录**（控制器被调用），不是气泡现状；但宿主在
+    // disposeAll 的 register 回调与 worker terminate 收尾里还各兜底一次（bridge.ts / worker-plugin-host.ts:118），
+    // 三个来源在同一个记录点上不可区分 ⇒ 真正把 M2（结束/停用不清 null）钉死的是上面那条
+    // 「会话结束后常驻行清成 null」—— 那条时刻宿主没有任何兜底通路。这里只作第二证。
     r.check("停用插件时把自家那条常驻行摘掉（最后一次 set 是 null）", null, await ourTail());
     await waitStatusSlot();
     const afterOff = await bubbleNow();
@@ -1170,6 +1252,8 @@ try {
     // 不先钉这条授权，下面的绿可能只是「没授权所以本来就不会装」
     r.check("再启用所需的 agent:hooks 授权仍在", true, await awaitGranted("agent:hooks"));
     await writeEnabledIds(settings.invoke, [...disabledIds, AGENT_ID]);
+    // 同一段道理：JS 侧要 reconcile 才真的再激活（`activate()` 会把 seenCounter/agentName 复位）。
+    await reconcilePetWindow(c);
     r.check("再启用后条目装回来", [perFile, perFile], [ours(cfgA), ours(cfgB)]);
     r.check("再启用同样不动别人条目", foreignBeforeToggle, `${foreignOf(cfgA)}|${foreignOf(cfgB)}`);
 
@@ -1735,6 +1819,13 @@ try {
     await hostInvoke(c)("set_pet_hidden", { hidden: false }).catch(() => undefined);
     petHidden = false;
     r.info("隐身兜底恢复", "执行了（正常路径不该走到这里）");
+  }
+  // 临时启用过心率就必须先还原清单（否则用户跑完一轮回归，桌面多了一个心率徽标）
+  if (hrTempEnabled) {
+    hrTempEnabled = false;
+    if (!settings) settings = await openSettingsInvoker(PORT, c).catch(() => null);
+    if (settings) await writeEnabledIds(settings.invoke, origEnabled).catch(() => undefined);
+    r.info("心率插件的临时启用已还原", "是");
   }
   // 本跑预置进插件存储的那份老配置：恢复成本跑之前的样子（原来不存在就删掉），不给这台机器留残file
   if (legacySeed) {
