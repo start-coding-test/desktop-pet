@@ -1,7 +1,7 @@
 {
   "id": "com.pet.agent-bridge",
   "name": "Agent 桥",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "entry": "index.js",
   "apiVersion": 2,
   "widget": "widget.js",
@@ -10,10 +10,9 @@
     "bus:subscribe",
     "storage",
     "widget",
-    "overlay",
     "pet:react",
     "pet:say",
     "agent:hooks"
   ],
-  "description": "把编码 Agent 的会话状态映射成 petdex 九状态、台词与桌面状态卡。Qoder hook 的安装/卸载在本插件的设置页（能力 agent:hooks，首次使用需同意）；会话标题与命令摘要默认不显示。"
+  "description": "把编码 Agent 的会话状态映射成 petdex 九状态、台词与本体气泡的常驻状态行（只显示 Agent、状态与步数，不含会话标题与命令内容）。Qoder hook 的安装/卸载在本插件的设置页（能力 agent:hooks，首次使用需同意）。"
 }

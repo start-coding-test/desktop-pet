@@ -22,6 +22,18 @@ const REPO = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const REGIONS = ["badge", "overlay", "settings"];
 /** 仓库自带的四个示例插件：默认全部走 Worker，所以三个区都得跑起来且不越界 */
 const REAL = ["com.pet.todo", "com.pet.agent-bridge", "com.pet.hr-ble", "com.pet.astock"];
+/**
+ * 「这个插件在这个区压根不画东西」的登记表（A9b：agent 桥头顶那张会话卡删了，
+ * widget 只分派 badge 与 settings 两个区）。
+ * 表里的组合不是「免测」，而是换成一条**反向**判据：挂上去必须零 op、零订阅、也不许报错 ——
+ * 「没有那个区」从此是可证的，而不是靠把格子删掉来承认。
+ */
+const NO_RENDER = { "com.pet.agent-bridge": ["overlay"] };
+/**
+ * 只豁免「至少一条总线订阅」的区：agent 桥的设置页数据来自宿主的 `agentHooks.status()`
+ * （能力调用），不来自 `*:widget` 总线，所以它没有订阅是设计事实；**渲染与事件回调照旧硬要求**。
+ */
+const NO_SUBSCRIBE = { "com.pet.agent-bridge": ["settings"] };
 /** 常驻基线：夹具那份是双 realm 写法，今天就该过 —— 它证明这套冒烟本身不是空转 */
 const FIXTURE_DIR = join("tests", "fixtures", "l1-probe");
 
@@ -294,15 +306,28 @@ function assertEventsRendered(r, label) {
 }
 
 /** 台账内 / 点名里的插件必须登记 BUS_POKE：没登记就意味着列表类分支从没被执行过，
- *  「冒烟绿」只覆盖了 mount 那一半 —— A10 那次存活的变异就是这么漏过去的。 */
-function assertPokeRendered(r, label) {
-  assert.ok(r.subCount > 0, `${label} 一条订阅都没有，喂不进数据`);
+ *  「冒烟绿」只覆盖了 mount 那一半 —— A10 那次存活的变异就是这么漏过去的。
+ *  `expectSub=false` 只豁免「有订阅」这半句（NO_SUBSCRIBE 表里的区），其余照旧硬要求。 */
+function assertPokeRendered(r, label, expectSub = true) {
+  if (expectSub) assert.ok(r.subCount > 0, `${label} 一条订阅都没有，喂不进数据`);
+  if (!expectSub && r.subCount === 0) return;
   assert.equal(
     r.pokeCount,
     r.subCount,
     `${label} 有 ${r.subCount - r.pokeCount} 个订阅没在 BUS_POKE 里匹配到 payload（按 topic 后缀补）`,
   );
   assert.ok(r.opsAfterPoke > r.opsBeforePoke, `${label} 喂了 payload 却没多发一条 op`);
+}
+
+/** 反向那半：登记为「这个区不画东西」的组合，必须真的零 op、零订阅、且挂载不报错 */
+function assertNoRender(r, label) {
+  assert.equal(r.bootError, null, `${label} 说不画东西，却连挂载都失败了：${r.bootError}`);
+  assert.equal(r.booted, true, `${label} 没有 booted 回执`);
+  assert.deepEqual(r.ops, [], `${label} 说好没有这个区，实得 ${r.ops.length} 条 op`);
+  assert.equal(r.subCount, 0, `${label} 说好没有这个区，却注册了 ${r.subCount} 条订阅`);
+  assert.equal(r.pokeCount, 0, `${label} 没有订阅却匹配到了喂数据`);
+  assert.deepEqual(r.badOps, [], `${label} 有 ${r.badOps.length} 条 op 过不了宿主门禁`);
+  assert.deepEqual(r.errors, [], `${label} 的回调抛出过：${r.errors.join(" / ")}`);
 }
 
 describe("常驻基线：夹具那份双 realm 写法必须跑得起来", () => {
@@ -318,14 +343,29 @@ describe("常驻基线：夹具那份双 realm 写法必须跑得起来", () => 
 describe("四个示例插件默认就跑在 Worker 里：三个区都得跑起来且不越界", () => {
   for (const id of targets()) {
     for (const region of REGIONS) {
-      it(`${id} 在 ${region} 区跑得起来且不越界`, async () => {
+      const noRender = (NO_RENDER[id] ?? []).includes(region);
+      const noSub = (NO_SUBSCRIBE[id] ?? []).includes(region);
+      it(`${id} 在 ${region} 区${noRender ? "确实不画任何东西（反向判据）" : "跑得起来且不越界"}`, async () => {
         const r = await smoke(join("plugins", id), region);
+        if (noRender) {
+          assertNoRender(r, `${id} ${region}`);
+          return;
+        }
         assertClean(r, `${id} ${region}`);
         assertEventsRendered(r, `${id} ${region}`);
-        assertPokeRendered(r, `${id} ${region}`);
+        assertPokeRendered(r, `${id} ${region}`, !noSub);
       });
     }
   }
+});
+
+it("豁免名单钉死：只许 agent-bridge 的 overlay（不画）与 settings（无总线订阅）这两项", () => {
+  const flat = (table) =>
+    Object.entries(table)
+      .flatMap(([id, regions]) => regions.map((region) => `${id}/${region}`))
+      .sort();
+  assert.deepEqual(flat(NO_RENDER), ["com.pet.agent-bridge/overlay"]);
+  assert.deepEqual(flat(NO_SUBSCRIBE), ["com.pet.agent-bridge/settings"]);
 });
 
 /**
