@@ -574,14 +574,14 @@ try {
   r.check(
     "会话进行中常驻行挂上了（本插件那条非空）",
     true,
-    await waitUntil(c, `(() => { const s = window.__pet.status; for (let i = s.length - 1; i >= 0; i--) if (s[i][0] === ${JSON.stringify(AGENT_ID)}) return s[i][1] !== null; return false; })()`, 12_000),
+    await waitUntil(c, `(() => { const s = window.__pet.status; for (let i = s.length - 1; i >= 0; i--) if (s[i][0] === ${JSON.stringify(AGENT_ID)}) return typeof s[i][1] === 'string' && s[i][1].length > 0; return false; })()`, 12_000),
   );
   await waitStatusSlot(); // 台词（上一轮的「这边需要你确认一下」）会占槽 3.6s，不等就读到的是它
   const on = await bubbleVsOurs();
   r.check(
     "气泡显示的正是本插件最近交给宿主的那一行（同一次求值里读，不赌时序）",
     true,
-    on.show === true && on.status === true && on.last !== null && on.text === on.last,
+    on.show === true && on.status === true && typeof on.last === "string" && on.last.length > 0 && on.text === on.last,
   );
   r.check("常驻行不含会话标题那串口令", false, String(on.last ?? "").includes("abc123"));
   r.check("常驻行不含命令摘要那串口令", false, String(on.last ?? "").includes("abc123-inner"));
@@ -670,7 +670,14 @@ try {
 
   r.group("销毁别人那扇窗，不影响本插件的常驻行");
   const beforeDestroy = await bubbleVsOurs();
-  r.check("前置：销毁之前本插件确实挂着一条非空的常驻行（且就显示在气泡上）", true, beforeDestroy.last !== null && beforeDestroy.text === beforeDestroy.last);
+  // 前置带**长度**判断（A04-D7 第 1 条）：只判 `!== null` 的话，万一记录点收进了被 reject 的
+  // 空串，两边都是空串就恒等 —— 那条比较就成了空判。桥目前清洗后为空会先抛（见结果文件里的
+  // 说明），这条是把「不依赖那个实现细节」写死在判据里。
+  r.check(
+    "前置：销毁之前本插件确实挂着一条非空的常驻行（且就显示在气泡上）",
+    true,
+    typeof beforeDestroy.last === "string" && beforeDestroy.last.length > 0 && beforeDestroy.text === beforeDestroy.last,
+  );
   await invoke("overlay_destroy", { pluginId: HR_ID });
   r.check("心率的窗确实被收掉了", true, await waitUntil(c, `(async () => { const l = await window.__TAURI_INTERNALS__.invoke('overlay_list'); return !l.some(([id, visible]) => id === ${JSON.stringify(HR_ID)} && visible); })()`, 12_000));
   await waitStatusSlot();
