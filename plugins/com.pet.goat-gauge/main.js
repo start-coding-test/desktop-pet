@@ -14,7 +14,7 @@ import { appendHistory } from "./history.js";
 import { buildSnapshot, maskKey } from "./normalize.js";
 import { nextDelay } from "./schedule.js";
 import { DEFAULT_CONFIG, migrate, sanitizeConfig, SCHEMA_VERSION } from "./store-schema.js";
-import { TOPIC_CMD, TOPIC_PANEL, TOPIC_STATUS, TOPIC_USAGE } from "./topics.js";
+import { TOPIC_AGENT_STATE, TOPIC_CMD, TOPIC_PANEL, TOPIC_STATUS, TOPIC_USAGE } from "./topics.js";
 import { cooldownReason, cooldownUntil, gate, resetThrottle } from "./index.js";
 
 export let ctx = null;
@@ -33,6 +33,8 @@ let timer = 0;
 let overlayChain = Promise.resolve();
 let stopped = false;
 let busy = false;
+/** 宿主 agent:state 的最近一次运行态；没有事件时保持默认间隔。 */
+let agentRunning = false;
 let noChangeCount = 0;
 let lastRefreshAt = 0;
 let viewState = "onboarding";
@@ -282,6 +284,7 @@ function scheduleNext(override) {
         noChangeCount,
         lastRefreshAt,
         authError: viewState === "auth_error",
+        agentRunning,
       },
       Date.now(),
       config,
@@ -563,11 +566,19 @@ export async function activate(context) {
   ctx = context;
   stopped = false;
   busy = false;
+  agentRunning = false;
   overlayChain = Promise.resolve();
   await restore();
   try {
     await ctx.bus.subscribe(TOPIC_CMD, (payload) => {
       void handleCmd(payload).catch((err) => status(`指令失败：${err.message}`, "error"));
+    });
+    // 精确订阅宿主公开的 agent:state；没有事件（agent 桥未启用）就保持默认间隔。
+    await ctx.bus.subscribe(TOPIC_AGENT_STATE, (payload) => {
+      const running = payload?.state === "running";
+      if (running === agentRunning) return;
+      agentRunning = running;
+      if (timer || config.demo || cred.apiKey) scheduleNext();
     });
   } catch (err) {
     ctx.log?.("订阅指令失败", err);

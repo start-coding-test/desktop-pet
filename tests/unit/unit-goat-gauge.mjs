@@ -1,5 +1,6 @@
 // com.pet.goat-gauge 纯函数单测（方案 §12.1）。
 // 只 import 不碰 ctx / 网络的模块；出网与视图在 C2 的 e2e 里验。
+import { readFileSync } from "node:fs";
 import { check, deep, eq, group } from "./harness.mjs";
 
 const { planInfo } = await import(new URL("../../plugins/com.pet.goat-gauge/plans.js", import.meta.url));
@@ -17,7 +18,12 @@ const {
 const { fmtCountdown, fmtCredits, fmtMoney, fmtPct, fmtTokens } = await import(
   new URL("../../plugins/com.pet.goat-gauge/format.js", import.meta.url)
 );
-const { nextDelay } = await import(new URL("../../plugins/com.pet.goat-gauge/schedule.js", import.meta.url));
+const { AGENT_RUNNING_REFRESH_SEC, nextDelay, scheduleBaseSec } = await import(
+  new URL("../../plugins/com.pet.goat-gauge/schedule.js", import.meta.url)
+);
+const { TOPIC_AGENT_STATE } = await import(
+  new URL("../../plugins/com.pet.goat-gauge/topics.js", import.meta.url)
+);
 const { appendHistory, bucketToLocalDay, localDayKey, samplePoint } = await import(
   new URL("../../plugins/com.pet.goat-gauge/history.js", import.meta.url)
 );
@@ -441,6 +447,31 @@ group("schedule.nextDelay");
       five_hour: { reset_at: now - 1_000 },
     }),
   );
+}
+
+group("schedule.agentState");
+{
+  const now = 1_000_000;
+  eq("running 基础 30s", 30_000, nextDelay({ agentRunning: true }, now, { refreshSec: 300 }, () => 0.5));
+  eq(
+    "running 不受无变化退避",
+    30_000,
+    nextDelay({ agentRunning: true, noChangeCount: 5 }, now, { refreshSec: 300 }, () => 0.5),
+  );
+  eq("idle 恢复默认间隔", 300_000, nextDelay({ agentRunning: false }, now, { refreshSec: 300 }, () => 0.5));
+  eq("缺省 agentRunning 保持默认", 300_000, nextDelay({}, now, { refreshSec: 300 }, () => 0.5));
+  eq("AGENT_RUNNING_REFRESH_SEC", 30, AGENT_RUNNING_REFRESH_SEC);
+  eq("scheduleBaseSec running", 30, scheduleBaseSec(true, 300));
+  eq("scheduleBaseSec idle", 300, scheduleBaseSec(false, 300));
+  eq("TOPIC_AGENT_STATE 精确", "agent:state", TOPIC_AGENT_STATE);
+
+  const mainSrc = readFileSync(new URL("../../plugins/com.pet.goat-gauge/main.js", import.meta.url), "utf8");
+  eq("main 精确订阅 TOPIC_AGENT_STATE", true, mainSrc.includes("ctx.bus.subscribe(TOPIC_AGENT_STATE"));
+  eq("main 读取 agent:state 的 running", true, mainSrc.includes('payload?.state === "running"'));
+  const subAt = mainSrc.indexOf("ctx.bus.subscribe(TOPIC_AGENT_STATE");
+  const handler = mainSrc.slice(subAt, subAt + 600);
+  eq("main 更新 agentRunning", true, handler.includes("agentRunning = running;"));
+  eq("main 状态变化重排", true, /agentRunning = running;[\s\S]*scheduleNext\(\)/.test(handler));
 }
 
 /* ============================ alerts ============================ */
