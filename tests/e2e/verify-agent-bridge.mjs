@@ -496,6 +496,9 @@ try {
   const manifest = manifests.ok ? manifests.v.find((m) => m.id === AGENT_ID) : null;
   r.check("manifest 存在", true, !!manifest);
   r.check("permissions 里没有 http", false, (manifest?.permissions ?? []).includes("http"));
+  // A06：这一条钉的是 **manifest 声明侧**（宿主 `plugins_list` 解析出来的那一份），与上面
+  // 「授权表里没有 overlay」那条运行时证据分属两层 —— 声明收回了才谈得上不授权。A04 的 M3b 打的就是这里。
+  r.check("permissions 里没有 overlay（A9b 已从 manifest 收回）", false, (manifest?.permissions ?? []).includes("overlay"));
 
   r.group("running：工具调用 → petdex 的 running");
   emitPhase("pre", { tool_name: "Bash" });
