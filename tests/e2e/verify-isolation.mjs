@@ -795,19 +795,21 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   // 归属只由窗口标签决定 —— 两扇插件窗各答出自己、宿主窗答 null。
   // 悬浮窗是插件起的：没开的用宿主命令补一扇，收尾把补的收掉、把新授的授权收回。
   r.group("overlay_owner：悬浮窗归属由窗口标签决定（两扇插件窗都在）");
-  const OWNER_AGENT = "com.pet.agent-bridge";
+  const OWNER_ALT = "com.pet.astock";
   const OWNER_HR = "com.pet.hr-ble";
-  const OWNER_LABEL = { [OWNER_AGENT]: "overlay-com_pet_agent-bridge", [OWNER_HR]: "overlay-com_pet_hr-ble" };
+  const OWNER_LABEL = { [OWNER_ALT]: "overlay-com_pet_astock", [OWNER_HR]: "overlay-com_pet_hr-ble" };
 
   // 前置一：起窗要求插件在启停清单里（overlay 页 sync 会自我关闭未启用插件的窗）
   const ownerEnabledAtStart = await readEnabledIds(invoke_);
-  const ownerMissingEnabled = [OWNER_AGENT, OWNER_HR].filter((id) => !ownerEnabledAtStart.includes(id));
+  const ownerFixtureManifest = JSON.parse(readFileSync(join(PLUGINS_DIR, OWNER_ALT, "manifest.json"), "utf8"));
+  r.check("B06 前置：夹具 manifest 确实声明 overlay", true, (ownerFixtureManifest.permissions ?? []).includes("overlay"));
+  const ownerMissingEnabled = [OWNER_ALT, OWNER_HR].filter((id) => !ownerEnabledAtStart.includes(id));
   if (ownerMissingEnabled.length) await setEnabled([...ownerEnabledAtStart, ...ownerMissingEnabled]);
 
   // 前置二：开窗命令要 overlay 已授权；没授的当场走真实同意框，记下来收尾撤销
   const ownerGrantedNow = new Set();
   const ownerBackup = {};
-  for (const id of [OWNER_AGENT, OWNER_HR]) {
+  for (const id of [OWNER_ALT, OWNER_HR]) {
     const prior = (await settings.invoke("permission_list")).v?.[id] ?? [];
     ownerBackup[id] = { prior, config: undefined };
     const pre = await invoke_("permission_check", { pluginId: id, capability: "overlay" });
@@ -848,7 +850,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     ownerPrior[id] = { entry: true, visible: visible === true };
   }
   for (const [id, x, y, height] of [
-    [OWNER_AGENT, 44, 44, 104],
+    [OWNER_ALT, 44, 44, 104],
     [OWNER_HR, 24, 24, 200],
   ]) {
     const shown = await invoke_("overlay_show", { pluginId: id, x, y, height });
@@ -883,11 +885,11 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   const ownerUntil = Date.now() + 30_000;
   while (Date.now() < ownerUntil) {
     await ownerRound();
-    if (ownerMap[OWNER_LABEL[OWNER_AGENT]] === OWNER_AGENT && ownerMap[OWNER_LABEL[OWNER_HR]] === OWNER_HR) break;
+    if (ownerMap[OWNER_LABEL[OWNER_ALT]] === OWNER_ALT && ownerMap[OWNER_LABEL[OWNER_HR]] === OWNER_HR) break;
     await sleep(800);
   }
   for (const oc of ownerClients.values()) oc.close();
-  r.check("Agent 桥那扇答出自己属于 com.pet.agent-bridge", OWNER_AGENT, ownerMap[OWNER_LABEL[OWNER_AGENT]] ?? null);
+  r.check("astock 那扇答出自己属于 com.pet.astock", OWNER_ALT, ownerMap[OWNER_LABEL[OWNER_ALT]] ?? null);
   r.check("左上角波形那扇答出自己属于 com.pet.hr-ble", OWNER_HR, ownerMap[OWNER_LABEL[OWNER_HR]] ?? null);
   const petOwner = await invoke_("overlay_owner");
   r.check("宠物窗（非悬浮窗）问归属得到 null", true, petOwner.ok === true && petOwner.v === null);
@@ -942,7 +944,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   // 收尾：本来就显示着的窗原地不动；其余（我们补开的、或本来就带病/隐藏的）收掉 ——
   // 插件下次需要它时会自己 show 回来。新授的 overlay 撤销前先让插件真的下线 ——
   // 否则它下一次轮询发现能力没了会再弹同意框；撤销连带清掉存储，所以按原样重授 + 写回 config。
-  for (const id of [OWNER_AGENT, OWNER_HR]) {
+  for (const id of [OWNER_ALT, OWNER_HR]) {
     if (ownerPrior[id]?.entry && ownerPrior[id]?.visible) continue;
     await invoke_("overlay_destroy", { pluginId: id });
   }
