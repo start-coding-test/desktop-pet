@@ -33,7 +33,11 @@ const STORE_DIR = join(env.APPDATA, "com.desktoppet.pet", "plugins", PROBE_ID);
 const probeManifest = (permissions) =>
   `{ id: ${JSON.stringify(PROBE_ID)}, widget: 'widget.js', permissions: ${JSON.stringify(permissions)} }`;
 const MOUNT_BARE = `window.__wh.mount(${probeManifest([])}, 'badge')`;
-const MOUNT_CAPPED = `window.__wh.mount(${probeManifest(["bus:publish", "bus:subscribe"])}, 'settings', document.body)`;
+// 正向对照挂 overlay 而不是 settings：S3 之后 settings 区一律进 Worker，而这份探针的 widget
+// 是照宿主 realm 写的（要读 window.__probes、要试 `(0,eval)`），被点名留在宿主 realm 的
+// 例外通道对那一区已不生效。这条对照组验的是「声明了能力就放行」，与区无关，
+// 所以换一个仍认例外名单的区；settings 区自己的取证在「agent:hooks 受控能力」那组（Worker 契约）。
+const MOUNT_CAPPED = `window.__wh.mount(${probeManifest(["bus:publish", "bus:subscribe"])}, 'overlay', document.body)`;
 const r = createReport("隔离与安全回归（dev）");
 const invoke = (c) => hostInvoke(c);
 
@@ -1544,6 +1548,9 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     r.group("agent:hooks 受控能力（settings 区专属）");
     const TEMP_ROOT = resolve(import.meta.dirname, "../../temp");
     const hookDir = join(PLUGINS_DIR, PROBE_ID);
+    // S3 之后 settings 区一律进 Worker：探针必须按 Worker 契约写 —— 没有 window / document，
+    // 建节点只能用 ctx.dom，事实只能经 ctx.bus 回传。两条 bus 能力按 manifest 声明，
+    // 并在本组开头真拿到授权（见下 grantProbeCap），否则 publish / subscribe 会被能力门禁拦下。
     const hookManifest = (permits) =>
       JSON.stringify({
         id: PROBE_ID,
@@ -1551,60 +1558,142 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
         version: "0.0.0",
         entry: "index.js",
         widget: "widget.js",
-        permissions: permits,
+        apiVersion: 2,
+        permissions: ["bus:publish", "bus:subscribe", ...permits],
         description: "验证 agent:hooks 的受控注入面与同意流程。",
       });
     const HOOK_WIDGET = `export function mount(root, ctx) {
-  const api = ctx.host && ctx.host.agentHooks;
-  const entry = {
+  const node = ctx.dom.createElement("div");
+  node.className = "zz-hookprobe";
+  node.textContent = ctx.region;
+  root.append(node);
+  ctx.bus.publish("${PROBE_ID}:fact", {
     region: ctx.region,
     hostIsUndefined: typeof ctx.host === "undefined",
-    hasAgentHooks: !!api,
+    hasAgentHooks: !!(ctx.host && ctx.host.agentHooks),
     keys: ctx.host ? Object.keys(ctx.host).sort() : [],
-  };
-  entry.call = async (name) => {
-    if (!api) return { ok: false, e: "no host.agentHooks on ctx" };
-    try { return { ok: true, v: await api[name]() }; }
-    catch (e) { return { ok: false, e: String(e && e.message ? e.message : e) }; }
-  };
-  (window.__hookProbes = window.__hookProbes || {})[ctx.region] = entry;
+  });
+  ctx.bus.subscribe("${PROBE_ID}:cmd", async (msg) => {
+    const api = ctx.host && ctx.host.agentHooks;
+    let out;
+    if (!api) out = { ok: false, e: "no host.agentHooks on ctx" };
+    else {
+      try { out = { ok: true, v: await api[msg.name]() }; }
+      catch (e) { out = { ok: false, e: String(e && e.message ? e.message : e) }; }
+    }
+    ctx.bus.publish("${PROBE_ID}:res", { id: msg.id, region: ctx.region, ...out });
+  });
 }
 export function unmount() {}
 `;
-    const MOUNT_HOOK_PROBES = `(async () => {
+    /** 收事实：探针在 Worker 里写不了 window，事实只能由本窗口的总线订阅者接住 */
+    const WATCH_HOOK_FACTS = `(async () => {
+      const { bus } = await import('/src/runtime/event-bus.ts');
+      window.__hookFacts = [];
+      window.__hookRes = [];
+      bus.subscribe('${PROBE_ID}:fact', (p) => window.__hookFacts.push(p));
+      bus.subscribe('${PROBE_ID}:res', (p) => window.__hookRes.push(p));
+      return true;
+    })()`;
+    /** 把探针挂进某个区：容器共用同一个临时槽，槽缺就先建 */
+    const mountHookRegion = (region) => `(async () => {
       const { widgetHost } = await import('/src/runtime/widget-host.ts');
       window.__hookHost = widgetHost;
-      document.getElementById('hook-probe-slot')?.remove();
-      const slot = document.createElement('div');
-      slot.id = 'hook-probe-slot';
-      document.body.append(slot);
-      const manifest = ${hookManifest([])};
-      await widgetHost.mount(manifest, 'settings', slot);
-      await widgetHost.mount(manifest, 'badge', slot);
-      await widgetHost.mount(manifest, 'overlay', slot);
-      return Object.keys(window.__hookProbes || {}).sort().join(',');
+      let slot = document.getElementById('hook-probe-slot');
+      if (!slot) { slot = document.createElement('div'); slot.id = 'hook-probe-slot'; document.body.append(slot); }
+      await widgetHost.mount(${hookManifest([])}, ${JSON.stringify(region)}, slot);
+      return true;
     })()`;
+    /** 例外名单是跨窗口共享的一份 localStorage：装/拆都要显式做，别让别的组跟着漂 */
+    const hookPin = (on) =>
+      sc.ev(
+        on
+          ? `localStorage.setItem('host:widget-realm-plugin-host', ${JSON.stringify(PROBE_ID)}); true`
+          : `localStorage.removeItem('host:widget-realm-plugin-host'); true`,
+      );
+    let hookCallSeq = 0;
+    /** 指令经总线投给探针，结果同样经总线回来；回传不了就返回可读失败而不是 TypeError */
+    const hookCall = async (name) => {
+      const id = ++hookCallSeq;
+      await sc.ev(`(async () => {
+        const { bus } = await import('/src/runtime/event-bus.ts');
+        bus.inject('${PROBE_ID}:cmd', { id: ${id}, name: ${JSON.stringify(name)} });
+        return true;
+      })()`);
+      const hit = `((window.__hookRes || []).find((r) => r.id === ${id} && r.region === "settings")) ?? null`;
+      const got = await waitUntil(sc, `!!(${hit})`, 15_000).catch(() => false);
+      if (!got) return { ok: false, e: `探针没回传 ${name} 的结果（15s）` };
+      return sc.ev(hit);
+    };
 
     writeFileSync(join(hookDir, "widget.js"), HOOK_WIDGET);
     writeFileSync(join(hookDir, "manifest.json"), hookManifest([]));
     mkdirSync(join(TEMP_ROOT, "b2"), { recursive: true });
     await sleep(900);
 
-    r.check("探针在 settings/badge/overlay 三区都能挂上", "badge,overlay,settings", await sc.ev(MOUNT_HOOK_PROBES));
-    const shape = await sc.ev(`({
-      hasAgentHooks: window.__hookProbes.settings.hasAgentHooks,
-      keys: window.__hookProbes.settings.keys.join(','),
-      badgeHost: window.__hookProbes.badge.hostIsUndefined,
-      badgeApi: window.__hookProbes.badge.hasAgentHooks,
-      overlayHost: window.__hookProbes.overlay.hostIsUndefined,
-      overlayApi: window.__hookProbes.overlay.hasAgentHooks,
-    })`);
-    r.check("settings 区注入 ctx.host.agentHooks（且只有这一个键）", true, shape.hasAgentHooks === true && shape.keys === "agentHooks");
-    r.check("badge 区取到的 ctx.host 是 undefined（断言 undefined，不是调用报错）", true, shape.badgeHost === true && shape.badgeApi === false);
-    r.check("overlay 区取到的 ctx.host 是 undefined", true, shape.overlayHost === true && shape.overlayApi === false);
-
-    // 起点确定：清掉上一次（可能崩溃留下）的旧授权，否则 permission_check 会短路掉声明校验
+    // 起点确定：清掉上一次（可能崩溃留下）的旧授权，否则 permission_check 会短路掉声明校验。
+    // 必须排在下面拿 bus 授权之前：permission_revoke 是 revoke_all，会把 bus 能力一并清掉。
     await sCall("permission_revoke", { pluginId: PROBE_ID });
+
+    // 探针的事实只能经总线回传，所以两条 bus 能力要真授权（各自一个真实同意框）
+    r.check("探针经同意框拿到 bus:publish（Worker 里回传事实的前提）", true, await grantProbeCap("bus:publish"));
+    r.check("探针经同意框拿到 bus:subscribe（Worker 里收指令的前提）", true, await grantProbeCap("bus:subscribe"));
+    await sc.ev(WATCH_HOOK_FACTS);
+
+    // S3 的正身：例外名单里点着 zz.probe，settings 区照样进 Worker
+    await hookPin(true);
+    // 已定口径：旧接口 widget（没写 apiVersion）在 settings 区被拦下并给可读原因，不是留在宿主 realm 跑。
+    // 点名也救不了它 —— 所以这条在名单开着的时候测。原因文案的可读性由 unit 那条钉住（closed shadow 读不到 body）
+    const legacyRealm = await sc.ev(`(async () => {
+      const { widgetHost } = await import('/src/runtime/widget-host.ts');
+      let slot = document.getElementById('hook-probe-slot-2');
+      if (!slot) { slot = document.createElement('div'); slot.id = 'hook-probe-slot-2'; document.body.append(slot); }
+      await widgetHost.mount({ id: 'zz.legacyprobe', widget: 'widget.js', permissions: [] }, 'settings', slot);
+      const n = document.querySelector('#hook-probe-slot-2 div[data-plugin-id="zz.legacyprobe"]');
+      const realm = n ? n.dataset.widgetRealm : null;
+      await widgetHost.unmount('zz.legacyprobe');
+      document.getElementById('hook-probe-slot-2')?.remove();
+      return realm;
+    })()`);
+    r.check("旧接口 widget 在 settings 区被拦下（blocked，点名也不放行）", "blocked", legacyRealm);
+    await sc.ev(mountHookRegion("settings"));
+    r.check(
+      "例外名单点着这个插件，settings 区仍进 Worker（S3）",
+      "worker",
+      (await waitWidgetRealm(sc, PROBE_ID, "settings", "worker", 20_000)).actual,
+    );
+    // 另两区照旧认例外名单：把名单摘掉它们才进 Worker —— 顺带钉住「名单只管 badge / overlay」
+    await hookPin(false);
+    await sc.ev(mountHookRegion("badge"));
+    await sc.ev(mountHookRegion("overlay"));
+    r.check("badge 区进 Worker", "worker", (await waitWidgetRealm(sc, PROBE_ID, "badge", "worker", 20_000)).actual);
+    r.check("overlay 区进 Worker", "worker", (await waitWidgetRealm(sc, PROBE_ID, "overlay", "worker", 20_000)).actual);
+    await hookPin(true); // 后面几组仍按老前提（例外名单开着）跑
+
+    const factsOk = await waitUntil(sc, `(window.__hookFacts || []).length >= 3`, 20_000).catch(() => false);
+    const facts = factsOk ? await sc.ev(`window.__hookFacts`) : [];
+    const shapeOf = (region) => facts.find((f) => f.region === region) ?? {};
+    r.check(
+      "探针在 settings/badge/overlay 三区都把事实经总线传了回来",
+      "badge,overlay,settings",
+      [...new Set(facts.map((f) => f.region))].sort().join(","),
+    );
+    r.check(
+      "settings 区注入 ctx.host.agentHooks（且只有这一个键）",
+      true,
+      shapeOf("settings").hasAgentHooks === true && (shapeOf("settings").keys ?? []).join(",") === "agentHooks",
+    );
+    r.check(
+      "badge 区取到的 ctx.host 是 undefined（断言 undefined，不是调用报错）",
+      true,
+      shapeOf("badge").hostIsUndefined === true && shapeOf("badge").hasAgentHooks === false,
+    );
+    r.check(
+      "overlay 区取到的 ctx.host 是 undefined",
+      true,
+      shapeOf("overlay").hostIsUndefined === true && shapeOf("overlay").hasAgentHooks === false,
+    );
+
     // 此刻探针确定没有 agent:hooks，且下面这次调用不会弹同意框（窗口门禁过了走的是能力校验）
     const hookSnapBefore = JSON.stringify((await sCall("agent_hooks_status")).v);
     const unauthUninstall = await sCall("agent_hooks_uninstall", { pluginId: PROBE_ID });
@@ -1614,7 +1703,7 @@ export function unmount() {}
       "denied|true",
       `${unauthUninstall.code}|${hookSnapBefore === hookSnapAfter}`,
     );
-    const undeclared = await sc.ev(`window.__hookProbes.settings.call("status")`);
+    const undeclared = await hookCall("status");
     r.check(
       "未声明 agent:hooks：settings 区调用被拒（未声明的能力不弹框，直接拒）",
       true,
@@ -1624,7 +1713,7 @@ export function unmount() {}
     // 声明后：首次调用应弹同意框。先拒绝一次，再同意。
     writeFileSync(join(hookDir, "manifest.json"), hookManifest(["agent:hooks"]));
     await sleep(500);
-    const pendingDeny = sc.ev(`window.__hookProbes.settings.call("status")`);
+    const pendingDeny = hookCall("status");
     const consentDeny = await driveConsent("deny", PROBE_ID);
     r.check("同意框列出了 agent:hooks", true, consentDeny.caps.some((x) => x.includes("agent:hooks")));
     // 同意框标题是既有文案 `${plugin_name}（${plugin_id}）`（consent/main.ts:34），断言整串
@@ -1632,7 +1721,7 @@ export function unmount() {}
     const denied = await pendingDeny;
     r.check("拒绝后调用被拒（默认拒绝语义）", true, denied.ok === false && /权限被拒绝/.test(denied.e));
 
-    const pendingAllow = sc.ev(`window.__hookProbes.settings.call("status")`);
+    const pendingAllow = hookCall("status");
     const consentAllow = await driveConsent("allow", PROBE_ID);
     r.check("拒绝没留下授权（第二次调用仍弹框）", true, consentAllow.caps.some((x) => x.includes("agent:hooks")));
     const allowed = await pendingAllow;
@@ -1688,7 +1777,7 @@ export function unmount() {}
       for (const f of statusFiles) writeFileSync(f.path, sample);
       sampleForeign = foreignOf(sample);
 
-      const installRes = await sc.ev(`window.__hookProbes.settings.call("install")`);
+      const installRes = await hookCall("install");
       r.check(
         "声明并同意后 install 成功（每个文件回显条数）",
         true,
@@ -1717,7 +1806,7 @@ export function unmount() {}
       const afterDirect = (await sCall("agent_hooks_status")).v;
       const marksAfterDirect = statusFiles.map((f) => readFileSync(f.path, "utf8").split("--pet-hook").length - 1);
       const foreignAfterDirect = statusFiles.map((f) => foreignOf(readFileSync(f.path, "utf8")));
-      const reinstall = await sc.ev(`window.__hookProbes.settings.call("install")`);
+      const reinstall = await hookCall("install");
       const afterReinstall = reinstall.ok === true ? (await sCall("agent_hooks_status")).v : { managed: -1 };
       const foreignAfterReinstall = statusFiles.map((f) => foreignOf(readFileSync(f.path, "utf8")));
       r.check(
@@ -1747,9 +1836,13 @@ export function unmount() {}
       true,
       await waitUntil(sc, `document.querySelector('.nav-item[data-view=${JSON.stringify(PROBE_ID)}]')?.dataset.search?.includes('agent:hooks') === true`, 10_000),
     );
-    // 重载把 window 上的探针句柄与桥缓存都清了：重新挂一次、再走一次 status 把缓存填上
-    await sc.ev(MOUNT_HOOK_PROBES);
-    const regrant = await sc.ev(`window.__hookProbes.settings.call("status")`);
+    // 重载把 window 上的订阅与桥缓存都清了：重挂 settings 区那一个（例外名单开着，它照样进 Worker）、
+    // 重订事实通道，再走一次 status 把缓存填上
+    await hookPin(true);
+    await sc.ev(WATCH_HOOK_FACTS);
+    await sc.ev(mountHookRegion("settings"));
+    await waitWidgetRealm(sc, PROBE_ID, "settings", "worker", 20_000);
+    const regrant = await hookCall("status");
     r.check("重载后凭已授权记录直接放行（不再弹框）", true, regrant.ok === true);
 
     // 所有点击都先等元素出现、缺了产出可读 FAIL —— 固定 sleep 赌渲染会在缺元素时抛

@@ -7,7 +7,6 @@ import { listen } from "@tauri-apps/api/event";
 import { bus } from "./event-bus";
 import { pluginFileUrl, pluginFileVersion } from "./plugin-url";
 import { createScopedBus } from "./topic-acl";
-import { createAgentHooksApi } from "./bridge";
 import { WIDGET_HOST_REALM_FLAG, legacyWidgetReason, widgetUsesWorker } from "./widget-protocol";
 import { BADGE_ROTATE_INTERVAL_MS, type BadgeArbiter, createBadgeArbiter } from "./badge-arbiter";
 // 与 plugin-runtime 是一对循环 import：两边都只在函数体里用对方（它是 widgetHost，这边是 getEnabled），
@@ -217,7 +216,10 @@ class WidgetHost {
     startedAt: number,
   ): void {
     if (this.epochOf(pluginId) !== startedAt) return;
-    console.warn(`[widget] ${reason}`);
+    // 走 console.info 而不是 warn：被拦下是**设计好的结果**（照 ADR-0008 迁移就没了），
+    // 与 widget-renderer 拒收 op 走 debug 是同一条理由 —— 正常路径不该把宿主页的
+    // 「自身无报错」门变成红的。全文在 note.title 与这条日志里。
+    console.info(`[widget] ${reason}`);
     const { host, shadow } = this.createSlot(pluginId, region, root, "blocked");
     const note = document.createElement("div");
     note.setAttribute("role", "note");
@@ -243,14 +245,15 @@ class WidgetHost {
   ): Promise<void> {
     const pinnedRaw = globalThis.localStorage?.getItem(WIDGET_HOST_REALM_FLAG);
     // 旧接口 widget 在加载之前就拦下：进了 Worker 只会 boot-failed、插槽被收掉，用户看到的是一块白
-    const legacy = legacyWidgetReason(manifest, pinnedRaw);
+    const legacy = legacyWidgetReason(manifest, pinnedRaw, region);
     if (legacy) {
       this.mountNotice(manifest.id, region, root, legacy, startedAt);
       return;
     }
     const bust = await pluginFileVersion(manifest.id, widgetPath);
     const url = pluginFileUrl(manifest.id, widgetPath, bust);
-    if (widgetUsesWorker(manifest.id, pinnedRaw)) {
+    // settings 区一律 Worker（S3），例外名单只对 badge / overlay 生效
+    if (widgetUsesWorker(manifest.id, pinnedRaw, region)) {
       return this.doMountInWorker(manifest, url, region, root, startedAt);
     }
     let host: HTMLDivElement | undefined;
@@ -272,16 +275,8 @@ class WidgetHost {
         region,
         bus: createScopedBus(manifest.id, manifest.permissions ?? [], bus),
       };
-      // 受控宿主通道只往设置区注入：badge / overlay 区与宠物窗主 realm 都拿不到 ctx.host
-      if (region === "settings") {
-        ctx.host = {
-          agentHooks: createAgentHooksApi({
-            id: manifest.id,
-            name: manifest.name ?? manifest.id,
-            permissions: manifest.permissions,
-          }),
-        };
-      }
+      // 这里**没有** settings 分支：settings 区在上面就分流进 Worker 了（S3）。
+      // 受控宿主通道（ctx.host.agentHooks）由 widget-worker.ts 在 Worker 侧按 region 构造。
       await mod.mount(shadow, ctx);
 
       if (this.epochOf(manifest.id) !== startedAt) {

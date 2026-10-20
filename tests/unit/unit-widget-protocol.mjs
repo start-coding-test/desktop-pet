@@ -12,8 +12,10 @@ import { fileURLToPath } from "node:url";
 import { inspect } from "./import-graph.mjs";
 import {
   WIDGET_ATTRS,
+  WIDGET_CONTRACT_API_VERSION,
   WIDGET_EVENTS,
   WIDGET_HTML_TAGS,
+  WIDGET_HOST_REALM_FLAG,
   WIDGET_MAX_OPS_PER_MESSAGE,
   WIDGET_OP_KINDS,
   WIDGET_PROPS,
@@ -26,6 +28,9 @@ import {
   isWidgetStyleProp,
   isWidgetTag,
   isWidgetToHost,
+  legacyWidgetReason,
+  regionForcesWorker,
+  widgetUsesWorker,
 } from "../../src/runtime/widget-protocol.ts";
 import { WidgetRenderSession, createDomFacade } from "../../src/runtime/widget-node.ts";
 
@@ -505,5 +510,60 @@ describe("SDK 类型面与协议词表同源", () => {
     ]);
     assert.deepEqual(members.filter((m) => !allowed.has(m)), []);
     assert.equal(members.length, allowed.size);
+  });
+});
+
+/**
+ * S3：门禁粒度从「哪扇窗」收到「谁」。设置窗的 realm 就是宿主壳的 realm，
+ * 被点名留在宿主 realm 的设置页因此拿得到宿主级命令，所以这一区不再认例外名单。
+ */
+describe("S3：settings 区一律进 Worker，例外名单只对 badge / overlay 生效", () => {
+  const HOST_SRC = readFileSync(new URL("../../src/runtime/widget-host.ts", import.meta.url), "utf8");
+  /** 注释里提到 `ctx.host` 是合法的（S3 的说明就在注释里），判据只看代码：先剥掉注释 */
+  const HOST_CODE = HOST_SRC.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
+
+  it("被点名的插件在 settings 区照样进 Worker，只在 badge / overlay 区留宿主 realm", () => {
+    const raw = "com.pet.other, com.pet.x ";
+    assert.equal(widgetUsesWorker("com.pet.x", raw, "settings"), true, "settings 区认了例外名单");
+    assert.equal(widgetUsesWorker("com.pet.x", raw, "badge"), false);
+    assert.equal(widgetUsesWorker("com.pet.x", raw, "overlay"), false);
+  });
+
+  it("没点名时三区都进 Worker（改的是例外名单，不是默认值）", () => {
+    for (const region of ["settings", "badge", "overlay"]) {
+      assert.equal(widgetUsesWorker("com.pet.x", null, region), true);
+    }
+  });
+
+  it("旧接口 widget 在 settings 区被拦下，原因里不把人引到例外名单上", () => {
+    const v1 = { id: "com.pet.old", widget: "widget.js" };
+    const pinned = "com.pet.old";
+    // 逃生门本身还在：badge 区点名照旧放行
+    assert.equal(legacyWidgetReason(v1, pinned, "badge"), null);
+    const reason = legacyWidgetReason(v1, pinned, "settings");
+    assert.ok(reason, "settings 区点名后旧接口 widget 没被拦下");
+    assert.ok(reason.includes("com.pet.old") && reason.includes(`apiVersion 1`), `原因不可读：${reason}`);
+    assert.ok(reason.includes(WIDGET_HOST_REALM_FLAG), `原因没点名那份名单：${reason}`);
+    assert.ok(/不生效/.test(reason), `原因没说清例外名单对这一区不生效：${reason}`);
+    assert.equal(reason.includes("点名这个插件 id"), false, "settings 区的原因仍在教用户去点名");
+  });
+
+  it("regionForcesWorker 只认 settings 这一个区", () => {
+    assert.equal(regionForcesWorker("settings"), true);
+    for (const other of ["badge", "overlay", "", "pet"]) {
+      assert.equal(regionForcesWorker(other), false, `${other} 也被当成了 settings`);
+    }
+  });
+
+  it("宿主两处判定都把区带了过去，且宿主 realm 不再给 settings 注入 ctx.host", () => {
+    assert.equal(HOST_CODE.includes("widgetUsesWorker(manifest.id, pinnedRaw, region)"), true, "分流没带区");
+    assert.equal(HOST_CODE.includes("legacyWidgetReason(manifest, pinnedRaw, region)"), true, "拦下判定没带区");
+    // settings 区在上面就分流进 Worker 了，宿主 realm 那条路永远到不了 settings：
+    // 留着注入代码等于留一条看起来还活着的提权路
+    assert.equal(HOST_CODE.includes("ctx.host"), false, "宿主 realm 仍在给 settings 注入 ctx.host");
+  });
+
+  it("契约版本没被顺手改动（这条卡改的是分流，不是渲染契约）", () => {
+    assert.equal(WIDGET_CONTRACT_API_VERSION, 2);
   });
 });
