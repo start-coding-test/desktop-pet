@@ -250,7 +250,7 @@ try {
   );
 
   r.group("设置面板回显当前配置");
-  const peeked = await invoke("bus_peek", { topic: `${PID}:widget` });
+  const peeked = await invoke("bus_peek", { topic: `${PID}:widget`, pluginId: PID });
   r.check("回灌的数据带着 card 开关", true, peeked.v?.config?.card === true);
   r.check("回灌的数据带着清单", 2, (peeked.v?.tasks ?? []).length);
 
