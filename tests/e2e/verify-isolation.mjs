@@ -2051,7 +2051,60 @@ export function deactivate() { live = false; }
     })()`);
 
   const enabledBeforeB3 = await readEnabledIds(invoke(c));
-  r.check("基线：没挂常驻行时气泡是收起的", false, (await bubbleNow()).show);
+  /**
+   * 基线读数要确定性成立。本组第一条读数会撞上**宿主自己的临时台词**：45s 一拍的闲置自言自语、
+   * AFK 满 3 分钟的等待台词、重载后的启动问候 —— 它们按设计只占槽 3.6s（`BUBBLE_HOLD_MS`），
+   * 点对点采样因此偶发读到「气泡正显示着」（2026-10-20 main 的 340/1 就是这条）。
+   * 两步把读数落到确定态：① 夹具隔离（把闲聊源在组内钉住，用完即还原）；② 有界轮询等已经在显示的那句台词回位。
+   * 判据本身**没放宽**：真有插件常驻行占着槽时 `.status` 会跟着亮，下面两条都会红。
+   */
+  let b3Pin = null;
+  let b3AfkReset = false;
+  let b3Quiet = false;
+  let b3Entry = null;
+  let b3After = null;
+  try {
+    // ① 关掉「45s 一拍 × Math.random() < 0.4」的闲置自言自语闸：抽两次必须相等，才说明真的钉住了
+    b3Pin = await c.ev(`(() => {
+      window.__b3SavedRandom = Math.random;
+      Math.random = () => 0.5;
+      return { a: Math.random(), b: Math.random() };
+    })()`);
+    // AFK 计时复位（可达则做）：`request()` 里 `sinceInteraction = 0`，把「3 分钟无交互」的等待台词推到本组之外；
+    // idle → idle 不改画面。宿主没暴露控制器时跳过，不影响后面的判据。
+    b3AfkReset = await c
+      .ev(`(async () => {
+        try {
+          const { petController } = await import('/src/pet/host.ts');
+          const ctl = petController();
+          if (!ctl) return false;
+          ctl.react("idle");
+          return true;
+        } catch { return false; }
+      })()`)
+      .catch(() => false);
+    b3Entry = await bubbleNow();
+    // ② 台词到点自己回位：有界轮询等它安静下来（不赌时序、不加固定 sleep）
+    b3Quiet = await waitUntil(c, `!document.getElementById('pet-bubble').classList.contains('show')`, 6_000).catch(() => false);
+    b3After = await bubbleNow();
+    r.info("B3 基线入口读数（show / .status / 文本 · AFK 计时已复位）", `${b3Entry.show} / ${b3Entry.status} / ${JSON.stringify(b3Entry.text)} · ${b3AfkReset}`);
+    r.info("B3 基线轮询后读数（是否等到安静 / .status / 文本）", `${b3Quiet} / ${b3After.status} / ${JSON.stringify(b3After.text)}`);
+    r.check("本组开始时已钉住随机台词闸（两次抽样相等且落在 0.4 之上，隔离生效）", true, b3Pin?.a === b3Pin?.b && b3Pin.a > 0.4 && b3Pin.a < 1);
+    r.check("基线：此刻槽里没有插件的常驻行（显示中的只能是不带 .status 的台词）", true, !(b3Entry.show && b3Entry.status));
+  } finally {
+    // 随机闸用完立刻还原（后面的「随机台词让路」那组要自己掌控 randomness）
+    await c
+      .ev(`(() => {
+        if (window.__b3SavedRandom) {
+          Math.random = window.__b3SavedRandom;
+          delete window.__b3SavedRandom;
+        }
+        return true;
+      })()`)
+      .catch(() => undefined);
+  }
+  const b3BaselineShow = b3After ? b3After.show : (await bubbleNow()).show;
+  r.check("基线：没挂常驻行时气泡是收起的", false, b3BaselineShow);
   // 上面那一段结尾把设置窗关了，句柄也随窗作废：本组要写启停清单与撤授权，重开一扇
   settings = await openSettingsInvoker(PORT, c);
   await setEnabled([...new Set([...enabledBeforeB3, STATUS_A, STATUS_B])]);
