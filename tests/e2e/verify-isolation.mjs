@@ -54,9 +54,22 @@ const invoke = (c) => hostInvoke(c);
  * 旧写法 `waitForPage(/consent/)` 抓到谁点谁，于是本套件的「同意框列出了 storage」读到别人的能力表，
  * 整组假红（实测一次 13 条）。别人的框留给宿主自己的 60 秒超时处理，不去替它作答。
  */
+/**
+ * 同意框归属匹配：`wantId` **后面一个字符不许还是 id 字符**。
+ * 子串匹配会让 `zz.status` 吃掉 `zz.status2` 的框 —— 两个夹具的标题各自是「常驻行探针 <id>（<id>）」
+ * （`src/consent/main.ts` 的文案是 `${plugin_name}（${plugin_id}）`），于是后者永远等不到自己的框。
+ */
+function consentBoxBelongsTo(name, wantId) {
+  if (!wantId) return true;
+  const escaped = wantId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`${escaped}(?![A-Za-z0-9._-])`).test(String(name ?? ""));
+}
+
 async function driveConsent(how, wantId = "") {
   const deadline = Date.now() + 20_000;
   let others = 0;
+  /** 扫到过的框标题（去重）：失败时原文带出去，用来区分「框根本没开」和「开的是别人的框」 */
+  const seenTitles = [];
   while (Date.now() < deadline) {
     const pages = (await listPages(PORT).catch(() => [])).filter((t) => /consent/.test(t.url));
     for (const target of pages) {
@@ -64,7 +77,8 @@ async function driveConsent(how, wantId = "") {
       try {
         cs = await attach(PORT, (t) => t.webSocketDebuggerUrl === target.webSocketDebuggerUrl, 8_000);
         const name = await cs.ev(`document.getElementById('plugin-name')?.textContent ?? ''`);
-        if (wantId && !name.includes(wantId)) {
+        if (!seenTitles.includes(name)) seenTitles.push(name);
+        if (!consentBoxBelongsTo(name, wantId)) {
           others += 1;
           cs.close();
           cs = null;
@@ -92,7 +106,7 @@ async function driveConsent(how, wantId = "") {
     await sleep(400);
   }
   throw new Error(
-    `20 秒内没等到 ${wantId ? `「${wantId}」的` : ""}同意框（场上别人的框累计扫到 ${others} 个，按名字跳过没点）`,
+    `20 秒内没等到 ${wantId ? `「${wantId}」的` : ""}同意框（场上扫到的框标题：[${seenTitles.join(" | ") || "一个都没有"}]，按名字跳过没点 ${others} 个）`,
   );
 }
 
@@ -2051,15 +2065,72 @@ export function deactivate() { live = false; }
     })()`);
 
   const enabledBeforeB3 = await readEnabledIds(invoke(c));
-  r.check("基线：没挂常驻行时气泡是收起的", false, (await bubbleNow()).show);
+  /**
+   * 基线读数要确定性成立。本组第一条读数会撞上**宿主自己的临时台词**：45s 一拍的闲置自言自语、
+   * AFK 满 3 分钟的等待台词、重载后的启动问候 —— 它们按设计只占槽 3.6s（`BUBBLE_HOLD_MS`），
+   * 点对点采样因此偶发读到「气泡正显示着」（2026-10-20 main 的 340/1 就是这条）。
+   * 两步把读数落到确定态：① 夹具隔离（把闲聊源在组内钉住，用完即还原）；② 有界轮询等已经在显示的那句台词回位。
+   * 判据本身**没放宽**：真有插件常驻行占着槽时 `.status` 会跟着亮，下面两条都会红。
+   */
+  let b3Pin = null;
+  let b3AfkReset = false;
+  let b3Quiet = false;
+  let b3Entry = null;
+  let b3After = null;
+  try {
+    // ① 关掉「45s 一拍 × Math.random() < 0.4」的闲置自言自语闸：抽两次必须相等，才说明真的钉住了
+    b3Pin = await c.ev(`(() => {
+      window.__b3SavedRandom = Math.random;
+      Math.random = () => 0.5;
+      return { a: Math.random(), b: Math.random() };
+    })()`);
+    // AFK 计时复位（可达则做）：`request()` 里 `sinceInteraction = 0`，把「3 分钟无交互」的等待台词推到本组之外；
+    // idle → idle 不改画面。宿主没暴露控制器时跳过，不影响后面的判据。
+    b3AfkReset = await c
+      .ev(`(async () => {
+        try {
+          const { petController } = await import('/src/pet/host.ts');
+          const ctl = petController();
+          if (!ctl) return false;
+          ctl.react("idle");
+          return true;
+        } catch { return false; }
+      })()`)
+      .catch(() => false);
+    b3Entry = await bubbleNow();
+    // ② 台词到点自己回位：有界轮询等它安静下来（不赌时序、不加固定 sleep）
+    b3Quiet = await waitUntil(c, `!document.getElementById('pet-bubble').classList.contains('show')`, 6_000).catch(() => false);
+    b3After = await bubbleNow();
+    r.info("B3 基线入口读数（show / .status / 文本 · AFK 计时已复位）", `${b3Entry.show} / ${b3Entry.status} / ${JSON.stringify(b3Entry.text)} · ${b3AfkReset}`);
+    r.info("B3 基线轮询后读数（是否等到安静 / .status / 文本）", `${b3Quiet} / ${b3After.status} / ${JSON.stringify(b3After.text)}`);
+    r.check("本组开始时已钉住随机台词闸（两次抽样相等且落在 0.4 之上，隔离生效）", true, b3Pin?.a === b3Pin?.b && b3Pin.a > 0.4 && b3Pin.a < 1);
+    r.check("基线：此刻槽里没有插件的常驻行（显示中的只能是不带 .status 的台词）", true, !(b3Entry.show && b3Entry.status));
+  } finally {
+    // 随机闸用完立刻还原（后面的「随机台词让路」那组要自己掌控 randomness）
+    await c
+      .ev(`(() => {
+        if (window.__b3SavedRandom) {
+          Math.random = window.__b3SavedRandom;
+          delete window.__b3SavedRandom;
+        }
+        return true;
+      })()`)
+      .catch(() => undefined);
+  }
+  const b3BaselineShow = b3After ? b3After.show : (await bubbleNow()).show;
+  r.check("基线：没挂常驻行时气泡是收起的", false, b3BaselineShow);
   // 上面那一段结尾把设置窗关了，句柄也随窗作废：本组要写启停清单与撤授权，重开一扇
   settings = await openSettingsInvoker(PORT, c);
   await setEnabled([...new Set([...enabledBeforeB3, STATUS_A, STATUS_B])]);
   await reloadAndWait(c);
   // 激活会为两个 fixture 各弹一次同意框（声明的三项能力）
   for (const id of [STATUS_A, STATUS_B]) {
-    const consent = await driveConsent("allow", id).catch(() => null);
-    r.check(`同意框列出了 ${id} 声明的能力（含 pet:say）`, true, !!consent && consent.caps.some((x) => x.includes("pet:say")));
+    const consent = await driveConsent("allow", id).catch((err) => ({ error: String(err?.message ?? err) }));
+    const caps = consent?.caps ?? null;
+    const capsOk = !!caps && caps.some((x) => x.includes("pet:say"));
+    // 期望值不动（仍是 true）；失败时把 driveConsent 的原因原文带进 detail —— 否则只有一句
+    // 「期望 true，实得 false」，分不清「框根本没开」还是「开的是别人的框」（B08 那一轮的现场就是这样丢掉的）
+    r.check(`同意框列出了 ${id} 声明的能力（含 pet:say）`, true, capsOk ? true : (consent?.error ?? false));
   }
   await c.ev(installedCollectors);
   /**
