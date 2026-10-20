@@ -2205,6 +2205,113 @@ export function deactivate() { live = false; }
   await statusCall(STATUS_B, "boom");
   await b3LineGoneWithin5s("Worker 崩溃后");
 
+  // B04：确定性启动问候。截住 src/main.ts 末尾的 700ms 回调，显式挂行后同步调用；
+  // 不依赖 45s 闲置拍子，也不改 fixture 的 activate（首次授权前 setStatus 会 reject）。
+  r.group("B3 随机台词让路：确定性启动问候（B04）");
+  const B4_LINE = "B4常驻";
+  const B4_INJECT = `(() => {
+    const orig = window.setTimeout;
+    window.__b4OrigTimeout = orig;
+    window.__b4Greet = { cb: null, calls: 0, stack: "" };
+    window.setTimeout = function (fn, ms, ...args) {
+      if (ms === 700 && !window.__b4Greet.cb) {
+        window.__b4Greet.cb = fn;
+        window.__b4Greet.calls += 1;
+        try { window.__b4Greet.stack = String(new Error().stack); } catch (e) {}
+        return 0;
+      }
+      return orig.call(window, fn, ms, ...args);
+    };
+  })();`;
+  const b4Injection = await c.send("Page.addScriptToEvaluateOnNewDocument", { source: B4_INJECT });
+  const b4InjectionId = b4Injection?.result?.identifier;
+  let b4Collectors = false;
+  let b4Captured = false;
+  let b4Ready = false;
+  try {
+    await reloadAndWait(c);
+    await c.ev(installedCollectors).catch(() => undefined);
+    b4Collectors = true;
+    const b4Greet = await c.ev(`window.__b4Greet ?? null`);
+    b4Captured = !!b4Greet?.cb && b4Greet.calls >= 1;
+    r.check("700ms 启动问候回调已截住（未执行）", true, b4Captured);
+    r.check("截住的回调来自 main（stack 含 /src/main）", true, /src\/main/.test(String(b4Greet?.stack ?? "")));
+
+    // A3 返回生效文本是后续断言的前置；失败只留这一条红，不连环。
+    const b4Set = await statusCall(STATUS_B, "set", B4_LINE);
+    r.check("设置返回生效后的文本", B4_LINE, b4Set.v);
+    if (b4Set.v === B4_LINE) {
+      await waitStatusSlot();
+      const b4Now = await bubbleNow();
+      r.check(
+        "reload 后常驻行已显示（前置，非激活自挂）",
+        `${B4_LINE}|true`,
+        [b4Now.text, b4Now.status].join("|"),
+      );
+      b4Ready = b4Now.status && b4Now.text === B4_LINE;
+    } else {
+      r.info("B04 前置失败，跳过后续断言", String(b4Set.e ?? b4Set.v));
+    }
+
+    if (b4Captured && b4Ready) {
+      // 负向：挂行时同步调用启动问候，采样 1.2s；守卫在就不该出现非 status 台词。
+      await c.ev(`(() => {
+        window.__b4Samples = [];
+        window.__b4Timer = setInterval(() => {
+          const b = document.getElementById('pet-bubble');
+          window.__b4Samples.push({ show: b.classList.contains('show'), status: b.classList.contains('status'), text: b.textContent });
+        }, 100);
+        return true;
+      })()`);
+      await c.ev(`(() => { window.__b4Greet.cb(); return true; })()`);
+      await waitUntil(c, `window.__b4Samples.length >= 12`, 3_000).catch(() => false);
+      const b4Samples = await c.ev(`window.__b4Samples ?? []`);
+      await c.ev(`(() => { clearInterval(window.__b4Timer); return true; })()`);
+      r.check(
+        "有常驻行时，启动问候不弹台词",
+        true,
+        b4Samples.some((s) => s.show === true) &&
+          b4Samples.every((s) => s.status === true && s.text === B4_LINE),
+      );
+      const b4After = await bubbleNow();
+      r.check("问候落空后常驻行仍在", B4_LINE, b4After.status ? b4After.text : "");
+
+      // 正向对照：reload 后截住新回调、清掉常驻行，同一回调必须弹出台词。
+      await reloadAndWait(c);
+      await c.ev(installedCollectors).catch(() => undefined);
+      b4Collectors = true;
+      const b4Greet2 = await c.ev(`window.__b4Greet ?? null`);
+      r.check("第二次 reload 也截住了问候回调", true, !!b4Greet2?.cb);
+      if (b4Greet2?.cb) {
+        await statusCall(STATUS_B, "clear");
+        await waitStatusSlot();
+        await c.ev(`(() => { window.__b4Greet.cb(); return true; })()`);
+        const b4Random = await waitUntil(
+          c,
+          `(() => { const b = document.getElementById('pet-bubble'); return b.classList.contains('show') && !b.classList.contains('status'); })()`,
+          5_000,
+        ).catch(() => false);
+        r.check("正向对照：无常驻行时同一问候回调必弹台词", true, b4Random);
+        // 等 3.6s 台词回落，别把随机台词漏进 B3 收尾后的断言。
+        await waitStatusSlot();
+      }
+    }
+  } finally {
+    await c
+      .ev(`(() => {
+        if (window.__b4Timer) clearInterval(window.__b4Timer);
+        if (window.__b4OrigTimeout) window.setTimeout = window.__b4OrigTimeout;
+        return true;
+      })()`)
+      .catch(() => undefined);
+    if (b4InjectionId) {
+      await c
+        .send("Page.removeScriptToEvaluateOnNewDocument", { identifier: b4InjectionId })
+        .catch(() => undefined);
+    }
+    if (b4Collectors) await statusCall(STATUS_B, "clear").catch(() => undefined);
+  }
+
   // 收尾：改回原清单、撤销授权。fixture 目录**留到 finally 再删** —— 组尾就删会让
   // 超时调用的迟到回包变成 `bus relay failed: … 没有安装`（verify:worker 的零噪音门会红）。
   await setEnabled(enabledBeforeB3);
