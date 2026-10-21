@@ -11,6 +11,7 @@ B07 卡落地。插件把 API Key / Cookie / refresh token 这类「泄漏即失
 2. **Windows DPAPI 当前用户作用域**：调用 `CryptProtectData` / `CryptUnprotectData`，`dwflags` 只带
    `CRYPTPROTECT_UI_FORBIDDEN`，**不带** `CRYPTPROTECT_LOCAL_MACHINE`。也就是说密文只能被同一 Windows
    账户解开；换账户、换机器、目录被拷走或备份泄漏时读不出明文。
+   （**设计意图，未实测**：换账户/换机器解不开由 current-user scope 保证；CI 没有跨账户测试。）
 3. **熵绑定**：每次加解密都带 `"pet-secrets:v1:" + plugin_id` 的 UTF-8 字节。它让「把 A 的密文复制到 B 的
    目录」解不开，但它**不是身份校验**（见「已知未收口」）。
 4. **落点与信封**：`%APPDATA%/<identifier>/plugins/<plugin_id>/secrets.json`（与 `store.json` 同目录）
@@ -24,8 +25,10 @@ B07 卡落地。插件把 API Key / Cookie / refresh token 这类「泄漏即失
    `packages/sdk/error-codes.json` 的现有 12 个码，不新增码。
 6. **宿主不做迁移**：宿主永不读 `store.json` 里的秘密字段、永不把明文写回。旧明文凭据的
    `copy → verify → clear` 迁移由插件侧在 C06 落地（协议见下）。
-7. **撤销授权连带清理**：`secrets.json` 与 `store.json` 同目录，现有 `store::clear_plugin` 的
-   `remove_dir_all` 会把它一起删掉；`secrets` 自己另有 `clear_plugin` 供测试与以后的独立清理路径使用。
+7. **撤销授权连带清理**：`secrets.json` 与 `store.json` 同目录；**生产清理路径是 `store::clear_plugin` 的
+   `remove_dir_all`**，它会连同目录里的 `secrets.json` 一起删掉（测试
+   `clear_plugin_removes_both_store_and_secrets` 钉住）。`secrets::SecretsStore::clear_plugin` 是备用入口，
+   当前无调用方，仅供测试与以后拆出独立目录时使用。
 
 ## 为什么
 
@@ -71,3 +74,15 @@ C06 的 Cookie 都会落在那里。文件权限挡不住拿到同一账户的�
   它不防「当前用户已经被攻陷」。
 - **`storage` 与 `secrets` 共用能力名**：撤销 `storage` 会同时收走两者；这是刻意的（凭据也是插件数据），
   但如果未来要分开授权，需要新能力名并改 `plugin-capabilities.json`。
+- **F2 清理失败可能残留**：`permission_revoke` 对 `store.clear_plugin` 的失败只 `log::warn!`，撤销授权后
+  凭据文件可能残留（与 `store.json` 同一失败面）；宿主没有自愈/重试。
+- **F3 键间不绑定**：熵只绑定 `plugin_id`，同一插件文件内不同 key 的 blob 可以互换后仍解密；若要按 key
+  绑定需 `pet-secrets:v2:<plugin_id>:<key>` 并写迁移说明。
+- **F7 两个 root 同源**：`StoreState` 的 root 与 secrets 的 `app_plugins_dir()` 目前都指向
+  `%APPDATA%/<identifier>/plugins`；F1 测试钉住了「同目录清理」，但两者仍是两个真值来源，未来改 root 必须同步。
+- **F8 恢复路径**：文件损坏/解密失败时宿主不自愈；恢复路径是撤销授权（或重装）后让用户重新输入，或由
+  未来卡提供显式 reset；当前没有 `secrets_reset`。
+- **F9 门禁校验的是被点名的 plugin_id，不是调用者**：有 `storage` 授权的插件可以给另一个有授权的插件
+  构造冒名请求；ADR-0011 的老缺口，等 Worker 宿主真身份。
+- **F12 parse 文案含 serde 消息**：`parse` 的 message 带 serde 的位置型描述；当前不含输入，若未来换成
+  含输入/上下文的错误文案，需要重新评估是否泄露。

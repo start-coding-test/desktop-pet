@@ -138,6 +138,7 @@ delete(key: string): Promise<void>
 - **失败面**：非 Windows ⇒ `unsupported`；解密失败/文件损坏 ⇒ `internal` / `parse`；任何失败都**不写、不删、不回落明文**。插件应把错误展示给用户（例如「凭据无法解密，请重新输入」），不要静默当空值。
 - **迁移**：宿主不会自动迁移 `store.json` 里的旧明文凭据；迁移由插件做 `copy → verify → clear`（C06 落地）。回滚后旧版宿主不认识 `secrets.json`，用户需要重新输入。
 - **残余**：DPAPI 只保护静态数据，不解决同 realm 插件冒用 id；见 [ADR-0012](../adr/0012-plugin-credential-store.md)。
+- **兼容性**：`secrets` 是 `PluginContext` 的必需成员（老宿主/老夹具需同步）。
 
 ### topic 命名空间规则
 
