@@ -367,7 +367,7 @@ try {
   // 宿主随后把「孤儿回调」告警喷到页面上，被后面的零噪音断言算作本跑噪音。
   // 清单归宿主（C1）：先由设置窗写进去，宠物窗这边只是 loadEnabled + activate。
   settings = await openSettingsInvoker(PORT, c);
-  await writeEnabledIds(settings.invoke, [...origEnabled, AGENT_ID]);
+  await writeEnabledIds(settings.invoke, [...new Set([...origEnabled, AGENT_ID, PROBE_ID])]);
   r.check(
     "插件经运行时激活",
     true,
@@ -756,7 +756,7 @@ try {
   // （上一轮 3&4 两条红就是取到 null —— 窗在、坐标对，页面不在）。isolation 那组在开窗前也有
   // 同样一段 owner 前置。这里临时把它加进清单，组尾摘掉，finally 再按 origEnabled 兜一次。
   hrTempEnabled = true;
-  await writeEnabledIds(settings.invoke, [...new Set([...origEnabled, AGENT_ID, HR_ID])]);
+  await writeEnabledIds(settings.invoke, [...new Set([...origEnabled, AGENT_ID, PROBE_ID, HR_ID])]);
   // 从设置窗写的清单不会自己通知宠物窗（harness 的 reconcilePetWindow 就是补这一步的既有入口，
   // 它内部按 enabled 逐个 activate/deactivate）；不 reconcile，心率插件在本窗根本没跑起来。
   await reconcilePetWindow(c);

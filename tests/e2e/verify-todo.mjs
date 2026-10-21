@@ -68,6 +68,9 @@ try {
   cdp = c;
   const invoke = hostInvoke(c);
   origEnabled = await readEnabledIds(invoke);
+  const safeOrigEnabled = origEnabled.filter(
+    (id) => !["com.pet.hr-ble", "zz.status", "zz.status2"].includes(id),
+  );
   void pump(420_000);
 
   r.group("发现与激活");
@@ -89,7 +92,7 @@ try {
   // WebView2 会报「custom protocol failed / 找不到 callback id」，混进零噪音断言里
   await sleep(1500);
   // 启停清单归宿主（C1）：写从设置窗走，宠物窗调用会被门禁拒
-  await writeEnabledIds(settings.invoke, [...origEnabled, PID]);
+  await writeEnabledIds(settings.invoke, [...safeOrigEnabled, PID]);
   await reloadAndWait(c);
   await sleep(5000);
 

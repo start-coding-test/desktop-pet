@@ -248,6 +248,9 @@ try {
 try {
   const invoke = hostInvoke(c);
   origEnabled = await readEnabledIds(invoke);
+  const safeOrigEnabled = origEnabled.filter(
+    (id) => !["com.pet.hr-ble", "zz.status", "zz.status2"].includes(id),
+  );
   pump = makePump();
   void pump.run(1_200_000);
   const manifest = (await invoke("plugins_list")).v?.find((m) => m.id === PID);
@@ -271,7 +274,7 @@ try {
   }, 8000);
 
   r.group("启用与授权");
-  await writeEnabledIds(settings.invoke, [...origEnabled, PID]);
+  await writeEnabledIds(settings.invoke, [...safeOrigEnabled, PID]);
   await reloadAndWait(c);
   await setupBus();
 
@@ -607,7 +610,7 @@ try {
     return !res.ok || res.v === null ? res : null;
   }, 8000);
   r.check("撤销后存储读不到", true, !!denied && (!denied.ok || denied.v === null));
-  await writeEnabledIds(settings.invoke, [...origEnabled, PID]);
+  await writeEnabledIds(settings.invoke, [...safeOrigEnabled, PID]);
   await reloadAndWait(c);
   await setupBus();
   const reconsent = await waitConsentForPlugin(beforeConsents, 30_000);

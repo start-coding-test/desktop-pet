@@ -9,11 +9,12 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { argv, env } from "node:process";
-import { attach, createReport, listPages, openSettingsInvoker, reloadAndWait, waitForPage } from "./harness/cdp.mjs";
+import { attach, createReport, hostInvoke, listPages, openSettingsInvoker, readEnabledIds, reloadAndWait, waitForPage, writeEnabledIds } from "./harness/cdp.mjs";
 
 const PORT = Number(env.CDP_PORT ?? argv.find((a) => a.startsWith("--port="))?.split("=")[1] ?? 9223);
 // 探针插件：只为拿到一个有 http 能力的「已安装插件」身份（permission_request 按磁盘 manifest 判定
-// 声明与否，未安装的 id 连同意框都弹不出来）。它全程不被启用，也不碰插件业务逻辑。
+// 声明与否，未安装的 id 连同意框都弹不出来）。D02 起未启用插件不能申请授权：本套件在请求期间
+// 经设置窗临时把它放进启停清单，收尾恢复，不 activate。
 const PROBE_ID = "zz.httpcharset";
 const PLUGINS_DIR = resolve(import.meta.dirname, "../../plugins");
 const PROBE_DIR = join(PLUGINS_DIR, PROBE_ID);
@@ -81,6 +82,7 @@ const tencentFields = (body) => (body.match(/="([^"]*)"/)?.[1] ?? "").split("~")
 
 let c = null;
 let settings = null;
+let origEnabled = [];
 
 try {
   await waitForPage(PORT, isPetPage, 60_000);
@@ -112,6 +114,8 @@ try {
 
   c = await attach(PORT, isPetPage);
   settings = await openSettingsInvoker(PORT, c);
+  origEnabled = await readEnabledIds(hostInvoke(c));
+  await writeEnabledIds(settings.invoke, [...new Set([...origEnabled, PROBE_ID])]);
   // 上一轮中途挂掉可能留下授权或一扇没点掉的同意框。它们会让这一轮少弹一扇框
   // （残留授权直接放行），也会让 pump 把别人的框记到我们头上 —— 起手必须先排空，
   // 并且把「排空了」当成断言钉住，否则继承来的状态只会表现为偶发红。
@@ -197,6 +201,7 @@ try {
   if (c) {
     // 撤销授权（连带清掉探针存储）+ 删掉探针目录，最后换新文档把桥里的授权缓存丢掉
     if (!settings) settings = await openSettingsInvoker(PORT, c).catch(() => null);
+    if (settings) await writeEnabledIds(settings.invoke, origEnabled).catch(() => undefined);
     if (settings) await settings.invoke("permission_revoke", { pluginId: PROBE_ID }).catch(() => undefined);
     settings?.close();
     settings = null;
