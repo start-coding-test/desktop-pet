@@ -133,6 +133,15 @@ const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
 const DENY_TEXT = "本次已拒绝，关闭插件再开启后可再次申请";
 const STOP_TEXT = "插件已停用，授权请求已取消";
+/**
+ * D09 两个新口径，都写死成常量，别散在各调用点：
+ * - `DENY_LOCK_SETTLE_MS=5_000`：拒绝锁应当**立刻**把 false 交回调用方；给 5s 而不是 3s 是卡面口径
+ *   （成功路径零成本，只有实现真的坏了才会等满），超时用哨兵，不再靠 CDP 的 20 秒硬超时打断整组。
+ * - `OBSERVE_MS=1_200`：「不该出现窗」的最小观察期（6 倍扫描间隔）。窗是异步建的，几百毫秒后才落位，
+ *   只扫一次等于没扫 —— W-1 的不可证伪就出在这儿。
+ */
+const DENY_LOCK_SETTLE_MS = 5_000;
+const OBSERVE_MS = 1_200;
 
 /**
  * D07 C6：console 窗口切片。只认 reportError 的 console 行（Vite 转换后固定在
@@ -265,29 +274,141 @@ async function enableForConsent(pluginId) {
   return async () => setEnabled(before);
 }
 
-/** 有界等「该插件没有同意框」：看到窗只说明还在关闭途中，继续轮询；超时仍有关联窗才 false。 */
-async function waitNoConsent(pluginId, timeoutMs = 2_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const pages = (await listPages(PORT).catch(() => [])).filter((t) => /consent/.test(t.url));
-    let found = false;
-    for (const target of pages) {
-      let cs = null;
-      try {
-        cs = await attach(PORT, (t) => t.webSocketDebuggerUrl === target.webSocketDebuggerUrl, 8_000);
-        const name = await cs.ev(`document.getElementById('plugin-name')?.textContent ?? ''`);
-        if (consentBoxBelongsTo(name, pluginId)) {
-          found = true;
-          break;
-        }
-      } finally {
-        cs?.close();
-      }
+/**
+ * D09 W-1：「这一轮扫描有没有看到该插件的同意框」的样本序列 → 「整个观察期内都没出现」吗。
+ * 空数组按「没观察 = 没证据」判不成立。纯函数，被 `waitNoConsent` 与 `noConsentThroughout` 真实调用，
+ * 并由套件尾部的两条自测判据证伪（D09-D1 第 4 条：不许只测一个没人用的函数）。
+ */
+function absentThrough(samples) {
+  return samples.length > 0 && samples.every((found) => !found);
+}
+
+/** 一轮扫描：场上有没有属于该插件的同意框（true=看到）。 */
+async function scanConsentFound(pluginId) {
+  const pages = (await listPages(PORT).catch(() => [])).filter((t) => /consent/.test(t.url));
+  for (const target of pages) {
+    let cs = null;
+    try {
+      cs = await attach(PORT, (t) => t.webSocketDebuggerUrl === target.webSocketDebuggerUrl, 8_000);
+      const name = await cs.ev(`document.getElementById('plugin-name')?.textContent ?? ''`);
+      if (consentBoxBelongsTo(name, pluginId)) return true;
+    } finally {
+      cs?.close();
     }
-    if (!found) return true;
-    await sleep(200);
   }
   return false;
+}
+
+/** 属于该插件的同意框清单（label + 窗口里列出的能力），用于数窗与并集判定。 */
+async function consentWindowsFor(pluginId) {
+  const out = [];
+  const pages = (await listPages(PORT).catch(() => [])).filter((t) => /consent/.test(t.url));
+  for (const target of pages) {
+    let cs = null;
+    try {
+      cs = await attach(PORT, (t) => t.webSocketDebuggerUrl === target.webSocketDebuggerUrl, 8_000);
+      const name = await cs.ev(`document.getElementById('plugin-name')?.textContent ?? ''`);
+      if (!consentBoxBelongsTo(name, pluginId)) continue;
+      out.push({
+        name,
+        caps: await cs.ev(`[...document.querySelectorAll('#cap-list li')].map(li => li.textContent)`),
+        label: await cs.ev(`window.__TAURI_INTERNALS__.metadata.currentWindow.label`),
+      });
+    } finally {
+      cs?.close();
+    }
+  }
+  return out;
+}
+
+/**
+ * 「等窗消失」的有界等待（前置、判据5前置、判据6、resetConsent 都走这条）。
+ * 语义**保持**「最新一次扫描没有窗即成立」—— 窗本来就是先开后关的，改成累计观察会把这几处判反
+ * （D09-D1 第 5 条）。判定仍然过一遍 `absentThrough`（第 4 条）。
+ */
+async function waitNoConsent(pluginId, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const found = await scanConsentFound(pluginId);
+    // 只看**这一次**扫描（累计观察是 noConsentThroughout 的口径）：这几处调用方等的是
+    // 「先开后关」的尾巴，累计样本会让它们永远判 false（D09-D1 第 5 条）。
+    if (absentThrough([found])) return true;
+    if (Date.now() >= deadline) return false;
+    await sleep(200);
+  }
+}
+
+/**
+ * 「不该出现窗」的用法（D09 W-1 新增）：连续采样满 `OBSERVE_MS`，任何一次看到窗就判 false。
+ * 原来 `waitNoConsent` 是扫到第一次没有就返回 true 的瞬时快照 —— 去掉拒绝锁时开窗是几百毫秒后的事，
+ * 那种写法抓不到，判据不可证伪。这里才是「观察期内始终没有」的判定。
+ */
+async function noConsentThroughout(pluginId, observeMs = OBSERVE_MS) {
+  const samples = [];
+  const until = Date.now() + observeMs;
+  for (;;) {
+    samples.push(await scanConsentFound(pluginId));
+    if (samples.some((found) => found)) return false;
+    if (Date.now() >= until) break;
+    await sleep(200);
+  }
+  return absentThrough(samples);
+}
+
+/**
+ * D09 W-2：连续采样「这个插件到底几扇窗」，判定要求**每个样本都恰为 want 且至少一次非 0**。
+ * 单次快照会让「第二扇窗晚开」的变异（合流键退回 req_id）因时序而存活 —— 和 W-1 是同一个毛病。
+ * 先有界地等第一扇出现（这是等窗出现，不是观察期），再连续采满 `observeMs`。
+ * 返回值带 `counts` 原文，红的时候能把采样序列贴出来。
+ */
+async function sampleConsentCounts(pluginId, want, observeMs = OBSERVE_MS, firstWaitMs = 10_000) {
+  const counts = [];
+  let first = [];
+  let last = [];
+  const untilFirst = Date.now() + firstWaitMs;
+  for (;;) {
+    const windows = await consentWindowsFor(pluginId);
+    counts.push(windows.length);
+    if (windows.length > 0) {
+      first = windows;
+      last = windows;
+      break;
+    }
+    if (Date.now() >= untilFirst) return { ok: false, counts, first, last };
+    await sleep(200);
+  }
+  const until = Date.now() + observeMs;
+  while (Date.now() < until) {
+    await sleep(200);
+    last = await consentWindowsFor(pluginId);
+    counts.push(last.length);
+  }
+  // 能力并集是 400ms 一次的重绘（consent/main.ts 的轮询），1.2s 观察期里至少走 3 轮，
+  // 所以读能力要取**最后一个**样本 —— 取第一个会读到还没并完的旧列表。
+  return { ok: counts.every((n) => n === want) && counts.some((n) => n > 0), counts, first, last };
+}
+
+/**
+ * D09 W-1：让「该立刻返回 false」的请求在 `ms` 内落地，超时给哨兵而不是静默等满 CDP 的 20 秒。
+ * 超时也必须 `clearTimeout`，否则挂着的定时器会在后续轮里迟到 resolve，污染下一个用例。
+ */
+const CONSENT_NOT_SETTLED = "__consent_not_settled__";
+function settledWithin(promise, ms = DENY_LOCK_SETTLE_MS) {
+  let timer = null;
+  const sentinel = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(CONSENT_NOT_SETTLED), ms);
+  });
+  const raced = Promise.race([Promise.resolve(promise), sentinel]);
+  return raced.then(
+    (value) => {
+      clearTimeout(timer);
+      return value;
+    },
+    (err) => {
+      clearTimeout(timer);
+      throw err;
+    },
+  );
 }
 
 /** 只读一扇同意框（不点按钮），用于停用关窗用例；调用方负责关闭返回的 client。 */
@@ -1975,10 +2096,21 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     r.check("拒绝后调用被拒（默认拒绝语义）", true, denied.ok === false && /权限被拒绝/.test(denied.e));
 
     // ADR-0013 I4：同轮第二次申请命中拒绝锁，不再弹窗；停用/启用清锁后才允许恢复。
+    // D09 W-1：先让第二次调用带 5s 超时落地 —— 挂到超时就是拒绝锁没生效，当场具名红；
+    // 之前是「扫一次没窗就算过」，而开窗是异步几百毫秒后的事，那条判据抓不到任何变异。
     const pendingAllow = hookCall("status");
-    const noSecondConsent = await waitNoConsent(hookId);
+    const racedAllow = await settledWithin(pendingAllow);
+    if (racedAllow === CONSENT_NOT_SETTLED) {
+      // 锁失效会留下一扇没人答的窗；收掉它，别让后面的用例连坐丢掉尾部汇总
+      await driveConsent("deny", hookId).catch(() => null);
+    }
     const deniedAgain = await pendingAllow;
-    r.check("拒绝后同轮不再弹（第二次无新窗）", true, noSecondConsent);
+    r.check(
+      "拒绝锁下第二次调用 5s 内直接落地（不是挂到超时）",
+      "false",
+      racedAllow === CONSENT_NOT_SETTLED ? "TIMEOUT" : String(racedAllow?.ok),
+    );
+    r.check("拒绝后同轮不再弹（第二次无新窗）", true, await noConsentThroughout(hookId));
     r.check("拒绝后第二次调用仍被拒", true, deniedAgain.ok === false && /权限被拒绝/.test(deniedAgain.e));
 
     const restoreAllow = await enableForConsent(hookId);
@@ -2350,6 +2482,17 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   await setEnabled([...new Set([...enabledBeforeB3, STATUS_A, STATUS_B])]);
   await reloadAndWait(c);
   // 激活会为两个 fixture 各弹一次同意框（声明的三项能力）
+  // D09 W-2 的正对照：两个插件同能力时各自必须**恰好一扇**，连续采样都不变。
+  // 这条存在的意义是证明 `consentWindowsFor` 不是恒 0、也不是恒 1 —— 归属判定若把别人的窗算给自己
+  // （或整页扫不到窗），下面那条「各 1 扇」会当场红，而不是让上面那些「无窗」判据空转。
+  const b3SampleA = await sampleConsentCounts(STATUS_A, 1);
+  const b3SampleB = await sampleConsentCounts(STATUS_B, 1);
+  r.info("B3 数窗采样原文", JSON.stringify({ A: b3SampleA.counts, B: b3SampleB.counts }));
+  r.check(
+    "对照：两插件同能力时各自连续数窗恰为 1（证明数窗判据抓得到窗）",
+    "true|true",
+    [b3SampleA.ok, b3SampleB.ok].join("|"),
+  );
   const b3Consents = [];
   for (const id of [STATUS_A, STATUS_B]) {
     const consent = await driveConsent("allow", id).catch((err) => ({ error: String(err?.message ?? err) }));
@@ -2509,32 +2652,63 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   r.check("撤销 A 的授权后 A 的行被摘掉、回落到 B 的行", "B行3", (await bubbleNow()).text);
   // 「不误删别人的行 / 撤无关权限不误清」的反面证据：B 的行既没被摘也没被改
   r.check("撤 A 的权不动 B 的行", "B行3", (await bubbleNow()).text);
-  // 无权之后不能再设置：直接申请被拒绝锁挡下（不绕过授权）；不再走插件 setStatus，
-  // 避免它在 catch 里再发一次失败的 bus.publish 制造额外的 console 噪音。
-  const b3NoGrant = invoke_("permission_request", {
-    pluginId: STATUS_A,
-    capabilities: ["pet:say"],
-  });
+  // F-1（D03 审计）：无权之后**必须真的再试一次插件路径**。上一版为了躲 console 噪音，把这次尝试
+  // 换成直接 `permission_request`，于是后面那句「这一行没出现」成了恒假的空比较 —— 没人去挂它。
+  // 这里恢复 ctx.pet.setStatus → 桥 gated → permission_request 的真实链路，并按 D09-D1 第 3 条
+  // 在尝试前后切一段 console 窗口，单独核 zz.status 的增量。
+  // 期望增量为 0 的依据（静态推断，标［推测］，首个 E2E 日志到后按原文校正）：桥的 `gated` 只
+  // `throw deniedError(...)`（bridge.ts:119-130），worker RPC 的 catch 只 `post({ok:false})`
+  // 不打日志（worker-plugin-host.ts:180-185），夹具的 catch 用正常 bus.publish 回包；
+  // `plugin-runtime.ts:166` 那条只由 doActivate 的 catch 发，本路径不经过它。
+  // 旁证（不是证据）：fd05352 那一版就是插件路径，那一轮 verify = 346 passed, 0 failed（run 39556079629）。
+  const b3BubbleBefore = await bubbleNow();
+  r.check("F-1 前置：挂行尝试之前气泡按名确认是 B行3", "B行3", b3BubbleBefore.text);
+  const b3AttemptConsoleStart = (c.noise ?? []).length;
+  const b3NoGrant = statusCall(STATUS_A, "set", "偷挂行");
   const b3ConsentAgain = await driveConsent("deny", STATUS_A).catch(() => null);
   const b3NoGrantRes = await b3NoGrant;
+  const b3AttemptConsole = consoleWindow(b3AttemptConsoleStart, [STATUS_A]);
   r.info("撤权后再设置的同意框", b3ConsentAgain ? "弹了（已拒）" : "没弹");
   r.check(
     "撤权后无权再设置常驻行：拒掉同意框就拿不到这一行",
     "true|false",
-    [b3NoGrantRes.ok === true && b3NoGrantRes.v === false, (await bubbleNow()).text === "偷挂行"].join("|"),
+    // 标签与期望串一字不改；改的是它前面那次真调用回来了（原实质=插件试过且被拒，新实质同，取代者=它自己）
+    [b3NoGrantRes.ok === false, (await bubbleNow()).text === "偷挂行"].join("|"),
+  );
+  r.check(
+    "F-1：经插件路径再设置时桥当场就把调用拒了（不是静默丢弃）",
+    true,
+    b3NoGrantRes.ok === false && /权限被拒绝/.test(String(b3NoGrantRes.e)),
+  );
+  r.check("F-1：挂行被拒这段窗口里 zz.status 的 console 增量", 0, b3AttemptConsole.length);
+  r.check(
+    "F-1：被拒的这次挂行没有把别人的行顶掉（拒绝不是清空气泡蒙过去的）",
+    "B行3",
+    (await bubbleNow()).text,
   );
   // ADR-0013 拒绝锁：同轮再申请不新开窗，调用直接失败；停用 A 时由宿主清锁。
-  // 直接打 permission_request，避免再走插件 setStatus → 失败的 bus.publish 产生额外 console。
+  // D09 W-1：先让请求带 5s 超时落地（挂到超时就是实现坏了，当场具名红），再连续观察该窗不该出现。
   const b3Retry = invoke_("permission_request", {
     pluginId: STATUS_A,
     capabilities: ["pet:say"],
   });
-  const b3RetryNoWindow = await waitNoConsent(STATUS_A);
+  const b3Raced = await settledWithin(b3Retry);
+  if (b3Raced === CONSENT_NOT_SETTLED) {
+    // 拒绝锁失效时会留下一扇没人答的窗；收掉它，别让后面整组靠 20 秒抛错连坐丢尾部汇总
+    await driveConsent("deny", STATUS_A).catch(() => null);
+  }
   const b3RetryRes = await b3Retry;
+  r.check(
+    "B3：拒绝锁下同轮调用 5s 内直接返回 false（不是挂到超时）",
+    "true|false",
+    b3Raced === CONSENT_NOT_SETTLED
+      ? "TIMEOUT"
+      : [b3RetryRes.ok === true, b3RetryRes.v === false].join("|"),
+  );
   r.check(
     "B3 撤权拒绝后同轮不再弹（拒绝锁生效）",
     true,
-    b3RetryNoWindow && b3RetryRes.ok === true && b3RetryRes.v === false,
+    (await noConsentThroughout(STATUS_A)) && b3RetryRes.ok === true && b3RetryRes.v === false,
   );
 
   // 回收：停用要走**真的下线路径**。裸写启停清单不会让宠物窗 reconcile（watchEnabled 只缓存，
@@ -2663,13 +2837,22 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     return restore;
   };
 
+  // D09 W-1：先自证这两个 helper 判得出「有没有窗」—— 否则后面所有「无窗」判据都可能只是在测一个瞎的函数。
+  // 纯函数直接喂构造样本：中间出现过窗必须判 false；一个样本都没有按「没证据」判 false。
+  r.check("自测：absentThrough 要能抓到序列里出现过的窗", false, absentThrough([false, true, false]));
+  r.check(
+    "自测：absentThrough 对全 false 判成立、对空序列判不成立",
+    "true|false",
+    `${absentThrough([false, false])}|${absentThrough([])}`,
+  );
+
   // 7：未启用直接申请 → false 且无窗
   {
     const before = await readEnabledIds(invoke(c));
     await setEnabled(before.filter((id) => id !== CONSENT_ID));
     const res = await askConsent(["storage"]);
     r.check("未启用插件直接申请返回 false", true, res.ok === true && res.v === false);
-    r.check("未启用插件不弹同意框", true, await waitNoConsent(CONSENT_ID));
+    r.check("未启用插件不弹同意框（连续观察 1.2s 无窗）", true, await noConsentThroughout(CONSENT_ID));
     await setEnabled(before);
   }
 
@@ -2678,6 +2861,14 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     const restore = await resetConsent();
     try {
       const first = askConsent(["storage"]);
+      // D09 W-2：数窗要连续采样满 OBSERVE_MS，每个样本都恰为 1 且至少一次非 0。
+      // 单次快照等于没判 ——「第二扇窗晚开」的变异（合流键退回 req_id）就是靠时序活下来的。
+      const s1 = await sampleConsentCounts(CONSENT_ID, 1);
+      r.info("判据1 数窗采样原文", JSON.stringify(s1.counts));
+      r.check("判据1：首次启用时该插件的窗数全程恰为 1", true, s1.ok);
+      // 正对照：窗明明开着的时候，两个「无窗」helper 都必须返回 false —— 证明扫描抓得到窗。
+      r.check("对照：窗开着时 waitNoConsent 必须返回 false（证明扫描不瞎）", false, await waitNoConsent(CONSENT_ID, 600));
+      r.check("对照：窗开着时 noConsentThroughout 也必须返回 false", false, await noConsentThroughout(CONSENT_ID, 600));
       const consent = await driveConsent("allow", CONSENT_ID, ["storage"]);
       const firstRes = await first;
       r.check("判据1：首次启用只一扇同意框", true, consent.label.startsWith("consent-"));
@@ -2687,6 +2878,17 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
       try {
         const a = askConsent(["storage"]);
         const b = askConsent(["notify"]);
+        const s2 = await sampleConsentCounts(CONSENT_ID, 1);
+        r.info("判据2 数窗采样原文", JSON.stringify(s2.counts));
+        r.check("判据2：两个并发请求期间该插件的窗数全程恰为 1", true, s2.ok);
+        r.check(
+          "判据2：那一扇窗列的是两项并集（各出现一次）",
+          "1|1",
+          [
+            (s2.last[0]?.caps ?? []).filter((x) => x.includes("storage")).length,
+            (s2.last[0]?.caps ?? []).filter((x) => x.includes("notify")).length,
+          ].join("|"),
+        );
         const merged = await driveConsent("allow", CONSENT_ID, ["storage", "notify"]);
         const [ra, rb] = await Promise.all([a, b]);
         r.check("判据2：同插件并发只一扇窗且能力并集", true, merged.caps.includes("storage") && merged.caps.includes("notify"));
@@ -2732,16 +2934,32 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
       r.check("判据9：重复能力在窗口里去重", true, dupConsent.caps.filter((x) => x === "storage").length === 1);
       r.check("判据10：deny 后新增能力不授权", true, dupRes.ok === true && dupRes.v === false && !(await checkConsent("storage")) && !(await checkConsent("notify")));
 
+      // D09 W-1：先让请求带 5s 超时落地（挂到超时＝拒绝锁没生效，当场具名红），再连续观察不该有窗。
       const second = askConsent(["notify"]);
-      r.check("判据4：拒绝后同轮不再弹窗", true, await waitNoConsent(CONSENT_ID));
+      const racedSecond = await settledWithin(second);
+      if (racedSecond === CONSENT_NOT_SETTLED) await driveConsent("deny", CONSENT_ID).catch(() => null);
       const secondRes = await second;
-      r.check("判据4：拒绝后同轮调用直接 false", true, secondRes.ok === true && secondRes.v === false);
+      r.check(
+        "判据4：拒绝后同轮调用 5s 内直接 false（不是挂到超时）",
+        "true|false",
+        racedSecond === CONSENT_NOT_SETTLED ? "TIMEOUT" : [secondRes.ok === true, secondRes.v === false].join("|"),
+      );
+      r.check("判据4：拒绝后同轮不再弹窗（连续观察 1.2s 无窗）", true, await noConsentThroughout(CONSENT_ID));
 
       // 设置页撤销授权不清拒绝锁（I4）
       await settings.invoke("permission_revoke", { pluginId: CONSENT_ID });
       const afterRevoke = askConsent(["notify"]);
-      r.check("I4：撤销授权不清拒绝锁、仍不弹窗", true, await waitNoConsent(CONSENT_ID));
+      const racedRevoke = await settledWithin(afterRevoke);
+      if (racedRevoke === CONSENT_NOT_SETTLED) await driveConsent("deny", CONSENT_ID).catch(() => null);
       const afterRevokeRes = await afterRevoke;
+      r.check(
+        "I4：撤销授权后同轮调用 5s 内直接 false（不是挂到超时）",
+        "true|false",
+        racedRevoke === CONSENT_NOT_SETTLED
+          ? "TIMEOUT"
+          : [afterRevokeRes.ok === true, afterRevokeRes.v === false].join("|"),
+      );
+      r.check("I4：撤销授权不清拒绝锁、仍不弹窗（连续观察 1.2s 无窗）", true, await noConsentThroughout(CONSENT_ID));
       r.check("I4：撤销授权后同轮仍直接 false", true, afterRevokeRes.ok === true && afterRevokeRes.v === false);
 
       // 停用再启用清锁（判据11）
@@ -2751,14 +2969,16 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
         const retryConsent = await driveConsent("allow", CONSENT_ID, ["notify"]);
         const retryRes = await retry;
         r.check("判据11：停用再启用后拒绝锁已清，可再次弹窗", true, retryConsent.caps.includes("notify"));
-        r.check("判据5：已授权能力再次申请不弹窗", true, retryRes.ok === true && retryRes.v === true);
+        // F-5（D03 审计 W-5）：这条的谓词是判据11 那次答复的后半，本来就没断「不弹窗」—— 改名对齐名实。
+        // I3（已授权不再弹）的实质由紧下面这两条承担，它们一个字没动。
+        r.check("判据11：清锁后再次申请的答复为 true", true, retryRes.ok === true && retryRes.v === true);
         // 上一个窗口的销毁是异步尾巴；先等它消失，再断言“已授权不再开窗”。
         r.check("判据5前置：答完后旧窗已关闭", true, await waitNoConsent(CONSENT_ID, 10_000));
         const already = await askConsent(["notify"]);
         r.check(
           "判据5：已授权请求直接 true 且无窗",
           true,
-          already.ok === true && already.v === true && (await waitNoConsent(CONSENT_ID)),
+          already.ok === true && already.v === true && (await noConsentThroughout(CONSENT_ID)),
         );
       } finally {
         await restore11();
@@ -2776,7 +2996,19 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
       const opened = await waitConsentWindow(CONSENT_ID);
       const before = await readEnabledIds(invoke(c));
       await setEnabled(before.filter((id) => id !== CONSENT_ID));
-      r.check("判据6：停用插件后同意框关闭", true, await waitNoConsent(CONSENT_ID, 10_000));
+      // F-5（D03 审计 W-4）：预算按 ADR-0013 §5 判据6 原文的 **5s**，上一版偷偷放宽到 10s。
+      // 起算点就是上面那次停用调用返回之后（不含任何观察期）；红时把实际耗时带进 detail，
+      // 一眼分清「窗根本没关」与「关得慢」——要放宽得由日志原文去改 ADR，不许在代码里悄悄放。
+      const closedStartedAt = Date.now();
+      const closedInBudget = await waitNoConsent(CONSENT_ID, 5_000);
+      const closedElapsed = Date.now() - closedStartedAt;
+      r.info("判据6 关窗读数", `预算 5000ms，实测 ${closedElapsed}ms`);
+      // 实际值带耗时：红的时候失败清单里就直接写着「没关，已等 Xms」，不用再回去翻日志
+      r.check(
+        "判据6：停用插件后同意框关闭",
+        "5s 内关掉",
+        closedInBudget ? "5s 内关掉" : `5s 内没关掉（已等 ${closedElapsed}ms）`,
+      );
       const res = await pending;
       r.check("判据6：停用后等待方返回 false", true, res.ok === true && res.v === false);
       opened.cs.close();
