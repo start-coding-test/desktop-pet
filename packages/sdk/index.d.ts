@@ -99,6 +99,15 @@ export interface PluginStorage {
   delete(key: string): Promise<void>;
 }
 
+/** 插件凭据存储（B07 / ADR-0012；Rust services/secrets.rs，DPAPI 当前用户加密，按插件 id 隔离）。
+ * 需要能力 `storage`；**widget 拿不到**。值只收字符串，未设置 resolve 出 null，
+ * 解密失败/非 Windows 一律 reject，绝不回落明文。 */
+export interface PluginSecrets {
+  get(key: string): Promise<string | null>;
+  set(key: string, value: string): Promise<void>;
+  delete(key: string): Promise<void>;
+}
+
 /** 宠物窗桥侧 BLE（bridge.ts:141-172）。扫描与连接会话按插件持有者计数（src/runtime/resources.ts:12-25）：
  * 不是最后一个持有者时 stopScan / disconnect 静默成功、不发 IPC（bridge.ts:155、167）。 */
 export interface PluginBle {
@@ -125,6 +134,8 @@ export interface PluginContext {
   bus: PluginBus;
   /** bridge.ts:135-139 */
   storage: PluginStorage;
+  /** bridge.ts:135-152；凭据专用，需要能力 `storage`（B07 / ADR-0012） */
+  secrets: PluginSecrets;
   /** bridge.ts:141-172；本机无蓝牙硬件，未经真实设备验证 */
   ble: PluginBle;
   /** 向自己的 widget 推数据，走 `<id>:widget` topic；需要能力 `widget`（bridge.ts:175-179） */

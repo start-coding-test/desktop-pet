@@ -186,7 +186,7 @@ class WorkerPluginHost {
   }
 
   /**
-   * 派发表：22 个「纯参数进、纯值出」的方法逐条点名，返回类型写成 `Record<ProxiedMethod, …>`
+   * 派发表：25 个「纯参数进、纯值出」的方法逐条点名，返回类型写成 `Record<ProxiedMethod, …>`
    * —— 协议里加了方法名而这里没实现，当场编译不过。
    * bus.subscribe 与 log 不在表里：它们的参数或返回里有函数，只能特判。
    */
@@ -197,6 +197,9 @@ class WorkerPluginHost {
       "storage.get": (args) => ctx.storage.get(String(args[0])),
       "storage.set": (args) => ctx.storage.set(String(args[0]), args[1]),
       "storage.delete": (args) => ctx.storage.delete(String(args[0])),
+      "secrets.get": (args) => ctx.secrets.get(String(args[0])),
+      "secrets.set": (args) => ctx.secrets.set(String(args[0]), String(args[1])),
+      "secrets.delete": (args) => ctx.secrets.delete(String(args[0])),
       "ble.startScan": () => ctx.ble.startScan(),
       "ble.stopScan": () => ctx.ble.stopScan(),
       "ble.connect": (args) => ctx.ble.connect(String(args[0])),

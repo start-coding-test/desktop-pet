@@ -182,6 +182,18 @@ export function buildContext(manifest: ManifestLike): PluginContext {
       delete: gated(manifest, STORAGE, (key: string) => storage.delete(key) as Promise<void>),
     },
 
+    secrets: {
+      get: gated(manifest, STORAGE, (key: string) =>
+        hostCall<string | null>("secrets_get", { pluginId: pid, key }),
+      ),
+      set: gated(manifest, STORAGE, (key: string, value: string) =>
+        hostCall<void>("secrets_set", { pluginId: pid, key, value }),
+      ),
+      delete: gated(manifest, STORAGE, (key: string) =>
+        hostCall<void>("secrets_delete", { pluginId: pid, key }),
+      ),
+    },
+
     ble: {
       startScan: gated(manifest, BLE_SCAN, async () => {
         // 先 claim 是对的（并发时不该有两个「开始扫描」），但失败必须对称回滚：

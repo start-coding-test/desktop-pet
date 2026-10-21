@@ -8,14 +8,17 @@
 // 错误的规整（asHostError）留在宿主侧做，Worker 只消费 `{code, message}` 这个纯负载。
 import catalog from "../../packages/sdk/error-codes.json" with { type: "json" };
 
-/** 面向插件的 24 个方法（点号命名空间）。`log` 不占能力，但同样只能走这条通道。
- *  24 = 22 的底座 + A02 的 `agentHooks.set`（第 23）+ B3 的 `pet.setStatus`（第 24），见 ADR-0006 增项记录。 */
+/** 面向插件的 27 个方法（点号命名空间）。`log` 不占能力，但同样只能走这条通道。
+ *  27 = 22 的底座 + A02 的 `agentHooks.set`（第 23）+ B3 的 `pet.setStatus`（第 24）+ B07 的 `secrets.*`（第 25–27），见 ADR-0006 增项记录。 */
 export const PLUGIN_WORKER_METHODS = [
   "bus.publish",
   "bus.subscribe",
   "storage.get",
   "storage.set",
   "storage.delete",
+  "secrets.get",
+  "secrets.set",
+  "secrets.delete",
   "ble.startScan",
   "ble.stopScan",
   "ble.connect",
@@ -41,8 +44,8 @@ export const PLUGIN_WORKER_METHODS = [
 export type WorkerMethod = (typeof PLUGIN_WORKER_METHODS)[number];
 
 /**
- * 宿主派发表要覆盖的方法：24 个里除去 `bus.subscribe`（参数带函数）与 `log`（不回包），
- * 剩下 22 个都是「纯参数进、纯值出」，可以做成一张表 —— 表的完备性由 Record 类型钉住。
+ * 宿主派发表要覆盖的方法：27 个里除去 `bus.subscribe`（参数带函数）与 `log`（不回包），
+ * 剩下 25 个都是「纯参数进、纯值出」，可以做成一张表 —— 表的完备性由 Record 类型钉住。
  */
 export type ProxiedMethod = Exclude<WorkerMethod, "bus.subscribe" | "log">;
 

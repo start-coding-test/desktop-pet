@@ -394,3 +394,11 @@ MVP 范围：<这一轮只做什么>
 | G2 | `ctx.http.request` 只返回 `status` / `content_type` / `body` / `truncated`，没有响应头。 | 429 无法读 `Retry-After`，只用本地冷却阶梯 60s→2m→5m→15m→30m。 | 在 `HttpResponse` 增加 `headers`（至少 `retry-after`）或 `retryAfterMs` 字段；桥与 Rust 同改。 |
 | G3 | Widget 在 Worker 里没有 `matchMedia` / 主题能力，无法跟随系统深浅色。 | badge / overlay 固定深色、设置页固定浅色；不接 `navigator.clipboard`，外链只显示文本。 | 评估 `ctx.theme` 或 `layout` 推送带 `colorScheme`；剪贴板另开能力卡。 |
 | G4 | 系统代理 / `HTTP(S)_PROXY`：宿主 `ureq::AgentBuilder` 未配置 proxy，代码没有读取系统/Clash 代理的路径（`src-tauri/src/services/http.rs:40-50`）。 | 需要代理才出网的环境（Clash `127.0.0.1:7897`）可能失败；插件没有绕过方式。 | 评估 `ctx.http.request` 读取系统代理或增加显式 proxy 配置；另拆宿主卡，本行仅登记 C05 预检发现。 |
+
+## 6. 宿主凭据存储（B07，2026-10-21）
+
+- `ctx.secrets.get/set/delete` 已落地（能力复用 `storage`，widget 不开放）：`plugins/<id>/secrets.json`，
+  值用 Windows DPAPI（当前用户 + `CRYPTPROTECT_UI_FORBIDDEN`）加密，熵为 `pet-secrets:v1:<plugin_id>`；
+  非 Windows / 解密失败一律报错，不回落明文。
+- 旧 `store.json` 明文凭据的 `copy→verify→clear` 迁移归 C06；宿主不读不写 `store.json` 的秘密字段。
+- 残余：`plugin_id` 仍由调用方自报，同 realm 冒名未收口（ADR-0006 / ADR-0011）；DPAPI 只保护静态数据。

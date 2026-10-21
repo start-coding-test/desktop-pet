@@ -64,7 +64,7 @@ export async function deactivate() { /* 停用/移除时调用 */ }
 |---|---|---|---|
 | `bus:publish` | `ctx.bus.publish` | 只能发布 `<自己的 id>:` 前缀的 topic | — |
 | `bus:subscribe` | `ctx.bus.subscribe` | **用了这个 API 就要声明**（不声明会在激活时被拒）。声明之后订阅自己前缀不需要额外授权；跨命名空间只认**公开 topic**（名单见 `packages/sdk/topics.js` 的 `PUBLIC_TOPICS`），其他插件的私有 topic 一律拒 | — |
-| `storage` | `ctx.storage.*` | 每插件独立 JSON 存储，宿主按 id 隔离落盘 | 风险 |
+| `storage` | `ctx.storage.*` / `ctx.secrets.*` | 每插件独立 JSON 存储 + DPAPI 加密的凭据存储；宿主按 id 隔离落盘 | 风险 |
 | `ble:scan` | `ctx.ble.startScan/stopScan` | 蓝牙扫描 | — |
 | `ble:connect` | `ctx.ble.connect/disconnect/connectedDevice` | 连接与订阅通知 | — |
 | `widget` | `ctx.widget.update` | 向自己的 widget 推数据（走 `<id>:widget` topic） | — |
@@ -123,6 +123,21 @@ setStatus(text: string | null): Promise<string | null>
 - **回收**：插件停用 / 卸载 / 撤销授权 / 重载 / Worker 崩溃或被收 —— 宿主都会摘掉它那条，不需要你写清理代码。
 - **随机台词让路**：你挂着常驻行时，宿主自己的随机台词（挂机打盹、闲置自言自语、启动问候）不弹；用户戳宠物这类**主动**触发的台词照旧优先占用槽，3.6 秒后回到你的常驻行。
 - **几何**：气泡永不越出立绘宽、不加高窗口、不缩字号；常驻行压成单行（台词仍可折行）。
+
+### 4.2 凭据存储 `ctx.secrets.get/set/delete`（B07）
+
+```ts
+get(key: string): Promise<string | null>
+set(key: string, value: string): Promise<void>
+delete(key: string): Promise<void>
+```
+
+- **用途**：API Key、Cookie、refresh token 这类「泄漏即失陷」的值。普通 `ctx.storage` 仍是明文 JSON，别把凭据放进去；`ctx.secrets` 的值落到 `plugins/<id>/secrets.json`，用 Windows DPAPI（当前用户）加密，熵绑定插件 id。
+- **能力**：复用 `storage`，不需要新声明；**widget 拿不到**（`WIDGET_CALL_METHODS` 没有这三个名字）。
+- **语义**：未设置 `get` 返回 `null`（不是 `""`）；`set` 只收字符串，key ≤64 字符且只含 `[A-Za-z0-9._-]`，值 ≤16 KiB；`delete` 幂等。
+- **失败面**：非 Windows ⇒ `unsupported`；解密失败/文件损坏 ⇒ `internal` / `parse`；任何失败都**不写、不删、不回落明文**。插件应把错误展示给用户（例如「凭据无法解密，请重新输入」），不要静默当空值。
+- **迁移**：宿主不会自动迁移 `store.json` 里的旧明文凭据；迁移由插件做 `copy → verify → clear`（C06 落地）。回滚后旧版宿主不认识 `secrets.json`，用户需要重新输入。
+- **残余**：DPAPI 只保护静态数据，不解决同 realm 插件冒用 id；见 [ADR-0012](../adr/0012-plugin-credential-store.md)。
 
 ### topic 命名空间规则
 
