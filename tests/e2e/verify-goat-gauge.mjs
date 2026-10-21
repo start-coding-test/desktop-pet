@@ -22,6 +22,7 @@ const PORT = Number(env.CDP_PORT ?? argv.find((a) => a.startsWith("--port="))?.s
 const PID = "com.pet.goat-gauge";
 const OVERLAY_LABEL = `overlay-${PID.replace(/[.]/g, "_")}`;
 const TEST_KEY = "sk-goat-e2e-DO-NOT-LEAK-9f4c2a";
+const TEST_COOKIE = "cookie-goat-e2e-DO-NOT-LEAK-7b1d3e";
 const ONLINE = Boolean(env.GOAT_GAUGE_KEY) && env.GOAT_GAUGE_ONLINE === "1";
 
 const isPetPage = (t) => /localhost:1420\/(src\/)?index\.html$/.test(t.url);
@@ -191,12 +192,12 @@ async function storeGet(key) {
   return res.ok ? res.v : null;
 }
 
-/** 先 clearKey，再等存储里的 apiKey 真的为空；收尾/在线组都走这里。 */
+/** 先 clearKey，再等 secrets 里的 apiKey 真的为空；收尾/在线组都走这里。 */
 async function clearCred(timeoutMs = 8000) {
   await send({ action: "clearKey" });
   return pollUntil(async () => {
-    const cred = await storeGet("cred");
-    return cred && cred.apiKey === "" ? cred : null;
+    const res = await hostInvoke(c)("secrets_get", { pluginId: PID, key: "apiKey" });
+    return res.ok && res.v === null ? true : null;
   }, timeoutMs);
 }
 
@@ -499,16 +500,51 @@ try {
 
   r.group("凭据：Key 不出现在视图/日志");
   await send({ action: "saveKey", key: TEST_KEY });
-  const storedCred = await pollUntil(async () => {
-    const cred = await storeGet("cred");
-    return cred?.apiKey === TEST_KEY ? cred : null;
+  const storedSecret = await pollUntil(async () => {
+    const res = await hostInvoke(c)("secrets_get", { pluginId: PID, key: "apiKey" });
+    return res.ok && res.v === TEST_KEY ? res.v : null;
   }, 8000);
-  r.check("测试 Key 已写入插件存储", TEST_KEY, storedCred?.apiKey);
+  const storedCred = await storeGet("cred");
+  r.check("测试 Key 已写入 secrets（不回写明文 store）", TEST_KEY, storedSecret);
+  r.check("store.cred 不含 apiKey 明文", undefined, storedCred?.apiKey);
   const peeked = await peekWidget();
   r.check("widget payload 不含测试 Key", false, JSON.stringify(peeked ?? null).includes(TEST_KEY));
   const logPath = join(env.LOCALAPPDATA ?? "", "com.desktoppet.pet", "logs", "host.log");
   const logHit = existsSync(logPath) && readFileSync(logPath, "utf8").includes(TEST_KEY);
   r.check("host.log 不含测试 Key", false, logHit);
+
+  r.group("凭据：Cookie 不进 widget/panel/log");
+  await send({ action: "saveCookie", cookie: TEST_COOKIE });
+  const storedCookie = await pollUntil(async () => {
+    const res = await hostInvoke(c)("secrets_get", { pluginId: PID, key: "cookie" });
+    return res.ok && res.v === TEST_COOKIE ? res.v : null;
+  }, 8000);
+  r.check("测试 Cookie 已写入 secrets", TEST_COOKIE, storedCookie);
+  const cookieView = await readView();
+  const cookiePeek = await peekWidget();
+  r.check(
+    "widget/readView 不含测试 Cookie/Key",
+    false,
+    JSON.stringify(cookieView ?? null).includes(TEST_COOKIE) ||
+      JSON.stringify(cookieView ?? null).includes(TEST_KEY) ||
+      JSON.stringify(cookiePeek ?? null).includes(TEST_COOKIE) ||
+      JSON.stringify(cookiePeek ?? null).includes(TEST_KEY),
+  );
+  const panelPayload = await c.ev("window.__seen.panel.at(-1) ?? null");
+  r.check(
+    "panel payload 不含测试 Cookie/Key",
+    false,
+    JSON.stringify(panelPayload ?? null).includes(TEST_COOKIE) ||
+      JSON.stringify(panelPayload ?? null).includes(TEST_KEY),
+  );
+  const cookieLogHit = existsSync(logPath) && readFileSync(logPath, "utf8").includes(TEST_COOKIE);
+  r.check("host.log 不含测试 Cookie", false, cookieLogHit);
+  await send({ action: "clearCookie" });
+  const clearedCookie = await pollUntil(async () => {
+    const res = await hostInvoke(c)("secrets_get", { pluginId: PID, key: "cookie" });
+    return res.ok && res.v === null ? true : null;
+  }, 8000);
+  r.check("清除 Cookie 后 secrets 为空", true, clearedCookie === true);
 
   const beforeClearFetched = Number((await readView())?.fetchedAt) || 0;
   const clearedDemo = await clearCred();
