@@ -6,6 +6,7 @@ pub mod enabled;
 pub mod fullscreen;
 pub mod hotkeys;
 pub mod http;
+pub mod http_proxy;
 pub mod notify;
 pub mod permission;
 pub mod secrets;

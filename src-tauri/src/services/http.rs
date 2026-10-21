@@ -1,9 +1,10 @@
 use std::io::Read;
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use super::http_proxy::{self, ProxySettings};
 use super::permission::PermissionState;
 use crate::host_error::{HostError, DENIED, INTERNAL, INVALID_ARG, NETWORK, PARSE};
 
@@ -12,8 +13,13 @@ use crate::host_error::{HostError, DENIED, INTERNAL, INVALID_ARG, NETWORK, PARSE
 /// 为什么必须由宿主代发：CSP 的 connect-src 只放行 'self' 与 ipc:，插件在 webview 里
 /// 直连外域本来就走不通；同时按「插件 × 域名」逐个授权，才不会出现某个插件声明了
 /// http 就能访问任意主机（含内网与云元数据端点）。
+///
+/// 系统代理（B10）：`ureq` 2.12 的代理只能建在 `Agent` 上（请求级没有 proxy 参数），
+/// 而「回环/私网目标永不走代理」必须按**目标**判 ⇒ 只能两个 agent 并存、按跳选路。
 pub struct HttpState {
-    agent: OnceLock<ureq::Agent>,
+    direct: OnceLock<ureq::Agent>,
+    /// 设置快照 + 走代理的那个 agent。锁只在取快照与克隆 agent 时持有，**不跨网络请求**。
+    proxy: Mutex<Option<CachedSettings>>,
 }
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -21,6 +27,28 @@ const MAX_BODY_BYTES: usize = 1 << 20; // 1 MiB：防止某个大响应吃掉内
 /// 重定向由我们自己逐跳跟：ureq 自动跟的话只校验首跳域名，
 /// 拿到一个已授权域名的插件就能弹到任意主机（内网、169.254.169.254）
 const MAX_REDIRECTS: usize = 5;
+/// 每次请求都问一次系统代理（行为 4：用户开关 Clash 不用重启宿主）。
+/// TTL 只是「同一个瞬间的并发请求不必各读一遍注册表」的合并窗口，不是缓存陈旧的上限。
+const PROXY_TTL: Duration = Duration::from_secs(5);
+
+/// 一次请求的路由视图：拿完之后与 `HttpState` 再无关系（agent 是 `Arc` 包底的廉价克隆）。
+/// http 与 https 各一个代理 agent：注册表的 `ProxyServer` 可以按协议给两个不同端点
+/// （`http=a:80;https=b:443`），只建一份就会把 https 塞进 http 那条代理里。
+pub struct Route {
+    direct: ureq::Agent,
+    proxied_http: Option<ureq::Agent>,
+    proxied_https: Option<ureq::Agent>,
+    settings: ProxySettings,
+}
+
+struct CachedSettings {
+    fetched_at: Instant,
+    settings: ProxySettings,
+    http_key: Option<String>,
+    https_key: Option<String>,
+    http_agent: Option<ureq::Agent>,
+    https_agent: Option<ureq::Agent>,
+}
 
 #[derive(Serialize)]
 pub struct HttpResponse {
@@ -30,23 +58,105 @@ pub struct HttpResponse {
     pub truncated: bool,
 }
 
+/// `redirects(0)` 与三个 timeout 是两个 agent 共用的口径 —— 走代理**不许**顺带把
+/// 「宿主自己跟重定向并逐跳复核授权」这条改成 ureq 自动跟。
+fn build_agent(proxy: Option<&str>) -> ureq::Agent {
+    let builder = ureq::AgentBuilder::new()
+        .timeout_connect(TIMEOUT)
+        .timeout_read(TIMEOUT)
+        .timeout_write(TIMEOUT)
+        // 0 = 不自动跟重定向，3xx 原样返回给 send_following_redirects 逐跳复核域名
+        .redirects(0);
+    match proxy.and_then(|url| ureq::Proxy::new(url).ok()) {
+        Some(p) => builder.proxy(p),
+        None => builder,
+    }
+    .build()
+}
+
 impl HttpState {
     pub fn new() -> Self {
         Self {
-            agent: OnceLock::new(),
+            direct: OnceLock::new(),
+            proxy: Mutex::new(None),
         }
     }
 
-    fn agent(&self) -> &ureq::Agent {
-        self.agent.get_or_init(|| {
-            ureq::AgentBuilder::new()
-                .timeout_connect(TIMEOUT)
-                .timeout_read(TIMEOUT)
-                .timeout_write(TIMEOUT)
-                // 0 = 不自动跟重定向，3xx 原样返回给 send_following_redirects 逐跳复核域名
-                .redirects(0)
-                .build()
-        })
+    fn direct(&self) -> ureq::Agent {
+        self.direct.get_or_init(|| build_agent(None)).clone()
+    }
+
+    /// 取一份本次请求用的路由：TTL 内复用快照，否则重读注册表 + 环境变量。
+    fn route(&self) -> Route {
+        let direct = self.direct();
+        let mut guard = self.proxy.lock().unwrap_or_else(|p| p.into_inner());
+        let fresh = guard
+            .as_ref()
+            .is_some_and(|c| c.fetched_at.elapsed() < PROXY_TTL);
+        if !fresh {
+            let settings = http_proxy::current_settings();
+            let previous = guard.take();
+            *guard = Some(CachedSettings {
+                fetched_at: Instant::now(),
+                http_agent: refresh_agent(
+                    previous.as_ref().map(|c| (&c.http_key, &c.http_agent)),
+                    settings.http.as_ref(),
+                ),
+                https_agent: refresh_agent(
+                    previous.as_ref().map(|c| (&c.https_key, &c.https_agent)),
+                    settings.https.as_ref(),
+                ),
+                http_key: settings.http.as_ref().map(|s| s.key()),
+                https_key: settings.https.as_ref().map(|s| s.key()),
+                settings,
+            });
+        }
+        let cached = guard.as_ref().expect("上面刚写过");
+        Route {
+            direct,
+            proxied_http: cached.http_agent.clone(),
+            proxied_https: cached.https_agent.clone(),
+            settings: cached.settings.clone(),
+        }
+    }
+}
+
+/// 端点没换就留住原来的 agent（连接池不白丢）；换了就重建；这一档没有代理就是 None。
+fn refresh_agent(
+    previous: Option<(&Option<String>, &Option<ureq::Agent>)>,
+    spec: Option<&http_proxy::ProxySpec>,
+) -> Option<ureq::Agent> {
+    let key = spec.map(|s| s.key())?;
+    if previous.is_some_and(|(old, agent)| agent.is_some() && old.as_deref() == Some(key.as_str()))
+    {
+        return previous.and_then(|(_, agent)| agent.clone());
+    }
+    Some(build_agent(Some(
+        &spec.expect("上面判过 key 存在").to_url(),
+    )))
+}
+
+impl Route {
+    /// 这一跳走哪儿。**判不出目标（理论上不该发生）就直连** —— 代理是那条把流量交给
+    /// 第三方进程的路线，判不明白时不该选它。
+    fn agent_for(&self, url: &tauri::Url) -> ureq::Agent {
+        // 判定只有一处实现：`http_proxy::hop_uses_proxy`（单测钉的就是它）
+        match self.settings.proxy_scheme_for(url.as_str()) {
+            // 决策说有代理却拿不到对应 agent（理论上不该发生）⇒ 退回直连，绝不猜一个代理用
+            Some("https") => self
+                .proxied_https
+                .clone()
+                .unwrap_or_else(|| self.direct.clone()),
+            Some(_) => self
+                .proxied_http
+                .clone()
+                .unwrap_or_else(|| self.direct.clone()),
+            None => self.direct.clone(),
+        }
+    }
+
+    fn redact(&self, text: String) -> String {
+        http_proxy::redact(&text, &self.settings)
     }
 }
 
@@ -102,7 +212,7 @@ fn check_granted(state: &PermissionState, plugin_id: &str, host: &str) -> Result
 /// 逐跳发送并校验域名。重定向不再由 ureq 自动跟随：每一跳的新 host 都要重新过一次授权，
 /// 换主机时还把 authorization / cookie 摘掉，免得凭据跟着跳转漏给另一个域名。
 fn send_following_redirects(
-    agent: &ureq::Agent,
+    route: &Route,
     granted: &[String],
     url: &str,
     method: &str,
@@ -126,6 +236,8 @@ fn send_following_redirects(
         let cross_host = hop > 0 && host != last_host;
         last_host = host;
 
+        // 每一跳都用**该跳的目标**重新决定走不走代理：公网 → 内网的重定向不能沿用上一跳的代理路线
+        let agent = route.agent_for(&current);
         let mut req = agent.request(&method, current.as_str());
         for (name, value) in headers {
             if is_valid_header_name(name) && !(cross_host && is_credential_header(name)) {
@@ -136,7 +248,8 @@ fn send_following_redirects(
             Some(text) => req.send_string(text),
             None => req.call(),
         }
-        .map_err(|e| HostError::new(NETWORK, format!("请求失败: {e}")))?;
+        // 走代理时 ureq 的报错会把代理端点（可能连凭据一起）带出来 ⇒ 出口前先洗一遍（B10 行为 3）
+        .map_err(|e| HostError::new(NETWORK, route.redact(format!("请求失败: {e}"))))?;
 
         let status = resp.status();
         if !(300..400).contains(&status) {
@@ -277,9 +390,10 @@ pub async fn http_request(
     // 阻塞线程里拿不到 State，先把这个插件已授权的能力取一份快照带进去
     let granted = perms.granted_caps(&plugin_id);
     let headers = headers.unwrap_or_default();
-    let agent = http.agent().clone();
+    // 取路由 = 读一次系统代理设置（TTL 内复用）；锁在这里就放掉了，不跨网络请求持有
+    let route = http.route();
     let sent = tauri::async_runtime::spawn_blocking(move || {
-        send_following_redirects(&agent, &granted, &url, &method, &headers, body.as_deref())
+        send_following_redirects(&route, &granted, &url, &method, &headers, body.as_deref())
     })
     .await
     .map_err(|e| HostError::new(INTERNAL, format!("HTTP 任务失败: {e}")))??;
