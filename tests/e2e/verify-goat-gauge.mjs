@@ -387,6 +387,35 @@ try {
   const page = await openPluginPage();
   r.check("插件页已挂载", true, page.hostOk);
   r.check("插件页在 Worker realm", "worker", page.realm);
+  const detailTabs = await shadowText(settings.client, settingsHost, ".g-tabs").catch(() => "");
+  r.check("设置页有明细 tab", true, detailTabs.includes("明细"));
+  const detailRanges = await shadowText(settings.client, settingsHost, ".g-detail-tabs").catch(() => "");
+  r.check(
+    "明细有今天/7 天/30 天/全部",
+    true,
+    ["今天", "7 天", "30 天", "全部"].every((label) => detailRanges.includes(label)),
+  );
+  const detailText = await shadowText(settings.client, settingsHost, ".g-details").catch(() => "");
+  r.check("明细注明最近 90 天 / 300 条", true, detailText.includes("最近 90 天 / 300 条"));
+  r.check("明细使用 HTML 降级（无 SVG）", 0, await shadowCount(settings.client, settingsHost, ".g-details svg").catch(() => -1));
+  r.check(
+    "明细空态/占位可见",
+    true,
+    detailText.includes("还没有明细数据") || detailText.includes("模型成本：—"),
+  );
+  const detailsPanelPayload = await c.ev("window.__seen.panel.at(-1) ?? null");
+  const detailsPanelKeys = Object.keys(detailsPanelPayload ?? {}).sort();
+  r.check(
+    "panel 键集含 daily/records/charts/cookieState",
+    true,
+    ["charts", "cookieState", "daily", "records"].every((key) => detailsPanelKeys.includes(key)),
+  );
+  r.check(
+    "panel 不含测试 Cookie/Key 值",
+    false,
+    JSON.stringify(detailsPanelPayload ?? null).includes(TEST_COOKIE) ||
+      JSON.stringify(detailsPanelPayload ?? null).includes(TEST_KEY),
+  );
   await send({ action: "saveConfig", config: { refreshSec: 120 } });
   const firstCfg = await pollUntil(async () => {
     const current = await storeGet("config");
@@ -509,6 +538,8 @@ try {
   r.check("store.cred 不含 apiKey 明文", undefined, storedCred?.apiKey);
   const peeked = await peekWidget();
   r.check("widget payload 不含测试 Key", false, JSON.stringify(peeked ?? null).includes(TEST_KEY));
+  const keyPanelPayload = await c.ev("window.__seen.panel.at(-1) ?? null");
+  r.check("panel payload 不含测试 Key", false, JSON.stringify(keyPanelPayload ?? null).includes(TEST_KEY));
   const logPath = join(env.LOCALAPPDATA ?? "", "com.desktoppet.pet", "logs", "host.log");
   const logHit = existsSync(logPath) && readFileSync(logPath, "utf8").includes(TEST_KEY);
   r.check("host.log 不含测试 Key", false, logHit);

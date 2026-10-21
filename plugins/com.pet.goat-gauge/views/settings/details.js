@@ -93,6 +93,8 @@ export function cacheHitRate({ cacheReadTokens = 0, tokensIn = 0, inputIncludesC
   const read = Number(cacheReadTokens) || 0;
   const input = Number(tokensIn) || 0;
   const denominator = inputIncludesCache ? input : read + input;
+  // 上游 tokens_in 是否已含 cache 无法离线证明［推测］；默认 false（分母 = cache_read + tokens_in），
+  // 探测为 true 时传入 inputIncludesCache=true（分母只用 tokens_in）。真实语义留本地 PM 复核。
   return denominator > 0 ? read / denominator : null;
 }
 
@@ -147,7 +149,8 @@ export function detailsModel(panel = {}, { rangeKey = "today", page = 1, now = D
 export function mountDetails(ctx, state) {
   const dom = ctx.dom;
   const box = card(dom, "明细");
-  const note = hint(dom, "口径：模型环来自 daily.by_model；明细表来自 records（最多 300 条）；全部受最近 90 天 / 300 条限制。");
+  box.className = "g-card g-details";
+  const note = hint(dom, "口径：模型环来自 daily.by_model；明细表来自 records（最多 300 条）；全部范围 = 最近 90 天 / 300 条（records 上限）；今天/7/30 按本地日历日。");
   const tabs = tag(dom, "div", "g-row g-detail-tabs");
   const rangeButtons = {};
   for (const range of DETAIL_RANGES) {

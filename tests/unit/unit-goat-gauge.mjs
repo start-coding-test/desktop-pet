@@ -83,6 +83,9 @@ const {
   paginate,
   detailsModel,
 } = await import(new URL("../../plugins/com.pet.goat-gauge/views/settings/details.js", import.meta.url));
+const { buildPanelPayload, COOKIE_STATES } = await import(
+  new URL("../../plugins/com.pet.goat-gauge/panel.js", import.meta.url)
+);
 
 /* ============================ planInfo ============================ */
 group("planInfo");
@@ -1308,8 +1311,8 @@ eq("过期文案", "会话已过期，明细暂停", COOKIE_EXPIRED_TEXT);
   const panelEnd = mainSrc.indexOf("function syncOverlay");
   const panelBlock = panelStart >= 0 && panelEnd > panelStart ? mainSrc.slice(panelStart, panelEnd) : "";
   check(
-    "panel 不含 Cookie/Key 值",
-    panelBlock.length > 0 && !panelBlock.toLowerCase().includes("cookie") && !panelBlock.includes("apiKey"),
+    "panel 不含 Cookie/Key 值（允许 cookieState 枚举）",
+    panelBlock.length > 0 && !panelBlock.includes("apiKey") && !/["']cookie["']\s*:/.test(panelBlock),
   );
 }
 
@@ -1393,6 +1396,36 @@ eq("缓存命中率分母 0", null, cacheHitRate({ cacheReadTokens: 0, tokensIn:
 
 {
   const source = readFileSync(new URL("../../plugins/com.pet.goat-gauge/main.js", import.meta.url), "utf8");
-  check("panel 只读投影 charts", source.includes("charts: Object.fromEntries"));
+  const panelSource = readFileSync(new URL("../../plugins/com.pet.goat-gauge/panel.js", import.meta.url), "utf8");
+  check("panel 只读投影 charts", source.includes("buildPanelPayload") && panelSource.includes("charts: Object.fromEntries"));
   check("明细不调用 matchMedia", !/matchMedia\s*\(/.test(readFileSync(new URL("../../plugins/com.pet.goat-gauge/views/settings/details.js", import.meta.url), "utf8")));
+}
+
+{
+  const payload = buildPanelPayload({
+    history: [[1, 2]],
+    fetchedAt: 123,
+    daily: [{ day: "2026-01-10", cost_total: 1, by_model: { m: { cost_total: 1 } } }],
+    records: [{ id: "r1", at_ms: 1, model: "m" }],
+    charts: { "2026-01-10": [{ model: "m", time_bucket: "2026-01-10", cache_read_tokens: 5 }] },
+    cookieState: "expired",
+  });
+  deep("panel 键集固定", Object.keys(payload).sort(), [
+    "charts",
+    "cookieState",
+    "daily",
+    "fetchedAt",
+    "history",
+    "records",
+  ]);
+  eq("panel cookieState 枚举", "expired", payload.cookieState);
+  check(
+    "panel 不含 Cookie/Key 值",
+    !JSON.stringify(payload).includes("cookie-goat-e2e") &&
+      !JSON.stringify(payload).includes("sk-goat-e2e") &&
+      !("apiKey" in payload) &&
+      !("cookie" in payload),
+  );
+  eq("panel cookieState 非法值回落 none", "none", buildPanelPayload({ cookieState: "bogus" }).cookieState);
+  eq("panel 允许的 cookieState 枚举", true, COOKIE_STATES.includes("unavailable") && COOKIE_STATES.includes("expired"));
 }
