@@ -50,6 +50,7 @@ function assertMarkerShape(marker) {
  * copy → verify → clear。只有所有存在的旧凭据都成功迁移/确认冲突时才写标记
  * （写 `cred` 标记即清掉旧明文）；任一失败都保留旧明文，等下次重试。
  * secrets 的 get/set 抛错时不回落明文，也不把错误值拼进返回值。
+ * @param {{ legacy?: Record<string, any>, secrets?: any, storage?: any, attempts?: number, delayMs?: number }} [options]
  */
 export async function migrateSecrets({
   legacy = {},
@@ -124,7 +125,10 @@ export async function migrateSecrets({
   return result;
 }
 
-/** internal 401/403：只删 Cookie，不碰 apiKey；删除失败也如实返回。 */
+/**
+ * internal 401/403：只删 Cookie，不碰 apiKey；删除失败也如实返回。
+ * @param {{ secrets?: any, storage?: any, attempts?: number, delayMs?: number }} [options]
+ */
 export async function clearCookieAfterAuthFailure({
   secrets,
   storage,

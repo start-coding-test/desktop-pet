@@ -3,12 +3,16 @@
 import { authEvent, evaluate } from "./alerts.js";
 import {
   fetchCredits,
+  fetchInternalCharts,
+  fetchInternalUsage,
   fetchSubscriptions,
   fetchUsageSummary,
   fetchWhoami,
   isAuthError,
   isThrottleError,
 } from "./api.js";
+import { mergeChartBuckets, mergeUsagePages, nextPageCursor } from "./internal.js";
+import { clearCookieAfterAuthFailure, migrateSecrets } from "./secrets.js";
 import { demoSnapshot, DEMO_SCENARIOS } from "./demo.js";
 import { appendHistory } from "./history.js";
 import { buildSnapshot, maskKey } from "./normalize.js";
@@ -21,6 +25,11 @@ export let ctx = null;
 
 let config = sanitizeConfig(DEFAULT_CONFIG);
 let cred = { apiKey: "", savedAt: 0 };
+let cookie = "";
+let cookieState = "none";
+let secretsReady = false;
+let records = [];
+let chartCache = [];
 /** @type {Record<string, any> | null} */
 let snapshot = null;
 /** @type {Array<Array<number | null>>} */
@@ -69,7 +78,15 @@ function status(text, level = "info") {
 
 async function persist(keys) {
   if (!ctx || !keys?.length) return;
-  const values = { schema: SCHEMA_VERSION, config, cred, snapshot, history, alertsFired };
+  // secrets 可用时 cred 只落非敏感标记；不可用时保留旧 cred，绝不丢明文。
+  const values = {
+    schema: SCHEMA_VERSION,
+    config,
+    cred: secretsReady ? { savedAt: cred.savedAt, secured: true } : cred,
+    snapshot,
+    history,
+    alertsFired,
+  };
   for (const key of keys) {
     try {
       await ctx.storage.set(key, values[key]);
@@ -97,6 +114,51 @@ async function restore() {
   alertsFired = store.alertsFired;
   needsSchemaWrite = raw.schema !== SCHEMA_VERSION;
   lastRefreshAt = Number(snapshot?.fetched_at) || 0;
+  await restoreSecrets(raw);
+}
+
+/** B 段：旧明文 copy→verify→clear；secret 不可用时保留明文，不回写明文。 */
+async function restoreSecrets(raw) {
+  secretsReady = false;
+  if (!ctx?.secrets) {
+    cookieState = "unavailable";
+    return;
+  }
+  const legacyCookie =
+    typeof raw?.cookie === "string"
+      ? raw.cookie
+      : typeof raw?.cred?.cookie === "string"
+        ? raw.cred.cookie
+        : "";
+  const legacy = {
+    apiKey: typeof cred.apiKey === "string" ? cred.apiKey : "",
+    cookie: legacyCookie,
+  };
+  if (legacy.apiKey || legacy.cookie) {
+    try {
+      const result = await migrateSecrets({
+        legacy,
+        secrets: ctx.secrets,
+        storage: { set: (key, value) => ctx.storage.set(key, value) },
+      });
+      if (result.marker?.cookieState) cookieState = result.marker.cookieState;
+    } catch {
+      cookieState = "unavailable";
+    }
+  }
+  try {
+    const storedKey = await ctx.secrets.get("apiKey");
+    if (storedKey) cred.apiKey = storedKey;
+    const storedCookie = await ctx.secrets.get("cookie");
+    if (storedCookie) {
+      cookie = storedCookie;
+      cookieState = "ready";
+    }
+    secretsReady = true;
+  } catch {
+    secretsReady = false;
+    cookieState = "unavailable";
+  }
 }
 
 function publishView() {
@@ -124,6 +186,9 @@ function publishView() {
     usage: snapshot?.usage ?? null,
     alerts: snapshot?.alerts ?? [],
     config: cloneConfig(),
+    cookie: { configured: !!cookie, state: cookieState },
+    records,
+    charts: chartCache,
     net: {
       lastMinute: gate.stats().window,
       cooldownReason,
@@ -329,8 +394,53 @@ async function handleRefreshError(err) {
   void syncOverlay();
 }
 
+/** B 段：Cookie 的 /internal usage/charts 拉取与翻页去重；401/403 只清 Cookie。 */
+async function refreshInternal() {
+  if (!ctx?.secrets || !cookie) {
+    cookieState = cookie ? "ready" : cookieState;
+    return;
+  }
+  try {
+    const pages = [];
+    const seen = new Set();
+    let cursor = "";
+    for (let i = 0; i < 5; i += 1) {
+      const page = await fetchInternalUsage(cookie, { cursor });
+      pages.push(page);
+      const pageRecords = Array.isArray(page) ? page : (page?.records ?? page?.data ?? []);
+      for (const record of pageRecords) {
+        if (record?.id) seen.add(record.id);
+      }
+      const next = nextPageCursor(page, seen);
+      if (!next) break;
+      cursor = next;
+    }
+    records = mergeUsagePages(pages);
+    const chartsPage = await fetchInternalCharts(cookie);
+    chartCache = mergeChartBuckets([
+      { data: chartsPage?.charts ?? chartsPage?.data ?? chartsPage?.records ?? [] },
+    ]);
+    cookieState = "ready";
+  } catch (err) {
+    if (isAuthError(err)) {
+      await clearCookieAfterAuthFailure({
+        secrets: ctx.secrets,
+        storage: { set: (key, value) => ctx.storage.set(key, value) },
+      });
+      cookie = "";
+      cookieState = "expired";
+      lastError = "会话已过期，明细暂停";
+      status(lastError, "warn");
+      return;
+    }
+    cookieState = "error";
+    lastError = err?.message ?? String(err);
+  }
+}
+
 async function refreshSnapshot() {
   if (busy || !alive()) return;
+  if (cookie) await refreshInternal();
   if (!config.demo && !cred.apiKey) {
     viewState = "onboarding";
     publishView();
@@ -482,6 +592,13 @@ async function handleCmd(cmd) {
           return;
         }
       }
+      try {
+        await ctx.secrets.set("apiKey", key);
+        secretsReady = true;
+      } catch {
+        status("凭据存储不可用，Key 未保存", "error");
+        return;
+      }
       resetThrottle();
       cred = { apiKey: key, savedAt: Date.now() };
       whoamiCache = null;
@@ -501,6 +618,13 @@ async function handleCmd(cmd) {
       return;
     }
     case "clearKey": {
+      try {
+        await ctx.secrets.delete("apiKey");
+        secretsReady = true;
+      } catch {
+        status("凭据清除失败，请重试", "error");
+        return;
+      }
       resetThrottle();
       cred = { apiKey: "", savedAt: 0 };
       whoamiCache = null;
@@ -518,6 +642,52 @@ async function handleCmd(cmd) {
       void syncOverlay();
       if (config.demo) scheduleNext(0);
       status("已清除 API Key", "ok");
+      return;
+    }
+    case "saveCookie": {
+      const value = typeof cmd.cookie === "string" ? cmd.cookie.trim() : "";
+      if (!value) {
+        status("请先填写 Cookie", "error");
+        return;
+      }
+      try {
+        await ctx.secrets.set("cookie", value);
+        secretsReady = true;
+      } catch {
+        cookieState = "unavailable";
+        status("Cookie 保存失败（凭据存储不可用）", "error");
+        return;
+      }
+      cookie = value;
+      cookieState = "ready";
+      try {
+        await ctx.storage.set("cookieState", cookieState);
+      } catch {
+        /* 非敏感标记写失败不影响 Cookie 已进 secrets */
+      }
+      publishView();
+      status("Cookie 已保存", "ok");
+      return;
+    }
+    case "clearCookie": {
+      try {
+        await ctx.secrets.delete("cookie");
+        secretsReady = true;
+      } catch {
+        status("Cookie 清除失败，请重试", "error");
+        return;
+      }
+      cookie = "";
+      cookieState = "none";
+      records = [];
+      chartCache = [];
+      try {
+        await ctx.storage.set("cookieState", cookieState);
+      } catch {
+        /* 非敏感标记写失败不影响清除 */
+      }
+      publishView();
+      status("已清除 Cookie", "ok");
       return;
     }
     case "saveConfig": {

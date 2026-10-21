@@ -62,6 +62,9 @@ const {
   classifyInternalStatus,
   isKeyModeSecret,
 } = await import(new URL("../../plugins/com.pet.goat-gauge/secrets.js", import.meta.url));
+const { buildInternalRequest, mergeChartBuckets, mergeUsagePages, nextPageCursor } = await import(
+  new URL("../../plugins/com.pet.goat-gauge/internal.js", import.meta.url)
+);
 
 /* ============================ planInfo ============================ */
 group("planInfo");
@@ -1089,3 +1092,71 @@ check(
 );
 deep("Key 模式只读 apiKey", KEY_MODE_SECRETS, ["apiKey"]);
 check("Key 模式不读 cookie", isKeyModeSecret("apiKey") && !isKeyModeSecret("cookie"));
+
+group("C06 internal 翻页与请求");
+
+{
+  const pages = [
+    {
+      records: [
+        { id: "a", createdAt: "2026-01-01T00:00:00Z", meta: { model: "m" } },
+        { id: "b", createdAt: "2026-01-02T00:00:00Z" },
+      ],
+    },
+    {
+      data: [
+        { id: "a", createdAt: "2026-01-03T00:00:00Z" },
+        { id: "c", createdAt: "2026-01-01T12:00:00Z" },
+      ],
+    },
+  ];
+  const merged = mergeUsagePages(pages);
+  deep("records 跨页去重 + 按时间降序", merged.map((record) => record.id), ["a", "b", "c"]);
+  eq("records 上限生效", 2, mergeUsagePages(pages, { limit: 2 }).length);
+  check("records 缺 id 丢弃", merged.every((record) => typeof record.id === "string" && record.id.length > 0));
+}
+
+{
+  const page = { records: [{ id: "a" }], nextCursor: "next" };
+  eq("有新 id 时继续翻页", "next", nextPageCursor(page, new Set()));
+  eq("无新 id 时停止翻页", null, nextPageCursor(page, new Set(["a"])));
+  eq("空页停止翻页", null, nextPageCursor({ records: [], nextCursor: "x" }, new Set()));
+}
+
+{
+  const request = buildInternalRequest("/internal/usage", "fake-cookie", {
+    cursor: "abc",
+    orgId: "o1",
+  });
+  eq("internal URL", "https://api.commandcode.ai/internal/usage?cursor=abc&orgId=o1", request.url);
+  check(
+    "internal Cookie 只在请求头",
+    request.headers.some(([key, value]) => key === "cookie" && value === "fake-cookie") &&
+      !request.url.includes("fake-cookie"),
+  );
+  check(
+    "internal 拒绝非白名单路径",
+    (() => {
+      try {
+        buildInternalRequest("/internal/other", "fake-cookie");
+        return false;
+      } catch {
+        return true;
+      }
+    })(),
+  );
+}
+
+{
+  const charts = mergeChartBuckets([
+    { data: [{ model: "m", timeBucket: "2026-01-01", requests: 1 }] },
+    {
+      data: [
+        { model: "m", timeBucket: "2026-01-01", requests: 2 },
+        { model: "m", timeBucket: "2026-01-02", requests: 1 },
+      ],
+    },
+  ]);
+  eq("charts 按 model+time_bucket 去重", 2, charts.length);
+  eq("charts 后到页为准", 2, charts.find((bucket) => bucket.time_bucket === "2026-01-01").requests);
+}
