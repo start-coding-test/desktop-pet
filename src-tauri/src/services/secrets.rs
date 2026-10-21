@@ -674,7 +674,9 @@ mod tests {
 
     #[test]
     fn dpapi_flags_forbid_ui_and_keep_current_user_scope() {
-        let src = include_str!("secrets.rs");
+        // CI 的 checkout 是 CRLF（autocrlf），源码里按 `\n` 定位前先归一化：
+        // 这条断言钉的是调用块的形状，不该被行尾格式影响。
+        let src = include_str!("secrets.rs").replace("\r\n", "\n");
         let start = src.find("\nfn dpapi(").expect("找不到 dpapi 函数");
         let rest = &src[start..];
         let end = rest.find("\n}\n").expect("找不到 dpapi 函数结尾");
