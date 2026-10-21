@@ -21,6 +21,9 @@ import { waitWidgetRealm } from "./harness/widget-realm.mjs";
 import { NET_ID, PROBE_ID, SPOOF_DIR, removeFixtures, writeFixtures } from "./harness/fixtures.mjs";
 
 const PORT = Number(env.CDP_PORT ?? argv.find((a) => a.startsWith("--port="))?.split("=")[1] ?? 9223);
+// D03 baseline only：本文件只存在于 tmp/d03-baseline，不进入 feat/d03-consent-e2e。
+// 失败继续收集模式：不改期望、不加 sleep；任何失败仍由 r.summary() 以非零退出。
+const D03_BASELINE = true;
 const PLUGINS_DIR = resolve(import.meta.dirname, "../../plugins");
 // 没有 APPDATA 时 join('', ...) 会把存储路径指到 cwd 下的相对路径，
 // 「文件不在」会被读成「隔离没生效」—— 这类失败必须当场拒绝开跑
@@ -105,9 +108,12 @@ async function driveConsent(how, wantId = "") {
     }
     await sleep(400);
   }
-  throw new Error(
-    `20 秒内没等到 ${wantId ? `「${wantId}」的` : ""}同意框（场上扫到的框标题：[${seenTitles.join(" | ") || "一个都没有"}]，按名字跳过没点 ${others} 个）`,
-  );
+  const message = `20 秒内没等到 ${wantId ? `「${wantId}」的` : ""}同意框（场上扫到的框标题：[${seenTitles.join(" | ") || "一个都没有"}]，按名字跳过没点 ${others} 个）`;
+  if (D03_BASELINE) {
+    console.log(`  BASELINE consent miss: ${message}`);
+    return { caps: [], name: "", label: "", missing: true };
+  }
+  throw new Error(message);
 }
 
 const isPetPage = (t) => /localhost:1420\/(src\/)?index\.html$/.test(t.url);
@@ -2394,6 +2400,9 @@ export function deactivate() { live = false; }
   // 断言中途抛错时别只丢一个栈：给出可读原因
   aborted = true;
   console.error("\n验证中断: " + String(err?.message ?? err).split("\n").slice(0, 3).join(" | "));
+  if (D03_BASELINE) {
+    for (const n of c?.noise ?? []) console.log("BASELINE console: " + n);
+  }
 } finally {
   removeFixtures(PLUGINS_DIR);
   // B3 那两个探针目录（zz.status / zz.status2）**不在这里删**：删掉之后，插件迟到的 `:res`
