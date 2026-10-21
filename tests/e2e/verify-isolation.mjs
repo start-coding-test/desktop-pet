@@ -300,11 +300,41 @@ async function grantProbeCap(capability, pluginId = PROBE_ID) {
     if (!probeRuntimeWritesAllowed) {
       throw new Error(`D07 预置 ${pluginId} 缺能力 ${capability}，窗口 A 前禁止运行时改写 manifest`);
     }
+    // D07-D10：写 manifest 前先确保插件 disabled；写后等 plugins-changed 信号，
+    // 再显式 await reconcile 并读回 isActive=false，之后才 enable。
+    const enabledNow = await readEnabledIds(invoke(c));
+    if (enabledNow.includes(pluginId)) {
+      await setEnabled(enabledNow.filter((id) => id !== pluginId));
+      await c.ev(`(async () => {
+        const rt = await import('/src/runtime/plugin-runtime.ts');
+        await rt.reconcile(await window.__TAURI_INTERNALS__.invoke('plugins_list'));
+        return true;
+      })()`);
+      await waitUntil(
+        c,
+        `(async () => { const rt = await import('/src/runtime/plugin-runtime.ts'); return rt.isActive(${JSON.stringify(pluginId)}) === false; })()`,
+        10_000,
+      );
+    }
+    await c.ev(RESET_CHANGE_SPY);
     writeFileSync(
       manifestPath,
       JSON.stringify({ ...manifest, permissions: [...(manifest.permissions ?? []), capability] }, null, 2),
     );
-    await sleep(600);
+    const sawChange = await waitUntil(c, sawChangedId(pluginId), 10_000);
+    await c.ev(`(async () => {
+      const rt = await import('/src/runtime/plugin-runtime.ts');
+      await rt.reconcile(await window.__TAURI_INTERNALS__.invoke('plugins_list'));
+      return true;
+    })()`);
+    const inactive = await waitUntil(
+      c,
+      `(async () => { const rt = await import('/src/runtime/plugin-runtime.ts'); return rt.isActive(${JSON.stringify(pluginId)}) === false; })()`,
+      10_000,
+    );
+    if (!sawChange || !inactive) {
+      throw new Error(`D07 ${pluginId} manifest 写入后 reconcile 未静默（sawChange=${sawChange}, inactive=${inactive}）`);
+    }
   }
   // 旧接缝是「未启用也能直接要授权」；D02 起宿主先看启停清单，这里临时启用探针，
   // 只写清单不 reconcile，避免激活期批量授权污染这一条能力的窗口。
@@ -2685,7 +2715,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   const consentNoise = c.noise.filter(
     (n) => n.includes("plugin-runtime.ts:166") && n.includes(CONSENT_ID),
   );
-  r.check("ADR-0013 新组/清理窗口 console 精确核销：zz.consent=1", 1, consentNoise.length);
+  r.check("ADR-0013 新组/清理窗口 console 精确核销：zz.consent=0", 0, consentNoise.length);
 
   logConsoleLedger("after ADR-0013");
   r.group("宿主页面自身未产生 CSP 违规或未捕获异常");
@@ -2702,8 +2732,8 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     "zz.probe: agent hooks 拒绝/重启用链；zz.consent: ADR-0013 新组清理；zz.status: 本轮未出现",
   );
   r.check(
-    "有意拒绝 console 核销：zz.probe=1 / zz.consent=1 / zz.status=0",
-    "1|1|0",
+    "有意拒绝 console 核销：zz.probe=0 / zz.consent=0 / zz.status=0",
+    "0|0|0",
     `${countDeny("zz.probe")}|${countDeny("zz.consent")}|${countDeny("zz.status")}`,
   );
   const remaining = unexpected.filter(
