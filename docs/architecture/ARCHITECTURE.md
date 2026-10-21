@@ -62,11 +62,12 @@
 │   │   │   ├── plugins.rs      # 插件清单/启停/撤销授权 + 形象与 overlay 命令
 │   │   │   ├── bus.rs          # bus_publish：origin 由宿主按发起窗口判定
 │   │   │   └── agent.rs        # Agent hook 的状态/安装/卸载
-│   │   ├── services/           # 原生能力服务：13 个功能模块
+│   │   ├── services/           # 原生能力服务：14 个功能模块
 │   │   │   ├── ble.rs          # btleplug 广播监听 + GATT 0x180D/2A37 心率
 │   │   │   ├── store.rs        # 插件隔离存储（%APPDATA%/com.desktoppet.pet/plugins/<id>）
 │   │   │   ├── secrets.rs      # 插件凭据存储（DPAPI 当前用户加密，按插件隔离）
 │   │   │   ├── http.rs         # 白名单域名的受控 HTTP 代理
+│   │   │   ├── http_proxy.rs   # 出站是否走系统代理：注册表/环境变量解析 + 回环私网永不走代理
 │   │   │   ├── notify.rs       # 系统通知（同样过授权表）
 │   │   │   ├── permission.rs   # 授权记录 + 首次调用的同意对话框
 │   │   │   ├── enabled.rs      # 插件启停清单（宿主磁盘上的唯一事实来源）

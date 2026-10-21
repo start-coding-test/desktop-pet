@@ -98,3 +98,62 @@ permission_request(pluginId, pluginName, capabilities)   ← pluginName 由前�
   没动，那条要等 Web Worker 宿主才能一起收口。
 - `http` 的域名白名单纯按域名判，对 DNS rebinding 无防护；重定向只复核 host 不复核 scheme。
   本轮未动（需要真机与专门的取证设计）。
+
+## 追加节（2026-10-21，B10）：出站走系统代理后的边界
+
+`ctx.http.request` 原先只直连（`ureq::AgentBuilder` 不配 proxy），所以用户开着 Clash（系统代理
+`127.0.0.1:7897`）时宿主仍然出不了网。B10 让宿主**默认跟随系统代理**，判定与解析收在
+`src-tauri/src/services/http_proxy.rs`（纯函数 + 平台读取各一半），`src-tauri/src/services/http.rs`
+只负责按判定选路。
+
+1. **读取顺序**：`HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` 的
+   `ProxyEnable`/`ProxyServer`/`ProxyOverride` → 环境变量 `HTTPS_PROXY` → `HTTP_PROXY` → `ALL_PROXY`
+   （大小写都试）→ 都没有才直连。**不用** `ureq` 的 `try_proxy_from_env`：它写死的顺序是
+   `ALL_PROXY → HTTPS_PROXY → HTTP_PROXY`，与本 ADR 要求的次序不符，而且它完全不读注册表。
+   `ProxyEnable == 0` 是**用户显式关掉**总开关 ⇒ 整条决策就是直连，**不**再回落到环境变量
+   （否则在 Clash 界面里关掉，仍会被 shell 里残留的 env 拽走）；`ProxyEnable` 根本不存在则不算
+   「关掉」，继续往下档找。每次请求都问一次（TTL 5 秒只为合并同一瞬间的并发请求），
+   用户开关代理不必重启宿主。
+2. **两个 agent、逐跳决定**：`ureq` 2.12 的代理只能建在 `Agent` 上（请求级没有 proxy 参数），
+   而「哪些目标不许经过代理」是按**目标**判的 ⇒ 直连 agent 与代理 agent 并存（`http=`/`https=`
+   两种协议各一个代理 agent，注册表 `ProxyServer` 允许给它们不同端点），每一跳重新问
+   `Settings::proxy_scheme_for`。重定向逐跳复核授权这条（本 ADR 第 3 条）不变，且**公网 → 内网**
+   的重定向在换完目标之后不会再沿用上一跳的代理路线。`redirects(0)`、三个 timeout、跨主机摘除
+   `authorization`/`cookie` 全部原样。
+3. **回环与私网永不走代理**（第一道否决，压过 `ProxyOverride` 与 `<-host>` 强制项）：`localhost`、
+   无点主机名、mDNS 的 `.local`（组播解析，交给 HTTP 代理本来就连不通）、`::1`、`0.0.0.0`，
+   以及字面 IPv4 的 `127/8`、`10/8`、`172.16/12`、`192.168/16`、`169.254/16`、`100.64/10`（CGNAT）、
+   `192.0.0/24`、`198.18/15`、`224/4` 起；IPv4-mapped 的 IPv6 写法（`::ffff:127.0.0.1`、
+   `::ffff:7f00:1`）折回 IPv4 判。运行时的反向证据是 `verify` 里那条真打
+   `http://localhost:1420/…` 的断言：这道否决一旦失效，那一跳就会红。
+4. **不夸口的地方**（必须连着上面一条一起读）：否决只看**字面**主机名/IP。一个解析到内网 IP 的
+   公网域名**不在本节的防护内** —— 挡住它的是本 ADR 的逐域名授权（`http:169.254.169.254` 这类
+   默认没人授权），不是 B10。要做「先解析再判私网」需要引入 DNS 解析（新依赖 + 新的时序攻击面），
+   本轮不做。`ProxyOverride` 也**只影响选路**，不构成对插件输入的任何限制。
+5. **新增的信任面**（这是本节的重点，别当成免费的功能）：开启之后，被授权域名的**目标主机名、
+   端口，以及除被摘掉的凭据头以外的请求头**都会交给系统代理程序 —— 本机 Clash 时等于交给本机那
+   个进程，企业/公共代理时等于交给第三方。HTTPS 走 CONNECT，正文与 TLS 仍在端点之间；明文 HTTP
+   本来就是明文。用户如果不想让宿主经第三方出网，关掉系统代理或在设置里把该域名收回授权。
+6. **代理 URL 的账号口令不外泄**：`ureq::Proxy` 是 `#[derive(Debug)]` 且字段带 `user`/`password`
+   ⇒ 全链路不对它做 `Debug`/Display；`ProxySpec` 手写 `Debug`（口令只报「有没有」），缓存键与日志
+   只带 `host:port` 与用户名；走代理时 ureq 的报错可能把代理端点带出来，所以出口统一过一遍
+   `http_proxy::redact`（端点、`user:pass@host:port`、整条 URL、用户名、口令原文一律换成 `[proxy]`）。
+7. **socks 条目忽略并直连**：本仓 `ureq = "2"` 没开 `socks` feature，`Proxy::new("socks5://…")`
+   只会得到 `InvalidProxyUrl`。把它当 HTTP 代理用会把 CONNECT 发给一个听不懂的端口，报错又会让
+   插件以为「自己没网」——所以按「这个协议没有配代理」处理：忽略该条、继续往下档找、最后直连。
+   同理 `ProxyOverride` 里的 PAC/`<SCRIPT>` 与不认识的形态只忽略**那一条**，不牵连其它规则。
+8. **非 Windows 与「什么都没配」的路径行为不变**：没有注册表、三个环境变量也没设 ⇒
+   `Settings::default()` ⇒ 每一跳都用原来那个直连 agent（配置项与改动前逐项相同）。
+9. **不扩面**：不新增宿主命令、不动方法表（`PLUGIN_WORKER_METHODS` 仍 27、`WIDGET_CALL_METHODS`
+   不动）、不新增 crate —— 注册表读取用已有的 `windows` 依赖，只在 `src-tauri/Cargo.toml` 给它加
+   一个 `Win32_System_Registry` feature（`Cargo.lock` 不记 feature ⇒ 零差异）。
+   被否掉的替代：直接依赖传递树里已有的 `winreg`（lock 里同时有 0.10 与 0.55 两份，选哪个都是新增依赖）。
+
+**已知未收口（本追加节新增的部分）**
+
+- 真实 Clash / 企业代理下的端到端行为没有自动化判据：判定与脱敏全是离线单测，`verify` 只能证明
+  「回环那跳没走代理」与「公网那跳仍然通」，不能证明「确实经过了 `127.0.0.1:7897`」。真机验证
+  归统一测试的人工项。
+- 代理端点自身不可信时没有二次校验：我们只保证不把凭据头带过去、不把口令写进日志，不校验
+  代理返回的内容是否被篡改（那是 TLS 的事，明文 HTTP 则本来就无解）。
+- 「解析到内网 IP 的域名」仍靠逐域名授权挡（见第 4 条）。

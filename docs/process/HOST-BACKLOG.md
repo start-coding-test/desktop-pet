@@ -396,6 +396,8 @@ MVP 范围：<这一轮只做什么>
 | G4 | 系统代理 / `HTTP(S)_PROXY`：宿主 `ureq::AgentBuilder` 未配置 proxy，代码没有读取系统/Clash 代理的路径（`src-tauri/src/services/http.rs:40-50`）。 | 需要代理才出网的环境（Clash `127.0.0.1:7897`）可能失败；插件没有绕过方式。 | 评估 `ctx.http.request` 读取系统代理或增加显式 proxy 配置；另拆宿主卡，本行仅登记 C05 预检发现。 |
 | G5 | C06 的 `/internal/usage` 与 `/internal/usage/charts` 出口同样受 G4 的宿主无代理限制（`src-tauri/src/services/http.rs:40-50`）；插件侧没有 proxy 参数。 | 需要代理的环境里 internal 明细不可达；Key 路径也一并失败，UI 只能显示冷却/错误。 | 与 G4 同一宿主缺口，C06 不修改宿主；真站/代理可达性由 PM 本机验收，runner 的 internal 用例使用假响应。 |
 
+> **B10（2026-10-21）已实现 G4 说的「读系统代理」**：默认走 Windows 系统代理（HKCU 的 Internet Settings，回落 `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`），回环/私网目标仍直连；判定与实现在 `src-tauri/src/services/http_proxy.rs`，边界与新增信任面见 ADR-0011 的「出站走系统代理」追加节。G5 受的是同一条限制，一并解除（C06 走的还是同一个 `ctx.http.request`）。
+
 ## 6. 宿主凭据存储（B07，2026-10-21）
 
 - `ctx.secrets.get/set/delete` 已落地（能力复用 `storage`，widget 不开放）：`plugins/<id>/secrets.json`，
