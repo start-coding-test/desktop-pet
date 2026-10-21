@@ -632,6 +632,88 @@ fn uninstall_cancels_pending_without_clearing_denial_lock() {
     assert!(denied(&state, "todo"), "卸载不清拒绝锁");
 }
 
+/// D10：`cancel_plan` 的三条分支逐条钉住 —— 这里就是 M5（停用不取消）与 M6（停用不清锁）的杀伤点。
+/// 为什么测决策而不是测 `cancel_pending_for_plugin` 本身：后者往下三层（`resolve_consent` →
+/// `deliver_pending`）都要真 `AppHandle` 去 `get_webview_window` 关窗，单测造不出它。抽取之前这段
+/// 决策只被 `source.contains("cancel_pending_for_plugin(app, id, true);")` 那句文本断言覆盖，
+/// 而文本断言杀不掉调用点改动（D03 审计 F-3；M5/M6 让全套单测 39/0 全绿就是它的实测代价）。
+#[test]
+fn cancel_plan_disable_resolves_the_open_request_as_disabled() {
+    let state = PermissionState::new();
+    let rx = insert_pending(&state, "r-1", "todo", &["storage"]);
+    let (req_id, end) = match cancel_plan(&state, "todo", true) {
+        CancelPlan::Resolve { req_id, end } => (req_id, end),
+        // ClearDenied / Nothing 都意味着「停用没去取消那扇开着的窗」—— 就是 M5 的形状
+        _ => panic!("停用且场上有 pending 时必须给出 Resolve，不能是清锁或什么都不做"),
+    };
+    assert_eq!(req_id, "r-1", "要取消的正是这个插件那一扇开着的请求");
+    assert!(
+        matches!(end, ConsentEnd::Disabled),
+        "停用收口必须是 Disabled —— 只有它会清拒绝锁"
+    );
+    let pending = state
+        .finish_consent(&req_id, end)
+        .expect("Disabled 收口应移除 pending");
+    for sender in pending.waiters {
+        let _ = sender.send(end.grants());
+    }
+    assert!(!rx.blocking_recv().unwrap(), "停用后等待方收到 false");
+    assert_eq!(pending_count(&state), 0);
+}
+
+/// 卡片 (b)：停用清掉拒绝锁后，同一插件必须能再次发起同意请求。这里覆盖的是**无 pending 只清锁**那一支
+/// （上一轮的窗早已收口，停用仍要清锁）；壳层对 `ClearDenied` 的动作就是 `state.clear_denied(plugin_id)`。
+#[test]
+fn cancel_plan_disable_without_pending_clears_the_lock_so_a_new_request_can_open() {
+    let state = PermissionState::new();
+    state
+        .consent
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .denied
+        .insert("todo".to_string());
+    assert!(
+        matches!(cancel_plan(&state, "todo", true), CancelPlan::ClearDenied),
+        "无 pending 的停用必须走清锁分支 —— 返回 Nothing 就是 M6 的形状"
+    );
+    state.clear_denied("todo");
+    assert!(!denied(&state, "todo"), "清锁后不该再被拒绝锁拦");
+    assert!(
+        matches!(
+            begin_with(&state, "todo", &["storage"], "r-2"),
+            BeginOutcome::Created { .. }
+        ),
+        "清锁后必须能再次发起同意请求（弹出一扇新窗）"
+    );
+}
+
+/// 卸载（`clear_denied = false`）：有 pending 也要收口，但收口类型必须是**不清锁**的 Uninstalled。
+#[test]
+fn cancel_plan_uninstall_resolves_as_uninstalled_and_keeps_the_lock() {
+    let state = PermissionState::new();
+    let _rx = insert_pending(&state, "r-1", "todo", &["storage"]);
+    state
+        .consent
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .denied
+        .insert("todo".to_string());
+    let end = match cancel_plan(&state, "todo", false) {
+        CancelPlan::Resolve { req_id, end } => {
+            assert_eq!(req_id, "r-1", "卸载同样要按 plugin_id 找到那一扇 pending");
+            end
+        }
+        _ => panic!("卸载有 pending 时也必须给出 Resolve，不能退化成清锁或什么都不做"),
+    };
+    assert!(
+        matches!(end, ConsentEnd::Uninstalled),
+        "卸载收口必须是 Uninstalled —— Disabled 会顺手清锁，那是停用语义"
+    );
+    let _ = state.finish_consent("r-1", end);
+    assert!(denied(&state, "todo"), "卸载不清拒绝锁");
+    assert_eq!(pending_count(&state), 0);
+}
+
 #[test]
 fn timeout_and_close_latch_unless_all_waiters_are_gone() {
     for end in [ConsentEnd::Timeout, ConsentEnd::Closed] {
