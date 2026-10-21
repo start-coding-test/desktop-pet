@@ -111,9 +111,23 @@ pub fn plugin_enabled_set(
     let cleaned = sanitize(&ids);
     let previous = read_ids_before_write(&app);
     write_ids(&app, &cleaned)?;
+    cancel_pending_for_removed(&app, previous.as_deref(), &cleaned);
     let _ = app.emit("host:enabled-changed", &cleaned);
     crate::services::agent::linkage::reconcile(&app, previous.as_deref(), &cleaned);
     Ok(cleaned)
+}
+
+/// 停用某个插件时取消它挂起的同意请求，并清掉旧拒绝锁（不写新锁）。
+/// 抽成函数是为了让 `plugin_enabled_set` 的命令体保持薄层。
+fn cancel_pending_for_removed(app: &AppHandle, previous: Option<&[String]>, cleaned: &[String]) {
+    let Some(previous) = previous else {
+        return;
+    };
+    for id in previous {
+        if !cleaned.contains(id) {
+            crate::services::permission::cancel_pending_for_plugin(app, id, true);
+        }
+    }
 }
 
 /// 写盘前把旧清单读出来。读失败不拦这次写入，只降级成「说不出」（None）。
