@@ -50,6 +50,18 @@ const {
 const { DEMO_SCENARIOS, demoSnapshot } = await import(
   new URL("../../plugins/com.pet.goat-gauge/demo.js", import.meta.url)
 );
+const {
+  KEY_MODE_SECRETS,
+  INTERNAL_ORIGIN,
+  INTERNAL_REFERER,
+  migrateSecrets,
+  clearCookieAfterAuthFailure,
+  assertInternalPath,
+  internalHeaders,
+  keyHeaders,
+  classifyInternalStatus,
+  isKeyModeSecret,
+} = await import(new URL("../../plugins/com.pet.goat-gauge/secrets.js", import.meta.url));
 
 /* ============================ planInfo ============================ */
 group("planInfo");
@@ -906,3 +918,174 @@ eq("normalizeCredits 兼容 window_limits", true, (() => {
   const { limits } = normalizeCredits({ data: { window_limits: { limited: true } } });
   return limits.limited === true;
 })());
+
+/* ============================ C06 secrets 迁移与认证隔离 ============================ */
+group("C06 secrets 迁移与认证隔离");
+
+function fakeSecrets(initial = {}) {
+  const store = { ...initial };
+  const calls = [];
+  return {
+    store,
+    calls,
+    async get(key) {
+      calls.push(`get:${key}`);
+      return store[key] ?? null;
+    },
+    async set(key, value) {
+      calls.push(`set:${key}`);
+      store[key] = value;
+    },
+    async delete(key) {
+      calls.push(`delete:${key}`);
+      delete store[key];
+    },
+  };
+}
+
+function fakeStorage() {
+  const store = {};
+  const calls = [];
+  return {
+    store,
+    calls,
+    async set(key, value) {
+      calls.push(`set:${key}`);
+      store[key] = value;
+    },
+  };
+}
+
+await (async () => {
+  const secrets = fakeSecrets();
+  const storage = fakeStorage();
+  const result = await migrateSecrets({
+    legacy: { apiKey: "fake-key", cookie: "fake-cookie", savedAt: 123 },
+    secrets,
+    storage,
+  });
+  deep("迁移成功两项", result.migrated, ["apiKey", "cookie"]);
+  eq("迁移后 secret apiKey", "fake-key", secrets.store.apiKey);
+  eq("迁移后 secret cookie", "fake-cookie", secrets.store.cookie);
+  deep("迁移成功标记只含非敏感字段", storage.store.cred, { savedAt: 123, secured: true });
+  check(
+    "迁移顺序：copy→verify→clear",
+    secrets.calls.join("|") === "get:apiKey|set:apiKey|get:apiKey|get:cookie|set:cookie|get:cookie" &&
+      storage.calls.join("|") === "set:cred",
+    secrets.calls.join("|") + " / " + storage.calls.join("|"),
+  );
+  check(
+    "迁移标记不含凭据值",
+    !JSON.stringify(storage.store).includes("fake-key") &&
+      !JSON.stringify(storage.store).includes("fake-cookie"),
+    JSON.stringify(storage.store),
+  );
+})();
+
+await (async () => {
+  const secrets = fakeSecrets();
+  const storage = fakeStorage();
+  // set 成功但读回不一致：不得写标记/清明文
+  secrets.get = async (key) => (secrets.store[key] ? "wrong" : null);
+  const result = await migrateSecrets({
+    legacy: { apiKey: "fake-key" },
+    secrets,
+    storage,
+  });
+  check("verify 失败：不清明文", storage.calls.length === 0, storage.calls.join("|"));
+  check("verify 失败：如实返回 failed", result.failed.includes("apiKey"), result.failed.join(","));
+})();
+
+await (async () => {
+  const secrets = fakeSecrets({ apiKey: "other-value" });
+  const storage = fakeStorage();
+  const result = await migrateSecrets({
+    legacy: { apiKey: "fake-key", savedAt: 5 },
+    secrets,
+    storage,
+  });
+  eq("冲突：不覆盖 secret", "other-value", secrets.store.apiKey);
+  check("冲突：不调用 set", !secrets.calls.includes("set:apiKey"), secrets.calls.join("|"));
+  deep("冲突：仍清明文并留标记", storage.store.cred, { savedAt: 5, secured: true, conflict: true });
+  deep("冲突：如实返回", result.conflicts, ["apiKey"]);
+})();
+
+await (async () => {
+  let setAttempts = 0;
+  const secrets = {
+    store: {},
+    calls: [],
+    async get(key) {
+      this.calls.push(`get:${key}`);
+      return this.store[key] ?? null;
+    },
+    async set(key, value) {
+      setAttempts += 1;
+      this.calls.push(`set:${key}`);
+      if (setAttempts === 1) throw new Error("transient");
+      this.store[key] = value;
+    },
+    async delete(key) {
+      this.calls.push(`delete:${key}`);
+      delete this.store[key];
+    },
+  };
+  const storage = fakeStorage();
+  const result = await migrateSecrets({
+    legacy: { apiKey: "fake-key" },
+    secrets,
+    storage,
+    attempts: 2,
+    delayMs: 0,
+  });
+  check("瞬时失败重试后成功", result.migrated.includes("apiKey") && secrets.store.apiKey === "fake-key");
+  eq("重试后写标记", "set:cred", storage.calls[0]);
+})();
+
+await (async () => {
+  const secrets = fakeSecrets({ apiKey: "keep-key", cookie: "fake-cookie" });
+  const storage = fakeStorage();
+  const result = await clearCookieAfterAuthFailure({ secrets, storage });
+  deep("internal 401 只删 Cookie", secrets.calls, ["delete:cookie"]);
+  eq("internal 401 后 Key 保留", "keep-key", secrets.store.apiKey);
+  eq("internal 401 后 Cookie 清空", undefined, secrets.store.cookie);
+  eq("internal 401 状态", "expired", result.cookieState);
+  eq("internal 401 标记", "expired", storage.store.cookieState);
+})();
+
+deep(
+  "internal 请求头含 Cookie/Origin/Referer",
+  internalHeaders("fake-cookie"),
+  [
+    ["accept", "application/json"],
+    ["user-agent", "DesktopPet-GOATGauge/0.1"],
+    ["cookie", "fake-cookie"],
+    ["origin", INTERNAL_ORIGIN],
+    ["referer", INTERNAL_REFERER],
+  ],
+);
+check(
+  "Key 请求头不含 Cookie",
+  !JSON.stringify(keyHeaders("fake-key")).toLowerCase().includes("cookie"),
+  JSON.stringify(keyHeaders("fake-key")),
+);
+eq("internal 401 分类", "expired", classifyInternalStatus(401));
+eq("internal 403 分类", "expired", classifyInternalStatus(403));
+eq("internal 429 分类", "throttle", classifyInternalStatus(429));
+eq("internal 200 分类", "ok", classifyInternalStatus(200));
+eq("internal 500 分类", "upstream", classifyInternalStatus(500));
+
+check(
+  "internal 非白名单路径拒绝",
+  (() => {
+    try {
+      assertInternalPath("/internal/other");
+      return false;
+    } catch {
+      return true;
+    }
+  })(),
+  "/internal/other 未被拒",
+);
+deep("Key 模式只读 apiKey", KEY_MODE_SECRETS, ["apiKey"]);
+check("Key 模式不读 cookie", isKeyModeSecret("apiKey") && !isKeyModeSecret("cookie"));
