@@ -40,6 +40,9 @@ h2 {
   font-size: 13px;
   line-height: 1.9;
   color: #c3c9d4;
+  max-height: 150px;
+  overflow-y: auto;
+  padding-right: 6px;
 }
 
 .actions {
