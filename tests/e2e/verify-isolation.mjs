@@ -480,6 +480,27 @@ try {
 
   // 上面都是测试主动 mount；这一组让宿主在页面加载时自己去 import 入口与 widget，
   // 覆盖 activatePlugin 那条 import（petplugin 协议的真实使用方）
+  // D07-D8：窗口 A 结束，把 zz.probe 写回 D04 的零声明 manifest；随后下线并清拒绝锁，
+  // 再进入“宿主自身激活路径”（该组要求首次激活不弹授权）。
+  probeRuntimeWritesAllowed = true;
+  assertProbeRuntimeWritesAllowed("窗口 A 结束后写回零声明");
+  writeFixtures(PLUGINS_DIR);
+  const enabledBeforeZeroProbe = await readEnabledIds(invoke_);
+  await setEnabled(enabledBeforeZeroProbe.filter((id) => id !== PROBE_ID));
+  await c.ev(`(async () => {
+    const rt = await import('/src/runtime/plugin-runtime.ts');
+    await rt.reconcile(await window.__TAURI_INTERNALS__.invoke('plugins_list'));
+    return true;
+  })()`);
+  r.check(
+    "D07 窗口 A 结束：zz.probe 已写回零声明并 isActive=false",
+    true,
+    await waitUntil(
+      c,
+      `(async () => { const rt = await import('/src/runtime/plugin-runtime.ts'); return rt.isActive(${JSON.stringify(PROBE_ID)}) === false; })()`,
+      10_000,
+    ),
+  );
   r.group("宿主自身激活路径");
   const prevEnabled = await readEnabledIds(invoke_);
   await setEnabled([PROBE_ID]);
@@ -551,8 +572,6 @@ try {
     );
   }
 
-  // D07 窗口 A 终点：预置 superset 已在启动前写入，后续热安装组才允许重建 zz.probe。
-  probeRuntimeWritesAllowed = true;
   logConsoleLedger("before hot install");
   r.group("热安装 / 热移除（不重启宿主，仅靠 plugins 目录 watcher）");
   // 先造出「有启用记录但目录不存在」的状态：此时不该有任何激活。
