@@ -22,6 +22,7 @@ import {
   NET_ID,
   PRESEED_CONSENT_ID,
   PRESEED_HOOK_ID,
+  PRESEED_HOOK_UNDECLARED_ID,
   PRESEED_PLUGIN_IDS,
   PRESEED_STATUS_A,
   PRESEED_STATUS_B,
@@ -129,6 +130,32 @@ async function driveConsent(how, wantId = "", waitCaps = null) {
 
 const isPetPage = (t) => /localhost:1420\/(src\/)?index\.html$/.test(t.url);
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+
+const DENY_TEXT = "本次已拒绝，关闭插件再开启后可再次申请";
+const STOP_TEXT = "插件已停用，授权请求已取消";
+
+/**
+ * D07 C6：console 窗口切片。只认 reportError 的 console 行（Vite 转换后固定在
+ * plugin-runtime.ts:166），再按插件 id 过滤；起点由调用方在窗口开始时读一次
+ * `c.noise.length` 钉住，终点在窗口的确定性 await/读回之后取。
+ */
+function consoleWindow(start, ids) {
+  return (c?.noise ?? [])
+    .slice(start)
+    .filter((n) => n.includes("plugin-runtime.ts:166") && ids.some((id) => n.includes(id)));
+}
+
+/** D07 C6：等窗口里出现预期的 console 条目；用 CDP 事件做信号，不靠固定 sleep。 */
+async function waitConsoleWindow(start, ids, predicate, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const entries = consoleWindow(start, ids);
+    if (predicate(entries)) return true;
+    const left = deadline - Date.now();
+    if (left <= 0) return false;
+    await c.once("Runtime.consoleAPICalled", Math.min(left, 5_000)).catch(() => undefined);
+  }
+}
 
 /** D07-D5：只记录、不断言。按三个插件累计并记录相对上次标记的增量原文。 */
 let consoleLedgerMark = 0;
@@ -369,6 +396,7 @@ async function grantProbeCap(capability, pluginId = PROBE_ID) {
 try {
   c = await attach(PORT, isPetPage);
   r.info("已连接", c.url);
+  const windowAConsoleStart = (c.noise ?? []).length;
   const preseeded = new Set(((await invoke(c)("plugins_list")).v ?? []).map((m) => m.id));
   const missingPreseed = PRESEED_PLUGIN_IDS.filter((id) => !preseeded.has(id));
   if (missingPreseed.length) {
@@ -507,6 +535,13 @@ try {
   const ids = (await invoke_("plugins_list")).v?.map((m) => m.id) ?? [];
   r.check("冒名目录的 id 未被列入", false, ids.includes(SPOOF_DIR));
   r.check("id 无重复（冒名者未顶替合法插件）", ids.length, new Set(ids).size);
+
+  // 窗口 A：触发=attach 后到宿主自身激活前的主动 mount / 授权 / 宿主规则；
+  // 发射点=doActivate 277-282（缺权限被拒）与 doDeactivate 322/339；
+  // 期望=0；理由=本窗口的拒绝/关窗都是直接 permission_request（不经过 doActivate），
+  // 且 zz.probe 尚未被宿主激活。
+  const windowANoise = consoleWindow(windowAConsoleStart, [PROBE_ID]);
+  r.check("窗口 A：zz.probe console=0（attach 后切片）", 0, windowANoise.length);
 
   // 上面都是测试主动 mount；这一组让宿主在页面加载时自己去 import 入口与 widget，
   // 覆盖 activatePlugin 那条 import（petplugin 协议的真实使用方）
@@ -2179,6 +2214,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   // ---------- B3：气泡常驻状态行（宿主侧） ----------
   // 两个 fixture（id 不同）验「每个插件各占一条 + 回落」；同一份入口脚本靠 ctx.pluginId 区分 topic。
   logConsoleLedger("before B3");
+  const b3WindowStart = (c.noise ?? []).length;
   r.group("B3 常驻状态行：显示 / 单行几何 / 仲裁回落 / 台词优先 / 回收");
   const STATUS_A = PRESEED_STATUS_A;
   const STATUS_B = PRESEED_STATUS_B;
@@ -2568,8 +2604,16 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   }
 
   logConsoleLedger("after B3");
+  // 窗口 C：触发=B3 组全流程（含撤权、停用回收、Worker 崩溃探针）；
+  // 发射点=doActivate 277-282（缺权限被拒）与 doDeactivate 322/339；
+  // 期望=0；理由=B3 的撤权走直接 permission_request，停用回收不报错；
+  // 故意的 `B3 崩溃探针` 不含 plugin-runtime.ts:166，不混入切片。
+  const b3Noise = consoleWindow(b3WindowStart, [STATUS_A, STATUS_B]);
+  r.check("窗口 C：zz.status/zz.status2 console=0（B3 组切片）", 0, b3Noise.length);
+
   // ---------- ADR-0013 判据 1–11：直接对宿主发 permission_request ----------
   r.group("ADR-0013：同意合流 / 拒绝锁 / 未启用门禁");
+  const adrWindowStart = (c.noise ?? []).length;
   const CONSENT_ID = PRESEED_CONSENT_ID;
   const askConsent = (caps) => invoke(c)("permission_request", { pluginId: CONSENT_ID, capabilities: caps });
   const checkConsent = async (cap) => {
@@ -2712,10 +2756,12 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   const consentBefore = await readEnabledIds(invoke(c));
   await setEnabled(consentBefore.filter((id) => id !== CONSENT_ID));
   // 有意拒绝/停用的都是直接 permission_request，不应经过 doActivate；按插件 id 精确核销为 0 条。
-  const consentNoise = c.noise.filter(
-    (n) => n.includes("plugin-runtime.ts:166") && n.includes(CONSENT_ID),
-  );
+  // 窗口 B：触发=ADR-0013 组的直接 permission_request / 拒绝锁 / 停用取消；
+  // 发射点=doActivate 277-282（本组不应经过）与 doDeactivate 322/339；
+  // 期望=0；理由=直接 permission_request 不经过 doActivate，停用取消也不进 catch。
+  const consentNoise = consoleWindow(adrWindowStart, [CONSENT_ID]);
   r.check("ADR-0013 新组/清理窗口 console 精确核销：zz.consent=0", 0, consentNoise.length);
+  r.check("窗口 B：zz.consent console=0（ADR-0013 组切片）", 0, consentNoise.length);
 
   logConsoleLedger("after ADR-0013");
   r.group("宿主页面自身未产生 CSP 违规或未捕获异常");
@@ -2725,7 +2771,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   const unexpected = c.noise.filter((n) => !n.includes("派发递归") && !n.includes("B3 崩溃探针"));
   // 有意拒绝组的 console 不能一律算“意外”：按插件 id + 文案原文 + 次数精确核销。
   // 这是新增的核销断言，不是白名单；数量/文案变化都会红。
-  const denyText = "本次已拒绝，关闭插件再开启后可再次申请 @ http://localhost:1420/src/runtime/plugin-runtime.ts:166";
+  const denyText = `${DENY_TEXT} @ http://localhost:1420/src/runtime/plugin-runtime.ts:166`;
   const countDeny = (id) => unexpected.filter((n) => n.includes(id) && n.includes(denyText)).length;
   r.info(
     "有意拒绝 console 触发窗口",
@@ -2741,6 +2787,95 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   );
   r.check("无其他 console 错误", 0, remaining.length);
   for (const n of remaining) console.log("   " + n);
+
+  // ---------- D07 窗口 D/E：deny / stop 正向对照 ----------
+  // 正向对照证明 console 采集真的能看见 reportError；否则上面 A/B/C 的 0 只是空判据。
+  r.group("D07 窗口 D/E：deny / stop 正向对照");
+  const UNDECLARED_ID = PRESEED_HOOK_UNDECLARED_ID;
+  const enabledBeforeDE = await readEnabledIds(invoke(c));
+  const deBaseIds = enabledBeforeDE.filter((id) => id !== UNDECLARED_ID);
+  const resetUndeclared = async () => {
+    if (!settings) settings = await openSettingsInvoker(PORT, c);
+    // 先移除：宿主会取消 pending 并清掉旧拒绝锁；再撤销旧授权，最后加回。
+    await setEnabled(deBaseIds);
+    await settings.invoke("permission_revoke", { pluginId: UNDECLARED_ID }).catch(() => undefined);
+    await setEnabled([...deBaseIds, UNDECLARED_ID]);
+    await waitNoConsent(UNDECLARED_ID, 10_000);
+  };
+  const fireUndeclaredActivation = () =>
+    c.ev(`(async () => {
+      const rt = await import('/src/runtime/plugin-runtime.ts');
+      const ms = await window.__TAURI_INTERNALS__.invoke('plugins_list');
+      const manifest = ms.find((m) => m.id === ${JSON.stringify(UNDECLARED_ID)});
+      if (!manifest) throw new Error('D07 未找到预置 fixture ${UNDECLARED_ID}');
+      window.__d07Activation = null;
+      rt.activatePlugin(manifest).then(
+        () => { window.__d07Activation = 'done'; },
+        (e) => { window.__d07Activation = 'error:' + String(e?.message ?? e); },
+      );
+      return true;
+    })()`);
+  const waitUndeclaredActivation = () =>
+    waitUntil(c, `window.__d07Activation !== null && window.__d07Activation !== undefined`, 20_000);
+  const undeclaredActive = () =>
+    c.ev(`(async () => { const rt = await import('/src/runtime/plugin-runtime.ts'); return rt.isActive(${JSON.stringify(UNDECLARED_ID)}); })()`);
+  try {
+    // 窗口 D：触发=显式 rt.activatePlugin(zz.hookundeclared)，doActivate 发现 storage 未授权；
+    // 发射点=277-282 的 permission_request 被用户拒绝 → 282 reportError(DENY_TEXT)；
+    // 期望=该窗口切片长度===1 且 DENY_TEXT===1；理由=本窗口只有 282 一个发射点。
+    await resetUndeclared();
+    const dStart = (c.noise ?? []).length;
+    const dConsole = waitConsoleWindow(
+      dStart,
+      [UNDECLARED_ID],
+      (entries) => entries.some((n) => n.includes(DENY_TEXT)),
+    );
+    await fireUndeclaredActivation();
+    const denySeen = await driveConsent("deny", UNDECLARED_ID);
+    r.check("窗口 D：同意框属于 zz.hookundeclared", true, denySeen.name.includes(UNDECLARED_ID));
+    await waitUndeclaredActivation();
+    await dConsole;
+    const dWindow = consoleWindow(dStart, [UNDECLARED_ID]);
+    r.check(
+      "窗口 D：DENY_TEXT 恰好 1（activatePlugin + deny）",
+      1,
+      dWindow.filter((n) => n.includes(DENY_TEXT)).length,
+    );
+    r.check("窗口 D：窗口切片总长恰好 1", 1, dWindow.length);
+    r.check("窗口 D：拒绝后插件没有进入 active", false, await undeclaredActive());
+
+    // 窗口 E：触发=清拒绝锁后重新 activatePlugin，permission_request 处于 pending 时停用；
+    // 发射点=doActivate 277-282 的 permission_request 返回 false，且 loadEnabled=false → 282 STOP_TEXT；
+    // 期望=切片长度===1 且 STOP_TEXT===1；322/339 期望 0，依据是 doDeactivate 开头的
+    // `if (!instance) return`：pending 时插件还没 active，停用不会进 doDeactivate 的 catch。
+    await resetUndeclared();
+    const eStart = (c.noise ?? []).length;
+    const eConsole = waitConsoleWindow(
+      eStart,
+      [UNDECLARED_ID],
+      (entries) => entries.some((n) => n.includes(STOP_TEXT)),
+    );
+    await fireUndeclaredActivation();
+    const pendingUndeclared = await waitConsentWindow(UNDECLARED_ID);
+    r.check("窗口 E：同意框已打开（pending）", true, pendingUndeclared.caps.includes("storage"));
+    pendingUndeclared.cs.close();
+    const beforeEStop = await readEnabledIds(invoke(c));
+    await setEnabled(beforeEStop.filter((id) => id !== UNDECLARED_ID));
+    await waitUndeclaredActivation();
+    await eConsole;
+    await waitNoConsent(UNDECLARED_ID, 10_000);
+    const eWindow = consoleWindow(eStart, [UNDECLARED_ID]);
+    r.check(
+      "窗口 E：STOP_TEXT 恰好 1（pending 时停用）",
+      1,
+      eWindow.filter((n) => n.includes(STOP_TEXT)).length,
+    );
+    r.check("窗口 E：窗口切片总长恰好 1（322/339 未发射）", 1, eWindow.length);
+  } finally {
+    await setEnabled(enabledBeforeDE);
+    if (settings) await settings.invoke("permission_revoke", { pluginId: UNDECLARED_ID }).catch(() => undefined);
+    await waitNoConsent(UNDECLARED_ID, 10_000);
+  }
 } catch (err) {
   // 断言中途抛错时别只丢一个栈：给出可读原因
   aborted = true;
