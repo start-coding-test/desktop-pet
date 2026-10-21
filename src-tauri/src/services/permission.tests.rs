@@ -769,6 +769,28 @@ fn request_and_window_paths_keep_the_gate_and_post_build_check() {
 }
 
 #[test]
+fn disable_path_cancels_pending_before_broadcast() {
+    let source = include_str!("enabled.rs");
+    let written = source
+        .find("write_ids(&app, &cleaned)?;")
+        .expect("启停清单必须先落盘");
+    let cancelled = source
+        .find("cancel_pending_for_removed(&app, previous.as_deref(), &cleaned);")
+        .expect("停用路径必须取消 pending");
+    let emitted = source
+        .find("app.emit(\"host:enabled-changed\"")
+        .expect("广播点不能丢");
+    assert!(
+        written < cancelled && cancelled < emitted,
+        "顺序必须是落盘 → 取消 pending → 广播"
+    );
+    assert!(
+        source.contains("cancel_pending_for_plugin(app, id, true);"),
+        "停用必须清拒绝锁"
+    );
+}
+
+#[test]
 fn orphan_pending_ids_only_returns_uninstalled() {
     let pending = vec!["zz.a".to_string(), "zz.b".to_string(), "zz.a".to_string()];
     let known: HashSet<String> = ["zz.a".to_string()].into_iter().collect();
