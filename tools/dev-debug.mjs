@@ -61,7 +61,7 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
   process.on(sig, () => {
     // 只杀 npm 包装进程会留下 vite 与 desktop-pet.exe：1420 被占且 strictPort，
     // 下次 dev 直接起不来。按进程树整棵收掉（vite 是 node 子进程，不能按镜像名杀）。
-    cleanupFixtures();
+    if (GATE) cleanupFixtures();
     if (platform === "win32") {
       spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", shell: true });
     } else {
@@ -71,6 +71,6 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
 }
 
 child.on("exit", (code) => {
-  cleanupFixtures();
+  if (GATE) cleanupFixtures();
   process.exit(code ?? 0);
 });
