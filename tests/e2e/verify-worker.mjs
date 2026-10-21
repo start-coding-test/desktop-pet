@@ -17,6 +17,7 @@ import {
   listPages,
   openSettingsInvoker,
   readEnabledIds,
+  reconcilePetWindow,
   reloadAndWait,
   waitUntil,
   writeEnabledIds,
@@ -107,13 +108,20 @@ try {
   const invoke = hostInvoke(c);
   settings = await openSettingsInvoker(PORT, c);
   origEnabled = await readEnabledIds(invoke);
+  // 这些套件不测 HR/状态行探针；上一套件若留下 enabled 但未授权的状态，激活会弹 consent
+  // 并让零噪音门误红。先隔离，收尾仍按 origEnabled 还原。
+  const safeOrigEnabled = origEnabled.filter(
+    (id) => !["com.pet.hr-ble", "zz.status", "zz.status2"].includes(id),
+  );
   void pump(420_000);
 
   r.group("装载");
   await settings.invoke("permission_revoke", { pluginId: PROBE });
   await sleep(1200);
-  const enabled = [...new Set([...origEnabled, PROBE])];
+  const enabled = [...new Set([...safeOrigEnabled, PROBE])];
   await writeEnabledIds(settings.invoke, enabled);
+  // 先把上一套件可能仍在活着的 HR/status 探针真正下线，再 reload；只改清单不会停 JS。
+  await reconcilePetWindow(c);
   await reloadAndWait(c);
   r.check(
     "探针在 Worker 里 activate 成功",

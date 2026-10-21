@@ -538,3 +538,55 @@ group("插件热重载判定");
   deep("缺 reloadIds 的载荷按空处理（不误重载）", hotReload.reloadIdsFrom({ ids: ["zz.a"] }), []);
   deep("坏载荷按空处理", hotReload.reloadIdsFrom(null), []);
 }
+
+/* ============================ 同意框刷新与拒绝文案（ADR-0013） ============================ */
+group("同意框刷新与拒绝文案");
+
+{
+  eq(
+    "停用时提示取消，不误导用户去设置页重新授权",
+    "插件已停用，授权请求已取消",
+    rt.consentFailureMessage(false),
+  );
+  eq(
+    "用户拒绝时提示关闭插件再开启",
+    "本次已拒绝，关闭插件再开启后可再次申请",
+    rt.consentFailureMessage(true),
+  );
+
+  const consentSrc = readFileSync(new URL("../../src/consent/main.ts", import.meta.url), "utf8");
+  check(
+    "同意框用 consent_details 轮询同一 req_id",
+    consentSrc.includes('hostCall<ConsentDetails>("consent_details"') &&
+      consentSrc.includes("timer = setInterval("),
+    true,
+  );
+  check(
+    "轮询间隔 400ms、上限约 65s",
+    /POLL_MS\s*=\s*400/.test(consentSrc) && /POLL_MAX_MS\s*=\s*65_000/.test(consentSrc),
+    true,
+  );
+  const notFoundBranch =
+    consentSrc.split("if (e.code === NOT_FOUND)")[1]?.split("// 偶发")[0] ?? "";
+  check(
+    "NOT_FOUND 只关窗、不再 consent_answer",
+    notFoundBranch.includes("closeExpired") &&
+      !notFoundBranch.includes('hostCall("consent_answer"'),
+    true,
+  );
+  check(
+    "答复、pagehide、beforeunload 都停表",
+    consentSrc.includes("stopPolling") &&
+      consentSrc.includes('addEventListener("pagehide", stopPolling)') &&
+      consentSrc.includes('addEventListener("beforeunload", stopPolling)'),
+    true,
+  );
+  check("能力并集重绘时去重", consentSrc.includes("[...new Set(caps)]"), true);
+
+  const consentCss = readFileSync(new URL("../../src/consent/style.css", import.meta.url), "utf8");
+  check(
+    "能力列表有高度上限并可滚动",
+    /#cap-list\s*\{[\s\S]*max-height:\s*150px;[\s\S]*overflow-y:\s*auto;/.test(consentCss),
+    true,
+  );
+}

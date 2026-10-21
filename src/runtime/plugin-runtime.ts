@@ -212,6 +212,13 @@ function reportError(plugin: string, error: unknown): void {
   void emit("host:plugin-error", { plugin, error: message });
 }
 
+/** 拒绝/停用的文案分开：停用不是用户拒绝，不能提示“去设置页重新授权”。 */
+export function consentFailureMessage(stillEnabled: boolean): string {
+  return stillEnabled
+    ? "本次已拒绝，关闭插件再开启后可再次申请"
+    : "插件已停用，授权请求已取消";
+}
+
 export function isActive(pluginId: string): boolean {
   return active.has(pluginId);
 }
@@ -268,7 +275,11 @@ async function doActivate(manifest: PluginManifest): Promise<void> {
         capabilities: missing,
       });
       if (!ok) {
-        reportError(manifest.id, "用户拒绝了权限申请（可在设置中重新授权）");
+        // 停用取消与用户拒绝都返回 false；向宿主重取启停清单区分文案，不改变激活顺序。
+        const stillEnabled = await loadEnabled()
+          .then((ids) => ids.includes(manifest.id))
+          .catch(() => true);
+        reportError(manifest.id, consentFailureMessage(stillEnabled));
         return;
       }
     }

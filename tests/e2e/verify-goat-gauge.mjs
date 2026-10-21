@@ -12,6 +12,7 @@ import {
   listPages,
   openSettingsInvoker,
   readEnabledIds,
+  reconcilePetWindow,
   reloadAndWait,
   waitUntil,
   writeEnabledIds,
@@ -248,6 +249,9 @@ try {
 try {
   const invoke = hostInvoke(c);
   origEnabled = await readEnabledIds(invoke);
+  const safeOrigEnabled = origEnabled.filter(
+    (id) => !["com.pet.hr-ble", "zz.status", "zz.status2"].includes(id),
+  );
   pump = makePump();
   void pump.run(1_200_000);
   const manifest = (await invoke("plugins_list")).v?.find((m) => m.id === PID);
@@ -271,7 +275,7 @@ try {
   }, 8000);
 
   r.group("启用与授权");
-  await writeEnabledIds(settings.invoke, [...origEnabled, PID]);
+  await writeEnabledIds(settings.invoke, [...safeOrigEnabled, PID]);
   await reloadAndWait(c);
   await setupBus();
 
@@ -587,10 +591,29 @@ try {
   r.check("清 Key 后 demo 继续刷新", true, !!afterClearView);
 
   r.group("停用：停止推送与收掉 overlay");
-  const widgetCountBefore = (await readView()) ? Number(await c.ev("window.__seen.widget.length")) : 0;
+  const widgetTimeline = async (label) => {
+    const snap = await c.ev(`(() => {
+      const a = window.__seen.widget;
+      const last = a.at(-1);
+      return { n: a.length, at: last?.fetchedAt ?? null, state: last?.state ?? null };
+    })()`);
+    r.info(`widget 推送时间线：${label}`, JSON.stringify(snap));
+    return snap.n;
+  };
+  await widgetTimeline("停用前");
   await writeEnabledIds(settings.invoke, origEnabled);
+  // 清单只写宿主；宠物窗的 JS 生命周期要靠既有 reconcile 入口真正下线。
+  await reconcilePetWindow(c);
+  // 先确认插件真的下线，再取基线；不能把停用触发前后的在飞推送算进“停用后新增”。
+  const inactive = await waitUntil(
+    c,
+    `(async () => { const rt = await import('/src/runtime/plugin-runtime.ts'); return rt.isActive(${JSON.stringify(PID)}) === false; })()`,
+    10_000,
+  );
+  r.check("停用生效确认（isActive=false）", true, inactive);
+  const widgetCountBefore = await widgetTimeline("停用确认后");
   await sleep(10_000);
-  const widgetCountAfter = Number(await c.ev("window.__seen.widget.length")) || 0;
+  const widgetCountAfter = await widgetTimeline("观察 10 秒后");
   r.check("停用后 10 秒没有新的 :widget 推送", widgetCountBefore, widgetCountAfter);
   const hidden = await pollUntil(
     async () => !(await overlayVisible().catch(() => true)),
@@ -607,7 +630,7 @@ try {
     return !res.ok || res.v === null ? res : null;
   }, 8000);
   r.check("撤销后存储读不到", true, !!denied && (!denied.ok || denied.v === null));
-  await writeEnabledIds(settings.invoke, [...origEnabled, PID]);
+  await writeEnabledIds(settings.invoke, [...safeOrigEnabled, PID]);
   await reloadAndWait(c);
   await setupBus();
   const reconsent = await waitConsentForPlugin(beforeConsents, 30_000);

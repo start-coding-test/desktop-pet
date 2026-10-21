@@ -18,7 +18,20 @@ import {
   writeEnabledIds,
 } from "./harness/cdp.mjs";
 import { waitWidgetRealm } from "./harness/widget-realm.mjs";
-import { NET_ID, PROBE_ID, SPOOF_DIR, removeFixtures, writeFixtures } from "./harness/fixtures.mjs";
+import {
+  NET_ID,
+  PRESEED_CONSENT_ID,
+  PRESEED_HOOK_ID,
+  PRESEED_HOOK_UNDECLARED_ID,
+  PRESEED_PLUGIN_IDS,
+  PRESEED_STATUS_A,
+  PRESEED_STATUS_B,
+  PROBE_ID,
+  SPOOF_DIR,
+  removeFixtures,
+  removePreseedFixtures,
+  writeFixtures,
+} from "./harness/fixtures.mjs";
 
 const PORT = Number(env.CDP_PORT ?? argv.find((a) => a.startsWith("--port="))?.split("=")[1] ?? 9223);
 const PLUGINS_DIR = resolve(import.meta.dirname, "../../plugins");
@@ -65,7 +78,7 @@ function consentBoxBelongsTo(name, wantId) {
   return new RegExp(`${escaped}(?![A-Za-z0-9._-])`).test(String(name ?? ""));
 }
 
-async function driveConsent(how, wantId = "") {
+async function driveConsent(how, wantId = "", waitCaps = null) {
   const deadline = Date.now() + 20_000;
   let others = 0;
   /** 扫到过的框标题（去重）：失败时原文带出去，用来区分「框根本没开」和「开的是别人的框」 */
@@ -88,7 +101,12 @@ async function driveConsent(how, wantId = "") {
           caps: await cs.ev(`[...document.querySelectorAll('#cap-list li')].map(li => li.textContent)`),
           name,
           label: await cs.ev(`window.__TAURI_INTERNALS__.metadata.currentWindow.label`),
+          seenTitles: [...seenTitles],
         };
+        // 追加能力走 400ms 轮询；等页面把并集重绘完再作答。
+        if (waitCaps && !waitCaps.every((cap) => seen.caps.includes(cap))) {
+          continue;
+        }
         if (how === "allow") {
           await cs.ev(`document.getElementById('btn-allow').click()`);
         } else if (how === "deny") {
@@ -112,6 +130,47 @@ async function driveConsent(how, wantId = "") {
 
 const isPetPage = (t) => /localhost:1420\/(src\/)?index\.html$/.test(t.url);
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+
+const DENY_TEXT = "本次已拒绝，关闭插件再开启后可再次申请";
+const STOP_TEXT = "插件已停用，授权请求已取消";
+
+/**
+ * D07 C6：console 窗口切片。只认 reportError 的 console 行（Vite 转换后固定在
+ * plugin-runtime.ts:166），再按插件 id 过滤；起点由调用方在窗口开始时读一次
+ * `c.noise.length` 钉住，终点在窗口的确定性 await/读回之后取。
+ */
+function consoleWindow(start, ids) {
+  return (c?.noise ?? [])
+    .slice(start)
+    .filter((n) => n.includes("plugin-runtime.ts:166") && ids.some((id) => n.includes(id)));
+}
+
+/** D07 C6：等窗口里出现预期的 console 条目；用 CDP 事件做信号，不靠固定 sleep。 */
+async function waitConsoleWindow(start, ids, predicate, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const entries = consoleWindow(start, ids);
+    if (predicate(entries)) return true;
+    const left = deadline - Date.now();
+    if (left <= 0) return false;
+    await c.once("Runtime.consoleAPICalled", Math.min(left, 5_000)).catch(() => undefined);
+  }
+}
+
+/** D07-D5：只记录、不断言。按三个插件累计并记录相对上次标记的增量原文。 */
+let consoleLedgerMark = 0;
+function logConsoleLedger(label) {
+  const noise = c?.noise ?? [];
+  const since = noise.slice(consoleLedgerMark);
+  const matched = (arr, id) =>
+    arr.filter((n) => n.includes(id) && (n.includes("plugin-runtime.ts:166") || n.includes("bus relay failed")));
+  const ids = ["zz.probe", "zz.consent", "zz.status"];
+  const totals = Object.fromEntries(ids.map((id) => [id, matched(noise, id).length]));
+  const deltas = Object.fromEntries(ids.map((id) => [id, matched(since, id).length]));
+  const deltaLines = Object.fromEntries(ids.map((id) => [id, matched(since, id)]));
+  r.info(`D07 console ledger ${label}`, JSON.stringify({ totals, deltas, deltaLines }));
+  consoleLedgerMark = noise.length;
+}
 
 /**
  * 「本体压住 overlay」的真窗判据：交回 `tools/win-zorder.ps1` 的退出码 + 它打的 ASCII 机器行。
@@ -173,6 +232,11 @@ try {
 // 装上的宿主句柄仍可能被随后的重载冲掉，故下面的安装带退避重试。
 let c;
 let aborted = false;
+/** D07：窗口 A 结束后才允许 zz.probe 的运行时 manifest 写入（热安装/存储/http 组）。 */
+let probeRuntimeWritesAllowed = false;
+function assertProbeRuntimeWritesAllowed(where) {
+  if (!probeRuntimeWritesAllowed) throw new Error(`D07 ${where}: 窗口 A 前禁止运行时改写 zz.probe manifest`);
+}
 // 撤销授权与查看授权表只认设置窗（见 gate.rs：插件 JS 就跑在宠物窗里，
 // 不设门禁的话一行 invoke 就能抹掉任意插件的授权并连带清掉其存储）。
 // 脚本要撤销时就把设置窗唤出来走这条真实通道，顺带证明宠物窗问同样的命令会被拒。
@@ -189,49 +253,191 @@ async function setEnabled(ids) {
 }
 
 /**
+ * 让一个插件在宿主启停清单里，跨一次「先移除再加回」以清掉旧拒绝锁。
+ * 只写清单，不 reconcile：这些探针不需要真的 activate，permission_request 只看宿主清单。
+ * 返回恢复函数，调用方在用例结束时还原原清单。
+ */
+async function enableForConsent(pluginId) {
+  const before = await readEnabledIds(invoke(c));
+  const without = before.filter((id) => id !== pluginId);
+  await setEnabled(without);
+  await setEnabled([...without, pluginId]);
+  return async () => setEnabled(before);
+}
+
+/** 有界等「该插件没有同意框」：看到窗只说明还在关闭途中，继续轮询；超时仍有关联窗才 false。 */
+async function waitNoConsent(pluginId, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const pages = (await listPages(PORT).catch(() => [])).filter((t) => /consent/.test(t.url));
+    let found = false;
+    for (const target of pages) {
+      let cs = null;
+      try {
+        cs = await attach(PORT, (t) => t.webSocketDebuggerUrl === target.webSocketDebuggerUrl, 8_000);
+        const name = await cs.ev(`document.getElementById('plugin-name')?.textContent ?? ''`);
+        if (consentBoxBelongsTo(name, pluginId)) {
+          found = true;
+          break;
+        }
+      } finally {
+        cs?.close();
+      }
+    }
+    if (!found) return true;
+    await sleep(200);
+  }
+  return false;
+}
+
+/** 只读一扇同意框（不点按钮），用于停用关窗用例；调用方负责关闭返回的 client。 */
+async function waitConsentWindow(pluginId, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const pages = (await listPages(PORT).catch(() => [])).filter((t) => /consent/.test(t.url));
+    for (const target of pages) {
+      const cs = await attach(PORT, (t) => t.webSocketDebuggerUrl === target.webSocketDebuggerUrl, 8_000);
+      const name = await cs.ev(`document.getElementById('plugin-name')?.textContent ?? ''`);
+      if (!consentBoxBelongsTo(name, pluginId)) {
+        cs.close();
+        continue;
+      }
+      return {
+        caps: await cs.ev(`[...document.querySelectorAll('#cap-list li')].map(li => li.textContent)`),
+        name,
+        label: await cs.ev(`window.__TAURI_INTERNALS__.metadata.currentWindow.label`),
+        cs,
+      };
+    }
+    await sleep(200);
+  }
+  throw new Error(`20 秒内没等到「${pluginId}」的同意框（只读）`);
+}
+
+/**
  * 用真实同意框给探针拿到某项能力。
  * S1 之后 store_* 在 Rust 侧查授权，S2/S3 之后总线与悬浮层也一样 ——
  * 而 fixture 探针默认零权限，脚本要走的能力必须自己一项项要回来，
  * 顺带证明「manifest 声明 + 用户同意」这条链在宿主侧确实生效。
  */
-async function grantProbeCap(capability) {
-  const manifestPath = join(PLUGINS_DIR, PROBE_ID, "manifest.json");
+async function grantProbeCap(capability, pluginId = PROBE_ID) {
+  const manifestPath = join(PLUGINS_DIR, pluginId, "manifest.json");
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
   if (!manifest.permissions?.includes(capability)) {
+    if (!probeRuntimeWritesAllowed) {
+      throw new Error(`D07 预置 ${pluginId} 缺能力 ${capability}，窗口 A 前禁止运行时改写 manifest`);
+    }
+    // D07-D10：写 manifest 前先确保插件 disabled；写后等 plugins-changed 信号，
+    // 再显式 await reconcile 并读回 isActive=false，之后才 enable。
+    const enabledNow = await readEnabledIds(invoke(c));
+    if (enabledNow.includes(pluginId)) {
+      await setEnabled(enabledNow.filter((id) => id !== pluginId));
+      await c.ev(`(async () => {
+        const rt = await import('/src/runtime/plugin-runtime.ts');
+        await rt.reconcile(await window.__TAURI_INTERNALS__.invoke('plugins_list'));
+        return true;
+      })()`);
+      await waitUntil(
+        c,
+        `(async () => { const rt = await import('/src/runtime/plugin-runtime.ts'); return rt.isActive(${JSON.stringify(pluginId)}) === false; })()`,
+        10_000,
+      );
+    }
+    await c.ev(RESET_CHANGE_SPY);
     writeFileSync(
       manifestPath,
       JSON.stringify({ ...manifest, permissions: [...(manifest.permissions ?? []), capability] }, null, 2),
     );
-    await sleep(600);
+    const sawChange = await waitUntil(c, sawChangedId(pluginId), 10_000);
+    await c.ev(`(async () => {
+      const rt = await import('/src/runtime/plugin-runtime.ts');
+      await rt.reconcile(await window.__TAURI_INTERNALS__.invoke('plugins_list'));
+      return true;
+    })()`);
+    const inactive = await waitUntil(
+      c,
+      `(async () => { const rt = await import('/src/runtime/plugin-runtime.ts'); return rt.isActive(${JSON.stringify(pluginId)}) === false; })()`,
+      10_000,
+    );
+    if (!sawChange || !inactive) {
+      throw new Error(`D07 ${pluginId} manifest 写入后 reconcile 未静默（sawChange=${sawChange}, inactive=${inactive}）`);
+    }
   }
-  const checked = await invoke(c)("permission_check", { pluginId: PROBE_ID, capability });
-  if (checked.ok && checked.v === true) return true; // 已授权时 permission_request 不弹框，别空等
-  // 不等 permission_request 的返回：它会阻塞到用户作答，而 CDP 的 Runtime.evaluate 有 20 秒硬超时
-  // （见 cdp.mjs::send），弹框慢一点就会把整条断言链打断。改成应答之后轮询授权表。
-  invoke(c)("permission_request", {
-    pluginId: PROBE_ID,
-    capabilities: [capability],
-  }).catch(() => undefined);
+  // 旧接缝是「未启用也能直接要授权」；D02 起宿主先看启停清单，这里临时启用探针，
+  // 只写清单不 reconcile，避免激活期批量授权污染这一条能力的窗口。
+  const restore = await enableForConsent(pluginId);
   try {
-    const consent = await driveConsent("allow", PROBE_ID);
-    r.check(`同意框列出了 ${capability}`, true, consent.caps.includes(capability));
-  } catch (err) {
-    console.log(`     没能操作 ${capability} 的同意框: ` + String(err?.message ?? err).split("\n")[0]);
+    const checked = await invoke(c)("permission_check", { pluginId, capability });
+    if (checked.ok && checked.v === true) return true; // 已授权时 permission_request 不弹框，别空等
+    // 不等 permission_request 的返回：它会阻塞到用户作答，而 CDP 的 Runtime.evaluate 有 20 秒硬超时
+    // （见 cdp.mjs::send），弹框慢一点就会把整条断言链打断。改成应答之后轮询授权表。
+    invoke(c)("permission_request", {
+      pluginId,
+      capabilities: [capability],
+    }).catch(() => undefined);
+    try {
+      const consent = await driveConsent("allow", pluginId);
+      r.check(`同意框列出了 ${capability}`, true, consent.caps.includes(capability));
+    } catch (err) {
+      console.log(`     没能操作 ${capability} 的同意框: ` + String(err?.message ?? err).split("\n")[0]);
+      return false;
+    }
+    const until = Date.now() + 20_000;
+    while (Date.now() < until) {
+      const now = await invoke(c)("permission_check", { pluginId, capability });
+      if (now.ok && now.v === true) return true;
+      await sleep(400);
+    }
     return false;
+  } finally {
+    await restore();
   }
-  const until = Date.now() + 20_000;
-  while (Date.now() < until) {
-    const now = await invoke(c)("permission_check", { pluginId: PROBE_ID, capability });
-    if (now.ok && now.v === true) return true;
-    await sleep(400);
-  }
-  return false;
 }
 try {
-  writeFixtures(PLUGINS_DIR);
-  await sleep(2500);
   c = await attach(PORT, isPetPage);
   r.info("已连接", c.url);
+  const windowAConsoleStart = (c.noise ?? []).length;
+  const preseeded = new Set(((await invoke(c)("plugins_list")).v ?? []).map((m) => m.id));
+  const missingPreseed = PRESEED_PLUGIN_IDS.filter((id) => !preseeded.has(id));
+  if (missingPreseed.length) {
+    throw new Error(`D07 预置 fixture 缺失: ${missingPreseed.join(", ")}；请用 PET_E2E_PRESEED=1 npm run dev:debug 或 GITHUB_ACTIONS 启动`);
+  }
+  const enabledAtBoot = await readEnabledIds(invoke(c));
+  const zzEnabledAtBoot = enabledAtBoot.filter((id) => String(id).startsWith("zz."));
+  if (zzEnabledAtBoot.length) {
+    throw new Error(`D07 启动前清单仍含 zz.*: ${zzEnabledAtBoot.join(", ")}`);
+  }
+  r.check("D07 启动前预置 fixture 齐全", true, missingPreseed.length === 0);
+  r.check("D07 启动前清单不含 zz.*", [], zzEnabledAtBoot);
+  let guardRejected = false;
+  try {
+    assertProbeRuntimeWritesAllowed("窗口 A 前");
+  } catch {
+    guardRejected = true;
+  }
+  r.check("D07 窗口 A 前拒绝 zz.probe 运行时写入（M7 杀手）", true, guardRejected);
+
+  // D07-D16：套件启动前 agent 临时状态必须只剩两份 live 样例、且都在 temp/ 下。
+  // dev-debug 已在 spawn 前删掉 *.pre-pet-backup；这里从宿主状态页读回，防止清理静默失效。
+  if (env.PET_AGENT_CONFIG_FILES) {
+    if (!settings) settings = await openSettingsInvoker(PORT, c);
+    const hookStatus = await settings.invoke("agent_hooks_status");
+    const hookFiles = Array.isArray(hookStatus.v?.files) ? hookStatus.v.files : [];
+    const hookTempRoot = resolve(import.meta.dirname, "../../temp");
+    const hookFilesUnderTemp =
+      hookFiles.length === 2 && hookFiles.every((f) => resolve(String(f.path)).startsWith(hookTempRoot + sep));
+    r.check("D07 启动前 agent 状态可读", true, hookStatus.ok === true);
+    r.check("D07 启动前 agent 临时配置只剩 2 个文件", 2, hookFiles.length);
+    r.check("D07 启动前 agent 配置都在 temp/ 下", true, hookFilesUnderTemp);
+    r.check(
+      "D07 启动前 agent 状态页为默认 qoder/12/0",
+      ["qoder", 12, 0],
+      [hookStatus.v?.agent, hookStatus.v?.expectedPerFile, hookStatus.v?.managed],
+    );
+  } else {
+    r.info("跳过 agent 临时状态检查", "未设 PET_AGENT_CONFIG_FILES（非 E2E 启动）");
+  }
+
   const INSTALL = `(async () => {
     if (!window.__wh || !Array.isArray(window.__canary)) {
       const { bus } = await import('/src/runtime/event-bus.ts');
@@ -352,8 +558,36 @@ try {
   r.check("冒名目录的 id 未被列入", false, ids.includes(SPOOF_DIR));
   r.check("id 无重复（冒名者未顶替合法插件）", ids.length, new Set(ids).size);
 
+  // 窗口 A：触发=attach 后到宿主自身激活前的主动 mount / 授权 / 宿主规则；
+  // 发射点=doActivate 277-282（缺权限被拒）与 doDeactivate 322/339；
+  // 期望=0；理由=本窗口的拒绝/关窗都是直接 permission_request（不经过 doActivate），
+  // 且 zz.probe 尚未被宿主激活。
+  const windowANoise = consoleWindow(windowAConsoleStart, [PROBE_ID]);
+  r.check("窗口 A：zz.probe console=0（attach 后切片）", 0, windowANoise.length);
+
   // 上面都是测试主动 mount；这一组让宿主在页面加载时自己去 import 入口与 widget，
   // 覆盖 activatePlugin 那条 import（petplugin 协议的真实使用方）
+  // D07-D8：窗口 A 结束，把 zz.probe 写回 D04 的零声明 manifest；随后下线并清拒绝锁，
+  // 再进入“宿主自身激活路径”（该组要求首次激活不弹授权）。
+  probeRuntimeWritesAllowed = true;
+  assertProbeRuntimeWritesAllowed("窗口 A 结束后写回零声明");
+  writeFixtures(PLUGINS_DIR);
+  const enabledBeforeZeroProbe = await readEnabledIds(invoke_);
+  await setEnabled(enabledBeforeZeroProbe.filter((id) => id !== PROBE_ID));
+  await c.ev(`(async () => {
+    const rt = await import('/src/runtime/plugin-runtime.ts');
+    await rt.reconcile(await window.__TAURI_INTERNALS__.invoke('plugins_list'));
+    return true;
+  })()`);
+  r.check(
+    "D07 窗口 A 结束：zz.probe 已写回零声明并 isActive=false",
+    true,
+    await waitUntil(
+      c,
+      `(async () => { const rt = await import('/src/runtime/plugin-runtime.ts'); return rt.isActive(${JSON.stringify(PROBE_ID)}) === false; })()`,
+      10_000,
+    ),
+  );
   r.group("宿主自身激活路径");
   const prevEnabled = await readEnabledIds(invoke_);
   await setEnabled([PROBE_ID]);
@@ -425,11 +659,13 @@ try {
     );
   }
 
+  logConsoleLedger("before hot install");
   r.group("热安装 / 热移除（不重启宿主，仅靠 plugins 目录 watcher）");
   // 先造出「有启用记录但目录不存在」的状态：此时不该有任何激活。
   // 探针此刻还在跑，目录被移走会让宠物窗整页热重载（本卡的新行为）：先武装
   // load 事件再删目录，等这次重载真的落地 —— 不等的话它会掀掉下面刚要埋的哨兵。
   const removalArmed = armPageReload();
+  assertProbeRuntimeWritesAllowed("probe fixture 写入");
   removeFixtures(PLUGINS_DIR);
   if (await removalArmed) await sleep(600); // 与 reloadAndWait 同口径：等新文档的 reconcile 跑完
   await setEnabled([PROBE_ID]);
@@ -440,6 +676,7 @@ try {
   // 哨兵：整段测试期间页面一旦被重载，下面的结论就都不成立
   await c.ev(`window.__hotSentinel = "armed"`);
   r.check("仅有启用记录、目录缺失时不激活", false, await c.ev(`(window.__probeActivated ?? 0) >= 1`));
+  assertProbeRuntimeWritesAllowed("probe fixture 写入");
   writeFixtures(PLUGINS_DIR);
   r.check("放入目录后免重启即激活", true, await waitUntil(c, `(window.__probeActivated ?? 0) >= 1`, 20_000));
   r.check("目录变动的广播带得出变更的插件 id", true, await waitUntil(c, sawChangedId(PROBE_ID), 10_000));
@@ -538,6 +775,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   // HEAD 形状走 watcher → reconcile → deactivate 那条路（deactivate 计数器可观察）。
   // 两条形状的共同结论必须都成立：插件停了。先武装 load 事件再删目录。
   const goneArmed = armPageReload();
+  assertProbeRuntimeWritesAllowed("probe fixture 写入");
   removeFixtures(PLUGINS_DIR);
   const goneByReload = await goneArmed;
   if (goneByReload) await sleep(600); // 等新文档的 reconcile 跑完
@@ -555,6 +793,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   r.check("widget 容器随之移除", 0, await c.ev(`document.querySelectorAll(${JSON.stringify(removedSelector)}).length`));
 
   r.group("存储门禁：能力授权收在 Rust 侧（绕过 JS 桥的直接 invoke）");
+  assertProbeRuntimeWritesAllowed("probe fixture 写入");
   writeFixtures(PLUGINS_DIR);
   await sleep(1200);
   await revoke(PROBE_ID); // 起点确定：探针手里没有 storage
@@ -653,7 +892,9 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   const HR = "com.pet.hr-ble";
   const hrManifest = (await invoke_("plugins_list")).v?.find((m) => m.id === HR);
   const savedConfig = await invoke_("store_get", { pluginId: HR, key: "config" });
-  await revoke(HR);
+  const restoreHr = await enableForConsent(HR);
+  try {
+    await revoke(HR);
   const pending = c.ev(
     `window.__TAURI_INTERNALS__.invoke('permission_request', { pluginId: ${JSON.stringify(HR)}, capabilities: ['ble:scan'] })`,
   );
@@ -675,21 +916,29 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   // 抛错（v 是 "ERR …"）和超时（v 是 undefined）也会算通过
   r.check("按拒绝处理", false, raced.v);
 
-  // 还原用户授权：重新走一次同意框并点「允许」
-  if (hrManifest?.permissions?.length) {
-    const regrant = c.ev(
-      `window.__TAURI_INTERNALS__.invoke('permission_request', { pluginId: ${JSON.stringify(HR)}, capabilities: ${JSON.stringify(hrManifest.permissions)} })`,
-    );
-    try {
-      const again = await driveConsent("allow", HR);
-      r.check("重新弹出的同意框带插件名", true, again.name.includes("心率"));
-    } catch (err) {
-      console.log("     还原授权失败: " + String(err?.message ?? err).split("\n")[0]);
+  // 还原用户授权：拒绝锁会让同轮第二次请求直接 false；先停用/再启用清锁，再走一次同意框。
+  const restoreRegrant = await enableForConsent(HR);
+  try {
+    if (hrManifest?.permissions?.length) {
+      const regrant = c.ev(
+        `window.__TAURI_INTERNALS__.invoke('permission_request', { pluginId: ${JSON.stringify(HR)}, capabilities: ${JSON.stringify(hrManifest.permissions)} })`,
+      );
+      try {
+        const again = await driveConsent("allow", HR);
+        r.check("拒绝后停用/再启用，重新弹出的同意框带插件名", true, again.name.includes("心率"));
+      } catch (err) {
+        console.log("     还原授权失败: " + String(err?.message ?? err).split("\n")[0]);
+      }
+      r.check("点允许后宿主放行", true, await regrant);
+      if (savedConfig?.v !== undefined && savedConfig?.v !== null) {
+        await invoke_("store_set", { pluginId: HR, key: "config", value: savedConfig.v });
+      }
     }
-    r.check("点允许后宿主放行", true, await regrant);
-    if (savedConfig?.v !== undefined && savedConfig?.v !== null) {
-      await invoke_("store_set", { pluginId: HR, key: "config", value: savedConfig.v });
-    }
+  } finally {
+    await restoreRegrant();
+  }
+  } finally {
+    await restoreHr();
   }
 
   await setEnabled(prevEnabled);
@@ -998,6 +1247,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   r.group("http 代理与按域名授权（#21）");
   // 热安装那组测试结束时删掉了 fixture，这里要自己造回来：
   // 否则宿主报的是「读不到 manifest」，会被误判成鉴权规则失效
+  assertProbeRuntimeWritesAllowed("probe fixture 写入");
   writeFixtures(PLUGINS_DIR);
   await sleep(1200);
   const LOCAL_URL = "http://localhost:1420/src/index.html";
@@ -1008,6 +1258,8 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   });
   r.check("未声明 http 的插件不能申请按域名放行", true, !badAsk.ok && /未在 manifest 声明/.test(String(badAsk.e)));
 
+  const restoreNet = await enableForConsent(NET_ID);
+  try {
   const grant = c
     .ev(
       `window.__TAURI_INTERNALS__.invoke('permission_request', { pluginId: ${JSON.stringify(NET_ID)}, capabilities: ["http", ${JSON.stringify(HOST_CAP)}] })`,
@@ -1057,7 +1309,10 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   );
   const notifyDenied = await invoke_("notify_show", { pluginId: NET_ID, title: "t", body: "b" });
   r.check("未声明 notify 的插件发不出系统通知", true, !notifyDenied.ok && /未授权/.test(String(notifyDenied.e)));
-  await revoke(NET_ID);
+  } finally {
+    await revoke(NET_ID);
+    await restoreNet();
+  }
 
   r.group("示例插件真实挂载（含相对 import 的 topics.js）");
   await c.ev(INSTALL); // 热安装那组末尾重载过页面，宿主句柄要重装（INSTALL 幂等）
@@ -1566,15 +1821,16 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     // 探针复用 zz.probe 目录（.gitignore 已忽略、收尾统一删除）。把它的 widget 换成
     // 「钩子能力探针」：mount 本身不发起任何调用，只把 ctx 形状与手动调用函数挂到 window，
     // 免得早先的挂载/开关用例被同意框打断。
+    logConsoleLedger("before agent hooks");
     r.group("agent:hooks 受控能力（settings 区专属）");
     const TEMP_ROOT = resolve(import.meta.dirname, "../../temp");
-    const hookDir = join(PLUGINS_DIR, PROBE_ID);
+    const hookId = PRESEED_HOOK_ID;
     // S3 之后 settings 区一律进 Worker：探针必须按 Worker 契约写 —— 没有 window / document，
     // 建节点只能用 ctx.dom，事实只能经 ctx.bus 回传。两条 bus 能力按 manifest 声明，
     // 并在本组开头真拿到授权（见下 grantProbeCap），否则 publish / subscribe 会被能力门禁拦下。
     const hookManifest = (permits) =>
       JSON.stringify({
-        id: PROBE_ID,
+        id: hookId,
         name: "钩子能力探针",
         version: "0.0.0",
         entry: "index.js",
@@ -1583,37 +1839,13 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
         permissions: ["bus:publish", "bus:subscribe", ...permits],
         description: "验证 agent:hooks 的受控注入面与同意流程。",
       });
-    const HOOK_WIDGET = `export function mount(root, ctx) {
-  const node = ctx.dom.createElement("div");
-  node.className = "zz-hookprobe";
-  node.textContent = ctx.region;
-  root.append(node);
-  ctx.bus.publish("${PROBE_ID}:fact", {
-    region: ctx.region,
-    hostIsUndefined: typeof ctx.host === "undefined",
-    hasAgentHooks: !!(ctx.host && ctx.host.agentHooks),
-    keys: ctx.host ? Object.keys(ctx.host).sort() : [],
-  });
-  ctx.bus.subscribe("${PROBE_ID}:cmd", async (msg) => {
-    const api = ctx.host && ctx.host.agentHooks;
-    let out;
-    if (!api) out = { ok: false, e: "no host.agentHooks on ctx" };
-    else {
-      try { out = { ok: true, v: await api[msg.name]() }; }
-      catch (e) { out = { ok: false, e: String(e && e.message ? e.message : e) }; }
-    }
-    ctx.bus.publish("${PROBE_ID}:res", { id: msg.id, region: ctx.region, ...out });
-  });
-}
-export function unmount() {}
-`;
     /** 收事实：探针在 Worker 里写不了 window，事实只能由本窗口的总线订阅者接住 */
     const WATCH_HOOK_FACTS = `(async () => {
       const { bus } = await import('/src/runtime/event-bus.ts');
       window.__hookFacts = [];
       window.__hookRes = [];
-      bus.subscribe('${PROBE_ID}:fact', (p) => window.__hookFacts.push(p));
-      bus.subscribe('${PROBE_ID}:res', (p) => window.__hookRes.push(p));
+      bus.subscribe('${hookId}:fact', (p) => window.__hookFacts.push(p));
+      bus.subscribe('${hookId}:res', (p) => window.__hookRes.push(p));
       return true;
     })()`;
     /** 把探针挂进某个区：容器共用同一个临时槽，槽缺就先建 */
@@ -1629,7 +1861,7 @@ export function unmount() {}
     const hookPin = (on) =>
       sc.ev(
         on
-          ? `localStorage.setItem('host:widget-realm-plugin-host', ${JSON.stringify(PROBE_ID)}); true`
+          ? `localStorage.setItem('host:widget-realm-plugin-host', ${JSON.stringify(hookId)}); true`
           : `localStorage.removeItem('host:widget-realm-plugin-host'); true`,
       );
     let hookCallSeq = 0;
@@ -1638,7 +1870,7 @@ export function unmount() {}
       const id = ++hookCallSeq;
       await sc.ev(`(async () => {
         const { bus } = await import('/src/runtime/event-bus.ts');
-        bus.inject('${PROBE_ID}:cmd', { id: ${id}, name: ${JSON.stringify(name)} });
+        bus.inject('${hookId}:cmd', { id: ${id}, name: ${JSON.stringify(name)} });
         return true;
       })()`);
       const hit = `((window.__hookRes || []).find((r) => r.id === ${id} && r.region === "settings")) ?? null`;
@@ -1647,18 +1879,14 @@ export function unmount() {}
       return sc.ev(hit);
     };
 
-    writeFileSync(join(hookDir, "widget.js"), HOOK_WIDGET);
-    writeFileSync(join(hookDir, "manifest.json"), hookManifest([]));
-    mkdirSync(join(TEMP_ROOT, "b2"), { recursive: true });
-    await sleep(900);
 
     // 起点确定：清掉上一次（可能崩溃留下）的旧授权，否则 permission_check 会短路掉声明校验。
     // 必须排在下面拿 bus 授权之前：permission_revoke 是 revoke_all，会把 bus 能力一并清掉。
-    await sCall("permission_revoke", { pluginId: PROBE_ID });
+    await sCall("permission_revoke", { pluginId: hookId });
 
     // 探针的事实只能经总线回传，所以两条 bus 能力要真授权（各自一个真实同意框）
-    r.check("探针经同意框拿到 bus:publish（Worker 里回传事实的前提）", true, await grantProbeCap("bus:publish"));
-    r.check("探针经同意框拿到 bus:subscribe（Worker 里收指令的前提）", true, await grantProbeCap("bus:subscribe"));
+    r.check("探针经同意框拿到 bus:publish（Worker 里回传事实的前提）", true, await grantProbeCap("bus:publish", hookId));
+    r.check("探针经同意框拿到 bus:subscribe（Worker 里收指令的前提）", true, await grantProbeCap("bus:subscribe", hookId));
     await sc.ev(WATCH_HOOK_FACTS);
 
     // S3 的正身：例外名单里点着 zz.probe，settings 区照样进 Worker
@@ -1681,14 +1909,14 @@ export function unmount() {}
     r.check(
       "例外名单点着这个插件，settings 区仍进 Worker（S3）",
       "worker",
-      (await waitWidgetRealm(sc, PROBE_ID, "settings", "worker", 20_000)).actual,
+      (await waitWidgetRealm(sc, hookId, "settings", "worker", 20_000)).actual,
     );
     // 另两区照旧认例外名单：把名单摘掉它们才进 Worker —— 顺带钉住「名单只管 badge / overlay」
     await hookPin(false);
     await sc.ev(mountHookRegion("badge"));
     await sc.ev(mountHookRegion("overlay"));
-    r.check("badge 区进 Worker", "worker", (await waitWidgetRealm(sc, PROBE_ID, "badge", "worker", 20_000)).actual);
-    r.check("overlay 区进 Worker", "worker", (await waitWidgetRealm(sc, PROBE_ID, "overlay", "worker", 20_000)).actual);
+    r.check("badge 区进 Worker", "worker", (await waitWidgetRealm(sc, hookId, "badge", "worker", 20_000)).actual);
+    r.check("overlay 区进 Worker", "worker", (await waitWidgetRealm(sc, hookId, "overlay", "worker", 20_000)).actual);
     await hookPin(true); // 后面几组仍按老前提（例外名单开着）跑
 
     const factsOk = await waitUntil(sc, `(window.__hookFacts || []).length >= 3`, 20_000).catch(() => false);
@@ -1717,14 +1945,19 @@ export function unmount() {}
 
     // 此刻探针确定没有 agent:hooks，且下面这次调用不会弹同意框（窗口门禁过了走的是能力校验）
     const hookSnapBefore = JSON.stringify((await sCall("agent_hooks_status")).v);
-    const unauthUninstall = await sCall("agent_hooks_uninstall", { pluginId: PROBE_ID });
+    const unauthUninstall = await sCall("agent_hooks_uninstall", { pluginId: hookId });
     const hookSnapAfter = JSON.stringify((await sCall("agent_hooks_status")).v);
     r.check(
       "设置窗带 pluginId 但未授权 agent:hooks：能力门禁拒且配置快照未动",
       "denied|true",
       `${unauthUninstall.code}|${hookSnapBefore === hookSnapAfter}`,
     );
-    const undeclared = await hookCall("status");
+    const undeclared = await sc.ev(`(async () => {
+      const { createAgentHooksApi } = await import('/src/runtime/bridge.ts');
+      const api = createAgentHooksApi({ id: ${JSON.stringify(PROBE_ID)}, name: '未声明钩子探针', permissions: ['agent:hooks'] });
+      try { await api.status(); return { ok: true }; }
+      catch (e) { return { ok: false, e: String(e?.message ?? e) } }
+    })()`);
     r.check(
       "未声明 agent:hooks：settings 区调用被拒（未声明的能力不弹框，直接拒）",
       true,
@@ -1732,20 +1965,32 @@ export function unmount() {}
     );
 
     // 声明后：首次调用应弹同意框。先拒绝一次，再同意。
-    writeFileSync(join(hookDir, "manifest.json"), hookManifest(["agent:hooks"]));
-    await sleep(500);
+    const restoreHookProbe = await enableForConsent(hookId);
     const pendingDeny = hookCall("status");
-    const consentDeny = await driveConsent("deny", PROBE_ID);
+    const consentDeny = await driveConsent("deny", hookId);
     r.check("同意框列出了 agent:hooks", true, consentDeny.caps.some((x) => x.includes("agent:hooks")));
     // 同意框标题是既有文案 `${plugin_name}（${plugin_id}）`（consent/main.ts:34），断言整串
-    r.check("同意框显示的是探针插件名（既有文案含 id）", "钩子能力探针（zz.probe）", consentDeny.name);
+    r.check("同意框显示的是探针插件名（既有文案含 id）", `钩子能力探针（${hookId}）`, consentDeny.name);
     const denied = await pendingDeny;
     r.check("拒绝后调用被拒（默认拒绝语义）", true, denied.ok === false && /权限被拒绝/.test(denied.e));
 
+    // ADR-0013 I4：同轮第二次申请命中拒绝锁，不再弹窗；停用/启用清锁后才允许恢复。
     const pendingAllow = hookCall("status");
-    const consentAllow = await driveConsent("allow", PROBE_ID);
-    r.check("拒绝没留下授权（第二次调用仍弹框）", true, consentAllow.caps.some((x) => x.includes("agent:hooks")));
-    const allowed = await pendingAllow;
+    const noSecondConsent = await waitNoConsent(hookId);
+    const deniedAgain = await pendingAllow;
+    r.check("拒绝后同轮不再弹（第二次无新窗）", true, noSecondConsent);
+    r.check("拒绝后第二次调用仍被拒", true, deniedAgain.ok === false && /权限被拒绝/.test(deniedAgain.e));
+
+    const restoreAllow = await enableForConsent(hookId);
+    let allowed;
+    try {
+      const pendingRetry = hookCall("status");
+      const consentAllow = await driveConsent("allow", hookId);
+      r.check("停用再启用后拒绝锁已清（可再次弹窗）", true, consentAllow.caps.some((x) => x.includes("agent:hooks")));
+      allowed = await pendingRetry;
+    } finally {
+      await restoreAllow();
+    }
     r.check("同意后 settings 区调用放行", true, allowed.ok === true);
     const hostStatus = await sCall("agent_hooks_status");
     r.check("status 回显与宿主路径一致", JSON.stringify(allowed.v), JSON.stringify(hostStatus.v));
@@ -1753,9 +1998,9 @@ export function unmount() {}
     // 宠物窗主 realm：绕过 JS 桥直接 invoke 必须被窗口门禁拒（label=pet）
     const petStatus = await call("agent_hooks_status");
     r.check("宠物窗直接 invoke status 被拒（label=pet）", true, petStatus.ok === false && /设置窗/.test(String(petStatus.e)));
-    const petInstall = await call("agent_hooks_install", { pluginId: PROBE_ID });
+    const petInstall = await call("agent_hooks_install", { pluginId: hookId });
     r.check("宠物窗带 pluginId 的 install 同样被窗口门禁拒", true, petInstall.ok === false && /设置窗/.test(String(petInstall.e)));
-    const petUninstall = await call("agent_hooks_uninstall", { pluginId: PROBE_ID });
+    const petUninstall = await call("agent_hooks_uninstall", { pluginId: hookId });
     r.check("宠物窗直接 invoke agent_hooks_uninstall（带 pluginId）被窗口门禁拒", "denied", petUninstall.code);
 
     // 写盘类断言只在宿主被指到 temp/ 时跑（PET_AGENT_CONFIG_FILES 启动方式）；
@@ -1855,14 +2100,14 @@ export function unmount() {}
     r.check(
       "设置页在 manifest 改写后刷新出 agent:hooks 权限",
       true,
-      await waitUntil(sc, `document.querySelector('.nav-item[data-view=${JSON.stringify(PROBE_ID)}]')?.dataset.search?.includes('agent:hooks') === true`, 10_000),
+      await waitUntil(sc, `document.querySelector('.nav-item[data-view=${JSON.stringify(hookId)}]')?.dataset.search?.includes('agent:hooks') === true`, 10_000),
     );
     // 重载把 window 上的订阅与桥缓存都清了：重挂 settings 区那一个（例外名单开着，它照样进 Worker）、
     // 重订事实通道，再走一次 status 把缓存填上
     await hookPin(true);
     await sc.ev(WATCH_HOOK_FACTS);
     await sc.ev(mountHookRegion("settings"));
-    await waitWidgetRealm(sc, PROBE_ID, "settings", "worker", 20_000);
+    await waitWidgetRealm(sc, hookId, "settings", "worker", 20_000);
     const regrant = await hookCall("status");
     r.check("重载后凭已授权记录直接放行（不再弹框）", true, regrant.ok === true);
 
@@ -1876,7 +2121,7 @@ export function unmount() {}
       return ready;
     };
 
-    const navOpened = await clickReady(`.nav-item[data-view=${JSON.stringify(PROBE_ID)}]`);
+    const navOpened = await clickReady(`.nav-item[data-view=${JSON.stringify(hookId)}]`);
     const hasRevokeBtn = navOpened && (await waitUntil(sc, `!!document.querySelector('.btn-revoke')`, 8_000).catch(() => false));
     r.check("插件壳上出现「撤销授权」（class=btn-revoke，声明列表已刷新）", true, hasRevokeBtn);
 
@@ -1886,7 +2131,7 @@ export function unmount() {}
     r.check(
       "撤销前桥缓存里有 agent:hooks（下面「失效」才是真的变化）",
       true,
-      (await sc.ev(`(async () => (await import('/src/runtime/bridge.ts')).grantedCapabilities(${JSON.stringify(PROBE_ID)}).includes('agent:hooks'))()`)) === true,
+      (await sc.ev(`(async () => (await import('/src/runtime/bridge.ts')).grantedCapabilities(${JSON.stringify(hookId)}).includes('agent:hooks'))()`)) === true,
     );
     if (hasRevokeBtn) await clickReady(".btn-revoke");
     const stripUp = hasRevokeBtn === true && (await waitUntil(sc, `document.getElementById('revoke-uninstall')?.checked === true`, 5_000).catch(() => false));
@@ -1913,13 +2158,13 @@ export function unmount() {}
     r.check(
       "「只撤能力」后桥的能力缓存失效",
       true,
-      await waitUntil(sc, `(async () => !(await import('/src/runtime/bridge.ts')).grantedCapabilities(${JSON.stringify(PROBE_ID)}).includes('agent:hooks'))()`, 5_000),
+      await waitUntil(sc, `(async () => !(await import('/src/runtime/bridge.ts')).grantedCapabilities(${JSON.stringify(hookId)}).includes('agent:hooks'))()`, 5_000),
     );
 
     // 分支二「连带卸载」：写盘，仅 temp 模式
     if (underTemp) {
       await clickReady(`.nav-item[data-view=pet]`);
-      await clickReady(`.nav-item[data-view=${JSON.stringify(PROBE_ID)}]`);
+      await clickReady(`.nav-item[data-view=${JSON.stringify(hookId)}]`);
       const hasBtn2 = await waitUntil(sc, `!!document.querySelector('.btn-revoke')`, 8_000).catch(() => false);
       r.check("重新进入插件页后撤销按钮再次可用", true, hasBtn2);
       if (hasBtn2) await clickReady(".btn-revoke");
@@ -1940,8 +2185,9 @@ export function unmount() {}
       }
     }
 
-    await sc.ev(`(async () => { await window.__hookHost.unmount(${JSON.stringify(PROBE_ID)}); document.getElementById('hook-probe-slot')?.remove(); return true; })()`);
+    await sc.ev(`(async () => { await window.__hookHost.unmount(${JSON.stringify(hookId)}); document.getElementById('hook-probe-slot')?.remove(); return true; })()`);
     await clickReady(`.nav-item[data-view=pet]`);
+    await restoreHookProbe();
 
     const noMod = await sCall("hotkey_set", { accelerator: "P" });
     r.check("不带修饰键的组合被拒", true, !noMod.ok && /修饰键/.test(String(noMod.e)));
@@ -1954,6 +2200,7 @@ export function unmount() {}
     r.check("状态读回的是改后的键", "Ctrl+Alt+F9", (await sCall("hotkey_status")).v?.accelerator);
     r.check("改回默认值", "CommandOrControl+Alt+P", (await sCall("hotkey_set", { accelerator: "CommandOrControl+Alt+P" })).v);
 
+    logConsoleLedger("after agent hooks");
     r.group("hotkey_test：试注册命令的门禁、语法码与不改现状");
     const petHotkeyTest = await call("hotkey_test", { accelerator: "Ctrl+Alt+F8" });
     r.check("宠物窗直接 invoke hotkey_test 被窗口门禁拒", "denied", petHotkeyTest.code);
@@ -1988,44 +2235,11 @@ export function unmount() {}
 
   // ---------- B3：气泡常驻状态行（宿主侧） ----------
   // 两个 fixture（id 不同）验「每个插件各占一条 + 回落」；同一份入口脚本靠 ctx.pluginId 区分 topic。
+  logConsoleLedger("before B3");
+  const b3WindowStart = (c.noise ?? []).length;
   r.group("B3 常驻状态行：显示 / 单行几何 / 仲裁回落 / 台词优先 / 回收");
-  const STATUS_A = "zz.status";
-  const STATUS_B = "zz.status2";
-  const STATUS_INDEX = `let live = true;
-export async function activate(ctx) {
-  const pid = ctx.pluginId;
-  // 下线之后不再回包：否则在途/迟到的那条 :res 会在下一套件里变成
-  // 'bus relay failed: … 插件没有安装'（verify:worker 的零噪音门会红）
-  const reply = (id, body) => { if (live) ctx.bus.publish(pid + ":res", Object.assign({ id: id }, body)); };
-  ctx.bus.subscribe(pid + ":cmd", async (msg) => {
-    try {
-      if (msg.action === "set") reply(msg.id, { ok: true, v: await ctx.pet.setStatus(msg.text) });
-      else if (msg.action === "clear") reply(msg.id, { ok: true, v: await ctx.pet.setStatus(null) });
-      else if (msg.action === "say") { await ctx.pet.say(String(msg.text)); reply(msg.id, { ok: true }); }
-      else if (msg.action === "boom") { reply(msg.id, { ok: true }); setTimeout(() => { throw new Error("B3 崩溃探针：故意未捕获"); }, 0); }
-      else reply(msg.id, { ok: false, e: "未知 action" });
-    } catch (e) {
-      reply(msg.id, { ok: false, e: String(e && e.message ? e.message : e) });
-    }
-  });
-}
-export function deactivate() { live = false; }
-`;
-  const statusManifest = (id) =>
-    JSON.stringify({
-      id,
-      name: `常驻行探针 ${id}`,
-      version: "0.0.0",
-      entry: "index.js",
-      permissions: ["pet:say", "bus:publish", "bus:subscribe"],
-      description: "验证气泡常驻行的显示、仲裁与回收（B3）。",
-    });
-  for (const id of [STATUS_A, STATUS_B]) {
-    const dir = join(PLUGINS_DIR, id);
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, "index.js"), STATUS_INDEX);
-    writeFileSync(join(dir, "manifest.json"), statusManifest(id));
-  }
+  const STATUS_A = PRESEED_STATUS_A;
+  const STATUS_B = PRESEED_STATUS_B;
   // 采样器必须等 reload 之后再装：window 上的东西（订阅与数组）会被那次重载整个冲掉 ——
   // 上一版就栽在这儿，结果每条 statusCall 都等满 15s 超时
   const installedCollectors = `(async () => {
@@ -2121,17 +2335,38 @@ export function deactivate() { live = false; }
   r.check("基线：没挂常驻行时气泡是收起的", false, b3BaselineShow);
   // 上面那一段结尾把设置窗关了，句柄也随窗作废：本组要写启停清单与撤授权，重开一扇
   settings = await openSettingsInvoker(PORT, c);
+  // D07-D16：上一轮可能留下 zz.status/zz.status2 的授权（B3 收尾的 revoke 若静默失败，
+  // 下一次 doActivate 的 permission_check 会直接放行，不再弹同意框）。启用前清掉所有
+  // zz.* 旧授权并读回；只动测试插件的授权，不碰用户插件。
+  const b3GrantsBefore = (await settings.invoke("permission_list")).v ?? {};
+  for (const id of Object.keys(b3GrantsBefore)) {
+    if (String(id).startsWith("zz.")) await revoke(id);
+  }
+  const b3GrantsAfter = (await settings.invoke("permission_list")).v ?? {};
+  const b3ZzLeft = Object.entries(b3GrantsAfter)
+    .filter(([id, caps]) => String(id).startsWith("zz.") && (caps ?? []).length > 0)
+    .map(([id]) => id);
+  r.check("B3 启用前授权表不含 zz.*（旧授权已清）", [], b3ZzLeft);
   await setEnabled([...new Set([...enabledBeforeB3, STATUS_A, STATUS_B])]);
   await reloadAndWait(c);
   // 激活会为两个 fixture 各弹一次同意框（声明的三项能力）
+  const b3Consents = [];
   for (const id of [STATUS_A, STATUS_B]) {
     const consent = await driveConsent("allow", id).catch((err) => ({ error: String(err?.message ?? err) }));
+    b3Consents.push(consent);
     const caps = consent?.caps ?? null;
     const capsOk = !!caps && caps.some((x) => x.includes("pet:say"));
     // 期望值不动（仍是 true）；失败时把 driveConsent 的原因原文带进 detail —— 否则只有一句
     // 「期望 true，实得 false」，分不清「框根本没开」还是「开的是别人的框」（B08 那一轮的现场就是这样丢掉的）
     r.check(`同意框列出了 ${id} 声明的能力（含 pet:say）`, true, capsOk ? true : (consent?.error ?? false));
   }
+  // 两个插件声明同一组能力；它们必须各自有独立 req/窗口，不能被按能力集合合流。
+  r.check(
+    "不同插件即使能力相同也各一扇窗（不合并）",
+    true,
+    b3Consents.every((x) => typeof x?.label === "string" && x.label.startsWith("consent-")) &&
+      b3Consents[0].label !== b3Consents[1].label,
+  );
   await c.ev(installedCollectors);
   /**
    * 等槽里没有台词在显示（气泡要么收起、要么带 `.status`）。
@@ -2274,15 +2509,32 @@ export function deactivate() { live = false; }
   r.check("撤销 A 的授权后 A 的行被摘掉、回落到 B 的行", "B行3", (await bubbleNow()).text);
   // 「不误删别人的行 / 撤无关权限不误清」的反面证据：B 的行既没被摘也没被改
   r.check("撤 A 的权不动 B 的行", "B行3", (await bubbleNow()).text);
-  // 无权之后不能再设置：会重新弹同意框，拒掉就不该出现这一行（不绕过授权）
-  const b3NoGrant = statusCall(STATUS_A, "set", "偷挂行").catch((err) => ({ ok: false, e: String(err?.message ?? err) }));
+  // 无权之后不能再设置：直接申请被拒绝锁挡下（不绕过授权）；不再走插件 setStatus，
+  // 避免它在 catch 里再发一次失败的 bus.publish 制造额外的 console 噪音。
+  const b3NoGrant = invoke_("permission_request", {
+    pluginId: STATUS_A,
+    capabilities: ["pet:say"],
+  });
   const b3ConsentAgain = await driveConsent("deny", STATUS_A).catch(() => null);
   const b3NoGrantRes = await b3NoGrant;
   r.info("撤权后再设置的同意框", b3ConsentAgain ? "弹了（已拒）" : "没弹");
   r.check(
     "撤权后无权再设置常驻行：拒掉同意框就拿不到这一行",
     "true|false",
-    [b3NoGrantRes.ok === false, (await bubbleNow()).text === "偷挂行"].join("|"),
+    [b3NoGrantRes.ok === true && b3NoGrantRes.v === false, (await bubbleNow()).text === "偷挂行"].join("|"),
+  );
+  // ADR-0013 拒绝锁：同轮再申请不新开窗，调用直接失败；停用 A 时由宿主清锁。
+  // 直接打 permission_request，避免再走插件 setStatus → 失败的 bus.publish 产生额外 console。
+  const b3Retry = invoke_("permission_request", {
+    pluginId: STATUS_A,
+    capabilities: ["pet:say"],
+  });
+  const b3RetryNoWindow = await waitNoConsent(STATUS_A);
+  const b3RetryRes = await b3Retry;
+  r.check(
+    "B3 撤权拒绝后同轮不再弹（拒绝锁生效）",
+    true,
+    b3RetryNoWindow && b3RetryRes.ok === true && b3RetryRes.v === false,
   );
 
   // 回收：停用要走**真的下线路径**。裸写启停清单不会让宠物窗 reconcile（watchEnabled 只缓存，
@@ -2376,29 +2628,309 @@ export function deactivate() { live = false; }
   await statusCall(STATUS_B, "boom");
   await b3LineGoneWithin5s("Worker 崩溃后");
 
-  // 收尾：改回原清单、撤销授权。fixture 目录**留到 finally 再删** —— 组尾就删会让
-  // 超时调用的迟到回包变成 `bus relay failed: … 没有安装`（verify:worker 的零噪音门会红）。
+  // 收尾：先真的下线两个状态探针，再改回原清单、撤销授权。fixture 目录**留到 finally 再删** ——
+  // 组尾就删会让超时调用的迟到回包变成 `bus relay failed: … 没有安装`（verify:worker 的零噪音门会红）。
+  await b3Deactivate(STATUS_A);
+  await b3Deactivate(STATUS_B);
   await setEnabled(enabledBeforeB3);
   for (const id of [STATUS_A, STATUS_B]) {
     await revoke(id);
   }
 
+  logConsoleLedger("after B3");
+  // 窗口 C：触发=B3 组全流程（含撤权、停用回收、Worker 崩溃探针）；
+  // 发射点=doActivate 277-282（缺权限被拒）与 doDeactivate 322/339；
+  // 期望=0；理由=B3 的撤权走直接 permission_request，停用回收不报错；
+  // 故意的 `B3 崩溃探针` 不含 plugin-runtime.ts:166，不混入切片。
+  const b3Noise = consoleWindow(b3WindowStart, [STATUS_A, STATUS_B]);
+  r.check("窗口 C：zz.status/zz.status2 console=0（B3 组切片）", 0, b3Noise.length);
+
+  // ---------- ADR-0013 判据 1–11：直接对宿主发 permission_request ----------
+  r.group("ADR-0013：同意合流 / 拒绝锁 / 未启用门禁");
+  const adrWindowStart = (c.noise ?? []).length;
+  const CONSENT_ID = PRESEED_CONSENT_ID;
+  const askConsent = (caps) => invoke(c)("permission_request", { pluginId: CONSENT_ID, capabilities: caps });
+  const checkConsent = async (cap) => {
+    const res = await invoke(c)("permission_check", { pluginId: CONSENT_ID, capability: cap });
+    return res.ok && res.v === true;
+  };
+  const resetConsent = async () => {
+    if (!settings) settings = await openSettingsInvoker(PORT, c);
+    await settings.invoke("permission_revoke", { pluginId: CONSENT_ID }).catch(() => undefined);
+    const restore = await enableForConsent(CONSENT_ID);
+    // 清锁/取消旧 pending 后，旧窗销毁是异步尾巴；先等场上没有本插件的窗再开始下一段。
+    await waitNoConsent(CONSENT_ID, 10_000);
+    return restore;
+  };
+
+  // 7：未启用直接申请 → false 且无窗
+  {
+    const before = await readEnabledIds(invoke(c));
+    await setEnabled(before.filter((id) => id !== CONSENT_ID));
+    const res = await askConsent(["storage"]);
+    r.check("未启用插件直接申请返回 false", true, res.ok === true && res.v === false);
+    r.check("未启用插件不弹同意框", true, await waitNoConsent(CONSENT_ID));
+    await setEnabled(before);
+  }
+
+  // 1/2/10：首次启用只一扇窗；并发同插件也只一扇；allow 后并集全授予
+  {
+    const restore = await resetConsent();
+    try {
+      const first = askConsent(["storage"]);
+      const consent = await driveConsent("allow", CONSENT_ID, ["storage"]);
+      const firstRes = await first;
+      r.check("判据1：首次启用只一扇同意框", true, consent.label.startsWith("consent-"));
+      r.check("判据10：allow 后 storage 授权", true, firstRes.ok === true && firstRes.v === true && (await checkConsent("storage")));
+
+      const restore2 = await resetConsent();
+      try {
+        const a = askConsent(["storage"]);
+        const b = askConsent(["notify"]);
+        const merged = await driveConsent("allow", CONSENT_ID, ["storage", "notify"]);
+        const [ra, rb] = await Promise.all([a, b]);
+        r.check("判据2：同插件并发只一扇窗且能力并集", true, merged.caps.includes("storage") && merged.caps.includes("notify"));
+        r.check("判据2：两个并发调用共享同一次允许", true, ra.ok === true && ra.v === true && rb.ok === true && rb.v === true);
+        r.check("判据10：allow 后 notify 也授权", true, await checkConsent("notify"));
+      } finally {
+        await restore2();
+      }
+    } finally {
+      await restore();
+    }
+  }
+
+  // 3：窗口开着时追加能力，不换窗；窗口 label 与 req_id 不变
+  {
+    const restore = await resetConsent();
+    try {
+      const first = askConsent(["storage"]);
+      const opened = await waitConsentWindow(CONSENT_ID);
+      try {
+        const second = askConsent(["notify"]);
+        const merged = await driveConsent("allow", CONSENT_ID, ["storage", "notify"]);
+        const [r1, r2] = await Promise.all([first, second]);
+        r.check("判据3：追加能力不换窗（label 不变）", opened.label, merged.label);
+        r.check("判据3：追加能力不换 req（原窗协议仍有效）", true, merged.label.startsWith("consent-"));
+        r.check("判据3：追加能力并集去重", true, merged.caps.filter((x) => x === "storage").length === 1 && merged.caps.filter((x) => x === "notify").length === 1);
+        r.check("判据3：两个请求都放行", true, r1.ok && r1.v === true && r2.ok && r2.v === true);
+      } finally {
+        opened.cs.close();
+      }
+    } finally {
+      await restore();
+    }
+  }
+
+  // 4/9/11：拒绝锁、重复能力去重、停用再启用清锁
+  {
+    const restore = await resetConsent();
+    try {
+      const dup = askConsent(["storage", "storage", "notify"]);
+      const dupConsent = await driveConsent("deny", CONSENT_ID, ["storage", "notify"]);
+      const dupRes = await dup;
+      r.check("判据9：重复能力在窗口里去重", true, dupConsent.caps.filter((x) => x === "storage").length === 1);
+      r.check("判据10：deny 后新增能力不授权", true, dupRes.ok === true && dupRes.v === false && !(await checkConsent("storage")) && !(await checkConsent("notify")));
+
+      const second = askConsent(["notify"]);
+      r.check("判据4：拒绝后同轮不再弹窗", true, await waitNoConsent(CONSENT_ID));
+      const secondRes = await second;
+      r.check("判据4：拒绝后同轮调用直接 false", true, secondRes.ok === true && secondRes.v === false);
+
+      // 设置页撤销授权不清拒绝锁（I4）
+      await settings.invoke("permission_revoke", { pluginId: CONSENT_ID });
+      const afterRevoke = askConsent(["notify"]);
+      r.check("I4：撤销授权不清拒绝锁、仍不弹窗", true, await waitNoConsent(CONSENT_ID));
+      const afterRevokeRes = await afterRevoke;
+      r.check("I4：撤销授权后同轮仍直接 false", true, afterRevokeRes.ok === true && afterRevokeRes.v === false);
+
+      // 停用再启用清锁（判据11）
+      const restore11 = await enableForConsent(CONSENT_ID);
+      try {
+        const retry = askConsent(["notify"]);
+        const retryConsent = await driveConsent("allow", CONSENT_ID, ["notify"]);
+        const retryRes = await retry;
+        r.check("判据11：停用再启用后拒绝锁已清，可再次弹窗", true, retryConsent.caps.includes("notify"));
+        r.check("判据5：已授权能力再次申请不弹窗", true, retryRes.ok === true && retryRes.v === true);
+        // 上一个窗口的销毁是异步尾巴；先等它消失，再断言“已授权不再开窗”。
+        r.check("判据5前置：答完后旧窗已关闭", true, await waitNoConsent(CONSENT_ID, 10_000));
+        const already = await askConsent(["notify"]);
+        r.check(
+          "判据5：已授权请求直接 true 且无窗",
+          true,
+          already.ok === true && already.v === true && (await waitNoConsent(CONSENT_ID)),
+        );
+      } finally {
+        await restore11();
+      }
+    } finally {
+      await restore();
+    }
+  }
+
+  // 6：窗口开着时停用插件 → 窗口关闭、等待方 false
+  {
+    const restore = await resetConsent();
+    try {
+      const pending = askConsent(["storage"]);
+      const opened = await waitConsentWindow(CONSENT_ID);
+      const before = await readEnabledIds(invoke(c));
+      await setEnabled(before.filter((id) => id !== CONSENT_ID));
+      r.check("判据6：停用插件后同意框关闭", true, await waitNoConsent(CONSENT_ID, 10_000));
+      const res = await pending;
+      r.check("判据6：停用后等待方返回 false", true, res.ok === true && res.v === false);
+      opened.cs.close();
+      await setEnabled(before);
+    } finally {
+      await restore();
+    }
+  }
+
+  // 清理探针：停用、移除目录，避免污染后续套件
+  const consentBefore = await readEnabledIds(invoke(c));
+  await setEnabled(consentBefore.filter((id) => id !== CONSENT_ID));
+  // 有意拒绝/停用的都是直接 permission_request，不应经过 doActivate；按插件 id 精确核销为 0 条。
+  // 窗口 B：触发=ADR-0013 组的直接 permission_request / 拒绝锁 / 停用取消；
+  // 发射点=doActivate 277-282（本组不应经过）与 doDeactivate 322/339；
+  // 期望=0；理由=直接 permission_request 不经过 doActivate，停用取消也不进 catch。
+  const consentNoise = consoleWindow(adrWindowStart, [CONSENT_ID]);
+  r.check("ADR-0013 新组/清理窗口 console 精确核销：zz.consent=0", 0, consentNoise.length);
+  r.check("窗口 B：zz.consent console=0（ADR-0013 组切片）", 0, consentNoise.length);
+
+  logConsoleLedger("after ADR-0013");
   r.group("宿主页面自身未产生 CSP 违规或未捕获异常");
   // 上面的递归测试会刻意打一条 console.error，它是被测行为的证据，不该混进这里的零容忍
   r.info("导航过渡期告警（reload 切断在飞 IPC 的产物，单独归类）", String(c.transitionNoise.length));
   // 本组故意打崩 Worker 的两条记录属被测行为的证据，按探针名过滤（同 verify-worker 口径）
   const unexpected = c.noise.filter((n) => !n.includes("派发递归") && !n.includes("B3 崩溃探针"));
-  r.check("无", 0, unexpected.length);
-  for (const n of unexpected) console.log("   " + n);
+  // 有意拒绝组的 console 不能一律算“意外”：按插件 id + 文案原文 + 次数精确核销。
+  // 这是新增的核销断言，不是白名单；数量/文案变化都会红。
+  const denyText = `${DENY_TEXT} @ http://localhost:1420/src/runtime/plugin-runtime.ts:166`;
+  const countDeny = (id) => unexpected.filter((n) => n.includes(id) && n.includes(denyText)).length;
+  r.info(
+    "有意拒绝 console 触发窗口",
+    "zz.probe: agent hooks 拒绝/重启用链；zz.consent: ADR-0013 新组清理；zz.status: 本轮未出现",
+  );
+  r.check(
+    "有意拒绝 console 核销：zz.probe=0 / zz.consent=0 / zz.status=0",
+    "0|0|0",
+    `${countDeny("zz.probe")}|${countDeny("zz.consent")}|${countDeny("zz.status")}`,
+  );
+  const remaining = unexpected.filter(
+    (n) => !((n.includes("zz.probe") || n.includes("zz.consent") || n.includes("zz.status")) && n.includes(denyText)),
+  );
+  r.check("无其他 console 错误", 0, remaining.length);
+  for (const n of remaining) console.log("   " + n);
+
+  // ---------- D07 窗口 D/E：deny / stop 正向对照 ----------
+  // 正向对照证明 console 采集真的能看见 reportError；否则上面 A/B/C 的 0 只是空判据。
+  r.group("D07 窗口 D/E：deny / stop 正向对照");
+  const UNDECLARED_ID = PRESEED_HOOK_UNDECLARED_ID;
+  const enabledBeforeDE = await readEnabledIds(invoke(c));
+  const deBaseIds = enabledBeforeDE.filter((id) => id !== UNDECLARED_ID);
+  const resetUndeclared = async () => {
+    if (!settings) settings = await openSettingsInvoker(PORT, c);
+    // 先移除：宿主会取消 pending 并清掉旧拒绝锁；再撤销旧授权，最后加回。
+    await setEnabled(deBaseIds);
+    await settings.invoke("permission_revoke", { pluginId: UNDECLARED_ID }).catch(() => undefined);
+    await setEnabled([...deBaseIds, UNDECLARED_ID]);
+    await waitNoConsent(UNDECLARED_ID, 10_000);
+  };
+  const fireUndeclaredActivation = () =>
+    c.ev(`(async () => {
+      const rt = await import('/src/runtime/plugin-runtime.ts');
+      const ms = await window.__TAURI_INTERNALS__.invoke('plugins_list');
+      const manifest = ms.find((m) => m.id === ${JSON.stringify(UNDECLARED_ID)});
+      if (!manifest) throw new Error('D07 未找到预置 fixture ${UNDECLARED_ID}');
+      window.__d07Activation = null;
+      rt.activatePlugin(manifest).then(
+        () => { window.__d07Activation = 'done'; },
+        (e) => { window.__d07Activation = 'error:' + String(e?.message ?? e); },
+      );
+      return true;
+    })()`);
+  const waitUndeclaredActivation = () =>
+    waitUntil(c, `window.__d07Activation !== null && window.__d07Activation !== undefined`, 20_000);
+  const undeclaredActive = () =>
+    c.ev(`(async () => { const rt = await import('/src/runtime/plugin-runtime.ts'); return rt.isActive(${JSON.stringify(UNDECLARED_ID)}); })()`);
+  try {
+    // 窗口 D：触发=显式 rt.activatePlugin(zz.hookundeclared)，doActivate 发现 storage 未授权；
+    // 发射点=277-282 的 permission_request 被用户拒绝 → 282 reportError(DENY_TEXT)；
+    // 期望=该窗口切片长度===1 且 DENY_TEXT===1；理由=本窗口只有 282 一个发射点。
+    await resetUndeclared();
+    const dStart = (c.noise ?? []).length;
+    const dConsole = waitConsoleWindow(
+      dStart,
+      [UNDECLARED_ID],
+      (entries) => entries.some((n) => n.includes(DENY_TEXT)),
+    );
+    await fireUndeclaredActivation();
+    const denySeen = await driveConsent("deny", UNDECLARED_ID);
+    r.check("窗口 D：同意框属于 zz.hookundeclared", true, denySeen.name.includes(UNDECLARED_ID));
+    await waitUndeclaredActivation();
+    await dConsole;
+    const dWindow = consoleWindow(dStart, [UNDECLARED_ID]);
+    r.check(
+      "窗口 D：DENY_TEXT 恰好 1（activatePlugin + deny）",
+      1,
+      dWindow.filter((n) => n.includes(DENY_TEXT)).length,
+    );
+    r.check("窗口 D：窗口切片总长恰好 1", 1, dWindow.length);
+    r.check("窗口 D：拒绝后插件没有进入 active", false, await undeclaredActive());
+
+    // 窗口 E：触发=清拒绝锁后重新 activatePlugin，permission_request 处于 pending 时停用；
+    // 发射点=doActivate 277-282 的 permission_request 返回 false，且 loadEnabled=false → 282 STOP_TEXT；
+    // 期望=切片长度===1 且 STOP_TEXT===1；322/339 期望 0，依据是 doDeactivate 开头的
+    // `if (!instance) return`：pending 时插件还没 active，停用不会进 doDeactivate 的 catch。
+    await resetUndeclared();
+    const eStart = (c.noise ?? []).length;
+    const eConsole = waitConsoleWindow(
+      eStart,
+      [UNDECLARED_ID],
+      (entries) => entries.some((n) => n.includes(STOP_TEXT)),
+    );
+    await fireUndeclaredActivation();
+    const pendingUndeclared = await waitConsentWindow(UNDECLARED_ID);
+    r.check("窗口 E：同意框已打开（pending）", true, pendingUndeclared.caps.includes("storage"));
+    pendingUndeclared.cs.close();
+    const beforeEStop = await readEnabledIds(invoke(c));
+    await setEnabled(beforeEStop.filter((id) => id !== UNDECLARED_ID));
+    await waitUndeclaredActivation();
+    await eConsole;
+    await waitNoConsent(UNDECLARED_ID, 10_000);
+    const eWindow = consoleWindow(eStart, [UNDECLARED_ID]);
+    r.check(
+      "窗口 E：STOP_TEXT 恰好 1（pending 时停用）",
+      1,
+      eWindow.filter((n) => n.includes(STOP_TEXT)).length,
+    );
+    r.check("窗口 E：窗口切片总长恰好 1（322/339 未发射）", 1, eWindow.length);
+  } finally {
+    await setEnabled(enabledBeforeDE);
+    if (settings) await settings.invoke("permission_revoke", { pluginId: UNDECLARED_ID }).catch(() => undefined);
+    await waitNoConsent(UNDECLARED_ID, 10_000);
+  }
 } catch (err) {
   // 断言中途抛错时别只丢一个栈：给出可读原因
   aborted = true;
   console.error("\n验证中断: " + String(err?.message ?? err).split("\n").slice(0, 3).join(" | "));
 } finally {
-  removeFixtures(PLUGINS_DIR);
-  // B3 那两个探针目录（zz.status / zz.status2）**不在这里删**：删掉之后，插件迟到的 `:res`
-  // 会在下一套件里中继成 `bus relay failed: … 插件没有安装`（verify:worker 的零噪音门会红）。
-  // 残留由上层的「构建前后清掉残留探针插件」那一步统一收拾（e2e.yml，2026-10-18 加）。
+  // D07 C5：先把清单里的 zz.* 剔掉并读回，再删目录；否则删目录触发的 reconcile
+  // 仍会看到清单里的 zz.*，把它们激活并弹授权窗。
+  try {
+    if (c) {
+      const beforeCleanup = await readEnabledIds(invoke(c));
+      const cleanIds = beforeCleanup.filter((id) => !String(id).startsWith("zz."));
+      if (cleanIds.length !== beforeCleanup.length) await setEnabled(cleanIds);
+      const afterCleanup = await readEnabledIds(invoke(c));
+      r.check("D07 收尾清单不含 zz.*", [], afterCleanup.filter((id) => String(id).startsWith("zz.")));
+    }
+  } catch (err) {
+    console.error("D07 收尾清理启停清单失败: " + String(err?.message ?? err));
+  }
+  removePreseedFixtures(PLUGINS_DIR);
+  // D07：预置的 zz.consent/zz.status/hook 与热安装组的 zz.probe 由上面的
+  // 「先剔清单、再删目录」统一收口；后续套件不再看到这些 fixture。
   // 探针留在宿主 realm 那条例外只服务于本套件的页面全局断言，不该活到下一轮真实使用里
   await c?.ev(`localStorage.removeItem('host:realm-plugin-host')`).catch(() => undefined);
   await c?.ev(`localStorage.removeItem('host:widget-realm-plugin-host')`).catch(() => undefined);

@@ -250,6 +250,14 @@ try {
   await reloadAndWait(settings.client);
   await waitUntil(settings.client, `!!window.__TAURI_INTERNALS__`, 15_000);
 
+  // 宿主启停门禁：探针先启用（并先移除一次以清旧拒绝锁），否则 permission_request 直接 false。
+  {
+    const current = await readEnabledIds(invoke);
+    const without = current.filter((id) => id !== PROBE_ID);
+    await writeEnabledIds(settings.invoke, without);
+    await writeEnabledIds(settings.invoke, [...without, PROBE_ID]);
+  }
+
   // 从设置页 realm 构造探针的 agentHooks 通道再调 status()：agent_hooks_* 带 pluginId 的调用
   // 除设置窗门禁外还要逐项校验 agent:hooks 已授权（commands/agent.rs 的 assert_caller），
   // 而桥在放行前会先 permission_request —— 探针起手必然没授权，所以这扇框必然要弹。
@@ -367,7 +375,7 @@ try {
   // 宿主随后把「孤儿回调」告警喷到页面上，被后面的零噪音断言算作本跑噪音。
   // 清单归宿主（C1）：先由设置窗写进去，宠物窗这边只是 loadEnabled + activate。
   settings = await openSettingsInvoker(PORT, c);
-  await writeEnabledIds(settings.invoke, [...origEnabled, AGENT_ID]);
+  await writeEnabledIds(settings.invoke, [...new Set([...origEnabled, AGENT_ID, PROBE_ID])]);
   r.check(
     "插件经运行时激活",
     true,
@@ -756,7 +764,7 @@ try {
   // （上一轮 3&4 两条红就是取到 null —— 窗在、坐标对，页面不在）。isolation 那组在开窗前也有
   // 同样一段 owner 前置。这里临时把它加进清单，组尾摘掉，finally 再按 origEnabled 兜一次。
   hrTempEnabled = true;
-  await writeEnabledIds(settings.invoke, [...new Set([...origEnabled, AGENT_ID, HR_ID])]);
+  await writeEnabledIds(settings.invoke, [...new Set([...origEnabled, AGENT_ID, PROBE_ID, HR_ID])]);
   // 从设置窗写的清单不会自己通知宠物窗（harness 的 reconcilePetWindow 就是补这一步的既有入口，
   // 它内部按 enabled 逐个 activate/deactivate）；不 reconcile，心率插件在本窗根本没跑起来。
   await reconcilePetWindow(c);
@@ -1474,7 +1482,16 @@ try {
     };
     const pagesBefore = (await listPages(PORT).catch(() => [])).length;
     const inboxBefore = readInboxLen();
-    const cleanup = spawnSync(EXE, ["--pet-hook-cleanup"], { encoding: "utf8", timeout: 5_000 });
+    // 独立进程只从 environment 取夹具路径：显式带上与宿主同一条覆盖，避免 runner 环境差异
+    // 让 cleanup 去扫真实 home（基线里 stripped=0 的首个失败点）。
+    const cleanupEnv = { ...env };
+    if (env.PET_AGENT_CONFIG_FILES) cleanupEnv.PET_AGENT_CONFIG_FILES = env.PET_AGENT_CONFIG_FILES;
+    const cleanup = spawnSync(EXE, ["--pet-hook-cleanup"], {
+      encoding: "utf8",
+      timeout: 5_000,
+      env: cleanupEnv,
+    });
+    r.info("cleanup stdout", String(cleanup.stdout ?? "").trim());
     r.check("清理分支 5 秒内退出且退出码为 0", 0, cleanup.status);
     r.check("清理分支没有被超时杀掉", undefined, cleanup.error);
     r.check("stdout 报告摘掉了条目", true, /result=done .*stripped=[1-9]\d* .*failed=0/.test(String(cleanup.stdout)));
@@ -1490,7 +1507,12 @@ try {
     const broken = "{ 半截 JSON";
     writeFileSync(cfgA, broken);
     const brokenB = readFileSync(cfgB, "utf8");
-    const cleanup2 = spawnSync(EXE, ["--pet-hook-cleanup"], { encoding: "utf8", timeout: 5_000 });
+    const cleanup2 = spawnSync(EXE, ["--pet-hook-cleanup"], {
+      encoding: "utf8",
+      timeout: 5_000,
+      env: cleanupEnv,
+    });
+    r.info("cleanup2 stdout", String(cleanup2.stdout ?? "").trim());
     r.check("撞到坏配置仍然退出码 0", 0, cleanup2.status);
     r.check("坏配置文件一字不改", broken, readFileSync(cfgA, "utf8"));
     r.check("坏配置不牵连另一个文件", brokenB, readFileSync(cfgB, "utf8"));
