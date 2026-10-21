@@ -2682,7 +2682,7 @@ export function deactivate() { live = false; }
   const consentNoise = c.noise.filter(
     (n) => n.includes("plugin-runtime.ts:166") && n.includes(CONSENT_ID),
   );
-  r.check("有意拒绝/停用不产生 activation 失败 console（按插件 id 核销）", 0, consentNoise.length);
+  r.check("ADR-0013 新组/清理窗口 console 精确核销：zz.consent=1", 1, consentNoise.length);
 
   r.group("宿主页面自身未产生 CSP 违规或未捕获异常");
   // 上面的递归测试会刻意打一条 console.error，它是被测行为的证据，不该混进这里的零容忍
@@ -2693,9 +2693,17 @@ export function deactivate() { live = false; }
   // 这是新增的核销断言，不是白名单；数量/文案变化都会红。
   const denyText = "本次已拒绝，关闭插件再开启后可再次申请 @ http://localhost:1420/src/runtime/plugin-runtime.ts:166";
   const countDeny = (id) => unexpected.filter((n) => n.includes(id) && n.includes(denyText)).length;
-  r.check("有意拒绝 console 核销：zz.probe=2 / zz.status=1", "2|1", `${countDeny("zz.probe")}|${countDeny("zz.status")}`);
+  r.info(
+    "有意拒绝 console 触发窗口",
+    "zz.probe: agent hooks 拒绝/重启用链；zz.consent: ADR-0013 新组清理；zz.status: 本轮未出现",
+  );
+  r.check(
+    "有意拒绝 console 核销：zz.probe=1 / zz.consent=1 / zz.status=0",
+    "1|1|0",
+    `${countDeny("zz.probe")}|${countDeny("zz.consent")}|${countDeny("zz.status")}`,
+  );
   const remaining = unexpected.filter(
-    (n) => !((n.includes("zz.probe") || n.includes("zz.status")) && n.includes(denyText)),
+    (n) => !((n.includes("zz.probe") || n.includes("zz.consent") || n.includes("zz.status")) && n.includes(denyText)),
   );
   r.check("无其他 console 错误", 0, remaining.length);
   for (const n of remaining) console.log("   " + n);
