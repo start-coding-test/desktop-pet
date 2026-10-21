@@ -88,16 +88,27 @@ impl HttpState {
 
     /// 取一份本次请求用的路由：TTL 内复用快照，否则重读注册表 + 环境变量。
     fn route(&self) -> Route {
+        self.route_at(Instant::now(), http_proxy::current_settings)
+    }
+
+    /// 同一件事，但**时钟与设置源都由调用方给**。
+    /// 「改了系统代理，TTL 到期的下一次请求立即生效」是卡片 4) 的硬要求，它不能靠
+    /// 真等 5 秒、也不能靠真读注册表来证 —— 那两个都得能注入。
+    fn route_at<F>(&self, now: Instant, mut read: F) -> Route
+    where
+        F: FnMut() -> ProxySettings,
+    {
         let direct = self.direct();
+        // poison 不 panic：`into_inner` 拿回那份缓存，最坏多用一个 TTL 的旧快照
         let mut guard = self.proxy.lock().unwrap_or_else(|p| p.into_inner());
         let fresh = guard
             .as_ref()
-            .is_some_and(|c| c.fetched_at.elapsed() < PROXY_TTL);
+            .is_some_and(|c| now.saturating_duration_since(c.fetched_at) < PROXY_TTL);
         if !fresh {
-            let settings = http_proxy::current_settings();
+            let settings = read();
             let previous = guard.take();
             *guard = Some(CachedSettings {
-                fetched_at: Instant::now(),
+                fetched_at: now,
                 http_agent: refresh_agent(
                     previous.as_ref().map(|c| (&c.http_key, &c.http_agent)),
                     settings.http.as_ref(),
@@ -140,7 +151,7 @@ impl Route {
     /// 这一跳走哪儿。**判不出目标（理论上不该发生）就直连** —— 代理是那条把流量交给
     /// 第三方进程的路线，判不明白时不该选它。
     fn agent_for(&self, url: &tauri::Url) -> ureq::Agent {
-        // 判定只有一处实现：`http_proxy::hop_uses_proxy`（单测钉的就是它）
+        // 判定只有一处实现：`Settings::proxy_scheme_for`（单测钉的就是它，这里只接线）
         match self.settings.proxy_scheme_for(url.as_str()) {
             // 决策说有代理却拿不到对应 agent（理论上不该发生）⇒ 退回直连，绝不猜一个代理用
             Some("https") => self
@@ -641,5 +652,211 @@ mod tests {
         assert!(is_credential_header("COOKIE"));
         assert!(is_credential_header("Proxy-Authorization"));
         assert!(!is_credential_header("Content-Type"));
+    }
+
+    /// 走代理那一档的夹具。**端点故意用非回环的名字**：回环代理端点会让「这一跳走了代理」
+    /// 与「第一道否决把目标拦下了」两件事搅在一起，判据就分不清在证什么。
+    fn fixture_settings() -> ProxySettings {
+        let spec = http_proxy::ProxySpec {
+            host: "proxy.internal.test".to_string(),
+            port: 3128,
+            user: None,
+            pass: None,
+        };
+        ProxySettings {
+            http: Some(spec.clone()),
+            https: Some(spec),
+            overrides: Vec::new(),
+        }
+    }
+
+    /// ureq 2.12 的 `Agent` 没有 `PartialEq`，但它的 `Debug` 里带 `config.proxy`
+    /// ——「这一次拿到的到底是直连 agent 还是代理 agent」就靠这个区分。
+    fn agent_label(agent: &ureq::Agent) -> String {
+        format!("{agent:?}")
+    }
+
+    #[test]
+    fn ttl_window_merges_setting_reads_and_expiry_switches_to_proxy() {
+        let state = HttpState::new();
+        let t0 = Instant::now();
+        let mut reads = 0usize;
+
+        // 第 1 次：一个代理源都没有 ⇒ 两档代理 agent 都不该存在
+        let r1 = state.route_at(t0, || {
+            reads += 1;
+            ProxySettings::default()
+        });
+        assert!(
+            r1.proxied_http.is_none() && r1.proxied_https.is_none(),
+            "没有代理源时不该建出代理 agent"
+        );
+
+        // 第 2 次：TTL 之内改了设置 ⇒ 仍用快照（这就是那 5 秒合并窗口的定义）
+        let r2 = state.route_at(t0 + Duration::from_secs(1), || {
+            reads += 1;
+            fixture_settings()
+        });
+        assert!(
+            r2.proxied_http.is_none() && r2.proxied_https.is_none(),
+            "TTL 内必须复用快照，不能提前换路线"
+        );
+        assert_eq!(reads, 1, "TTL 内不该再读一次设置源");
+
+        // 第 3 次：TTL 一到，**下一次请求**立即用上系统代理（卡片 4 的硬要求）
+        let r3 = state.route_at(t0 + PROXY_TTL + Duration::from_secs(1), || {
+            reads += 1;
+            fixture_settings()
+        });
+        assert_eq!(reads, 2, "到期就重读，不多读也不漏读");
+        assert!(
+            r3.proxied_http.is_some() && r3.proxied_https.is_some(),
+            "TTL 到期的下一次请求必须立刻切到系统代理，不能等重启"
+        );
+        let public = tauri::Url::parse("https://api.example.com/v1/status").unwrap();
+        assert!(
+            agent_label(&r3.agent_for(&public)).contains("proxy: Some("),
+            "公网目标这一跳拿到的得是代理 agent"
+        );
+    }
+
+    #[test]
+    fn ttl_expiry_switches_back_to_direct_when_the_proxy_is_removed() {
+        let state = HttpState::new();
+        let t0 = Instant::now();
+        let r1 = state.route_at(t0, fixture_settings);
+        assert!(r1.proxied_https.is_some(), "起点：正在走代理");
+
+        // 用户把系统代理关掉 ⇒ 到期后的下一次请求回到直连（反方向同一条硬要求）
+        let r2 = state.route_at(
+            t0 + PROXY_TTL + Duration::from_secs(1),
+            ProxySettings::default,
+        );
+        assert!(
+            r2.proxied_http.is_none() && r2.proxied_https.is_none(),
+            "关掉系统代理后到期必须回直连，不能把旧代理 agent 一直留着"
+        );
+        let public = tauri::Url::parse("https://api.example.com/v1/status").unwrap();
+        assert_eq!(
+            agent_label(&r2.agent_for(&public)),
+            agent_label(&r2.direct),
+            "回落到直连后公网目标用的就是那个直连 agent"
+        );
+    }
+
+    #[test]
+    fn no_proxy_source_keeps_the_direct_agent_exactly_as_before_b10() {
+        // 基准：B10 之前 http.rs 里就是这一个 agent，构造表达式原样抄一遍。
+        // 判的是「一个代理源都没有 ⇒ 出站配置与改动前逐字一致」，不是「能跑」。
+        let before_b10 = ureq::AgentBuilder::new()
+            .timeout_connect(TIMEOUT)
+            .timeout_read(TIMEOUT)
+            .timeout_write(TIMEOUT)
+            // 0 = 不自动跟重定向，3xx 原样返回给 send_following_redirects 逐跳复核域名
+            .redirects(0)
+            .build();
+        let now = build_agent(None);
+        assert_eq!(
+            agent_label(&before_b10),
+            agent_label(&now),
+            "无代理源时的直连 agent 配置被改了（timeout / redirects / proxy 任一项）"
+        );
+        assert!(agent_label(&now).contains("proxy: None"));
+        assert!(
+            agent_label(&now).contains("redirects: 0"),
+            "重定向仍由宿主自己跟"
+        );
+
+        let state = HttpState::new();
+        let r = state.route_at(Instant::now(), ProxySettings::default);
+        for url in [
+            "https://api.example.com/v1/status",
+            "http://api.example.com/v1/status",
+            "http://127.0.0.1:1420/src/index.html",
+        ] {
+            let parsed = tauri::Url::parse(url).unwrap();
+            assert_eq!(
+                agent_label(&r.agent_for(&parsed)),
+                agent_label(&r.direct),
+                "没有代理源时 {url} 必须用直连 agent"
+            );
+        }
+    }
+
+    #[test]
+    fn only_public_targets_get_the_proxied_agent() {
+        let state = HttpState::new();
+        let r = state.route_at(Instant::now(), fixture_settings);
+        let proxied = agent_label(&r.proxied_https.clone().expect("夹具里有 https 档"));
+        assert!(proxied.contains("server: \"proxy.internal.test\""));
+        assert!(
+            proxied.contains("redirects: 0"),
+            "走代理不许顺带把「宿主自己逐跳跟重定向」放宽成 ureq 自动跟"
+        );
+
+        // 同一份代理设置下：公网走代理，回环/私网/本机名一律直连（第一道否决接线到 Route）
+        for url in [
+            "http://127.0.0.1:1420/src/index.html",
+            "http://localhost:1420/",
+            "http://192.168.1.10/admin",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]:8080/",
+        ] {
+            let parsed = tauri::Url::parse(url).unwrap();
+            assert_eq!(
+                agent_label(&r.agent_for(&parsed)),
+                agent_label(&r.direct),
+                "{url} 是回环/私网，永不该拿到代理 agent"
+            );
+        }
+        let public = tauri::Url::parse("https://api.example.com/v1/status").unwrap();
+        assert_eq!(
+            agent_label(&r.agent_for(&public)),
+            proxied,
+            "公网目标该拿到代理 agent"
+        );
+        // 重定向回来变成内网：下一跳单独决定 ⇒ 又回到直连
+        let hop_back = tauri::Url::parse("http://10.0.0.5/internal").unwrap();
+        assert_eq!(
+            agent_label(&r.agent_for(&hop_back)),
+            agent_label(&r.direct),
+            "公网 → 内网的重定向不许沿用上一跳的代理路线"
+        );
+    }
+
+    #[test]
+    fn a_stale_proxy_snapshot_is_replaced_not_piled_up() {
+        // 端点换了 ⇒ 键换了 ⇒ 旧 agent 要被换掉，不能同时留着两档；
+        // 端点没换 ⇒ TTL 到期重建时留住原来的 agent（连接池不白丢）。
+        let state = HttpState::new();
+        let t0 = Instant::now();
+        let first = state.route_at(t0, fixture_settings);
+        assert!(
+            agent_label(&first.proxied_https.clone().expect("夹具里有 https 档"))
+                .contains("port: 3128")
+        );
+
+        let moved = state.route_at(t0 + PROXY_TTL + Duration::from_secs(1), || {
+            let mut s = fixture_settings();
+            let mut spec = s.https.clone().expect("夹具里有 https 档");
+            spec.port = 8888;
+            s.http = Some(spec.clone());
+            s.https = Some(spec);
+            s
+        });
+        let label = agent_label(&moved.proxied_https.clone().expect("到期后仍有 https 档"));
+        assert!(
+            label.contains("port: 8888") && !label.contains("port: 3128"),
+            "换了端点必须整体换档，不能新旧两档并存"
+        );
+
+        let same = state.route_at(
+            t0 + 2 * (PROXY_TTL + Duration::from_secs(1)),
+            fixture_settings,
+        );
+        assert!(
+            agent_label(&same.proxied_https.clone().expect("夹具里有 https 档"))
+                .contains("port: 3128")
+        );
     }
 }
