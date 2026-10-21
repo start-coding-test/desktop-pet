@@ -68,7 +68,7 @@ export function mountSettings(root, ctx, cleanups) {
     buttons[key] = buttonNode;
   }
 
-  wrap.append(tabs, statusLine, panes.overview, panes.trend, panes.prefs);
+  wrap.append(tabs, statusLine, panes.overview, panes.trend, panes.details, panes.prefs);
   root.append(wrap);
   setTab("overview");
 
