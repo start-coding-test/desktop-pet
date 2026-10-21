@@ -336,6 +336,13 @@ try {
   }
   r.check("D07 启动前预置 fixture 齐全", true, missingPreseed.length === 0);
   r.check("D07 启动前清单不含 zz.*", [], zzEnabledAtBoot);
+  let guardRejected = false;
+  try {
+    assertProbeRuntimeWritesAllowed("窗口 A 前");
+  } catch {
+    guardRejected = true;
+  }
+  r.check("D07 窗口 A 前拒绝 zz.probe 运行时写入（M7 杀手）", true, guardRejected);
   const INSTALL = `(async () => {
     if (!window.__wh || !Array.isArray(window.__canary)) {
       const { bus } = await import('/src/runtime/event-bus.ts');
