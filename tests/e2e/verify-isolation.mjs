@@ -2689,8 +2689,16 @@ export function deactivate() { live = false; }
   r.info("导航过渡期告警（reload 切断在飞 IPC 的产物，单独归类）", String(c.transitionNoise.length));
   // 本组故意打崩 Worker 的两条记录属被测行为的证据，按探针名过滤（同 verify-worker 口径）
   const unexpected = c.noise.filter((n) => !n.includes("派发递归") && !n.includes("B3 崩溃探针"));
-  r.check("无", 0, unexpected.length);
-  for (const n of unexpected) console.log("   " + n);
+  // 有意拒绝组的 console 不能一律算“意外”：按插件 id + 文案原文 + 次数精确核销。
+  // 这是新增的核销断言，不是白名单；数量/文案变化都会红。
+  const denyText = "本次已拒绝，关闭插件再开启后可再次申请 @ http://localhost:1420/src/runtime/plugin-runtime.ts:166";
+  const countDeny = (id) => unexpected.filter((n) => n.includes(id) && n.includes(denyText)).length;
+  r.check("有意拒绝 console 核销：zz.probe=2 / zz.status=1", "2|1", `${countDeny("zz.probe")}|${countDeny("zz.status")}`);
+  const remaining = unexpected.filter(
+    (n) => !((n.includes("zz.probe") || n.includes("zz.status")) && n.includes(denyText)),
+  );
+  r.check("无其他 console 错误", 0, remaining.length);
+  for (const n of remaining) console.log("   " + n);
 } catch (err) {
   // 断言中途抛错时别只丢一个栈：给出可读原因
   aborted = true;

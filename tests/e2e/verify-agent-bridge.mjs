@@ -1482,7 +1482,16 @@ try {
     };
     const pagesBefore = (await listPages(PORT).catch(() => [])).length;
     const inboxBefore = readInboxLen();
-    const cleanup = spawnSync(EXE, ["--pet-hook-cleanup"], { encoding: "utf8", timeout: 5_000 });
+    // 独立进程只从 environment 取夹具路径：显式带上与宿主同一条覆盖，避免 runner 环境差异
+    // 让 cleanup 去扫真实 home（基线里 stripped=0 的首个失败点）。
+    const cleanupEnv = { ...env };
+    if (env.PET_AGENT_CONFIG_FILES) cleanupEnv.PET_AGENT_CONFIG_FILES = env.PET_AGENT_CONFIG_FILES;
+    const cleanup = spawnSync(EXE, ["--pet-hook-cleanup"], {
+      encoding: "utf8",
+      timeout: 5_000,
+      env: cleanupEnv,
+    });
+    r.info("cleanup stdout", String(cleanup.stdout ?? "").trim());
     r.check("清理分支 5 秒内退出且退出码为 0", 0, cleanup.status);
     r.check("清理分支没有被超时杀掉", undefined, cleanup.error);
     r.check("stdout 报告摘掉了条目", true, /result=done .*stripped=[1-9]\d* .*failed=0/.test(String(cleanup.stdout)));
@@ -1498,7 +1507,12 @@ try {
     const broken = "{ 半截 JSON";
     writeFileSync(cfgA, broken);
     const brokenB = readFileSync(cfgB, "utf8");
-    const cleanup2 = spawnSync(EXE, ["--pet-hook-cleanup"], { encoding: "utf8", timeout: 5_000 });
+    const cleanup2 = spawnSync(EXE, ["--pet-hook-cleanup"], {
+      encoding: "utf8",
+      timeout: 5_000,
+      env: cleanupEnv,
+    });
+    r.info("cleanup2 stdout", String(cleanup2.stdout ?? "").trim());
     r.check("撞到坏配置仍然退出码 0", 0, cleanup2.status);
     r.check("坏配置文件一字不改", broken, readFileSync(cfgA, "utf8"));
     r.check("坏配置不牵连另一个文件", brokenB, readFileSync(cfgB, "utf8"));
