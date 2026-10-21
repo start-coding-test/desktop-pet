@@ -18,7 +18,19 @@ import {
   writeEnabledIds,
 } from "./harness/cdp.mjs";
 import { waitWidgetRealm } from "./harness/widget-realm.mjs";
-import { NET_ID, PROBE_ID, SPOOF_DIR, removeFixtures, writeFixtures } from "./harness/fixtures.mjs";
+import {
+  NET_ID,
+  PRESEED_CONSENT_ID,
+  PRESEED_HOOK_ID,
+  PRESEED_PLUGIN_IDS,
+  PRESEED_STATUS_A,
+  PRESEED_STATUS_B,
+  PROBE_ID,
+  SPOOF_DIR,
+  removeFixtures,
+  removePreseedFixtures,
+  writeFixtures,
+} from "./harness/fixtures.mjs";
 
 const PORT = Number(env.CDP_PORT ?? argv.find((a) => a.startsWith("--port="))?.split("=")[1] ?? 9223);
 const PLUGINS_DIR = resolve(import.meta.dirname, "../../plugins");
@@ -178,6 +190,11 @@ try {
 // 装上的宿主句柄仍可能被随后的重载冲掉，故下面的安装带退避重试。
 let c;
 let aborted = false;
+/** D07：窗口 A 结束后才允许 zz.probe 的运行时 manifest 写入（热安装/存储/http 组）。 */
+let probeRuntimeWritesAllowed = false;
+function assertProbeRuntimeWritesAllowed(where) {
+  if (!probeRuntimeWritesAllowed) throw new Error(`D07 ${where}: 窗口 A 前禁止运行时改写 zz.probe manifest`);
+}
 // 撤销授权与查看授权表只认设置窗（见 gate.rs：插件 JS 就跑在宠物窗里，
 // 不设门禁的话一行 invoke 就能抹掉任意插件的授权并连带清掉其存储）。
 // 脚本要撤销时就把设置窗唤出来走这条真实通道，顺带证明宠物窗问同样的命令会被拒。
@@ -261,10 +278,13 @@ async function waitConsentWindow(pluginId, timeoutMs = 20_000) {
  * 而 fixture 探针默认零权限，脚本要走的能力必须自己一项项要回来，
  * 顺带证明「manifest 声明 + 用户同意」这条链在宿主侧确实生效。
  */
-async function grantProbeCap(capability) {
-  const manifestPath = join(PLUGINS_DIR, PROBE_ID, "manifest.json");
+async function grantProbeCap(capability, pluginId = PROBE_ID) {
+  const manifestPath = join(PLUGINS_DIR, pluginId, "manifest.json");
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
   if (!manifest.permissions?.includes(capability)) {
+    if (!probeRuntimeWritesAllowed) {
+      throw new Error(`D07 预置 ${pluginId} 缺能力 ${capability}，窗口 A 前禁止运行时改写 manifest`);
+    }
     writeFileSync(
       manifestPath,
       JSON.stringify({ ...manifest, permissions: [...(manifest.permissions ?? []), capability] }, null, 2),
@@ -273,18 +293,18 @@ async function grantProbeCap(capability) {
   }
   // 旧接缝是「未启用也能直接要授权」；D02 起宿主先看启停清单，这里临时启用探针，
   // 只写清单不 reconcile，避免激活期批量授权污染这一条能力的窗口。
-  const restore = await enableForConsent(PROBE_ID);
+  const restore = await enableForConsent(pluginId);
   try {
-    const checked = await invoke(c)("permission_check", { pluginId: PROBE_ID, capability });
+    const checked = await invoke(c)("permission_check", { pluginId, capability });
     if (checked.ok && checked.v === true) return true; // 已授权时 permission_request 不弹框，别空等
     // 不等 permission_request 的返回：它会阻塞到用户作答，而 CDP 的 Runtime.evaluate 有 20 秒硬超时
     // （见 cdp.mjs::send），弹框慢一点就会把整条断言链打断。改成应答之后轮询授权表。
     invoke(c)("permission_request", {
-      pluginId: PROBE_ID,
+      pluginId,
       capabilities: [capability],
     }).catch(() => undefined);
     try {
-      const consent = await driveConsent("allow", PROBE_ID);
+      const consent = await driveConsent("allow", pluginId);
       r.check(`同意框列出了 ${capability}`, true, consent.caps.includes(capability));
     } catch (err) {
       console.log(`     没能操作 ${capability} 的同意框: ` + String(err?.message ?? err).split("\n")[0]);
@@ -292,7 +312,7 @@ async function grantProbeCap(capability) {
     }
     const until = Date.now() + 20_000;
     while (Date.now() < until) {
-      const now = await invoke(c)("permission_check", { pluginId: PROBE_ID, capability });
+      const now = await invoke(c)("permission_check", { pluginId, capability });
       if (now.ok && now.v === true) return true;
       await sleep(400);
     }
@@ -302,10 +322,20 @@ async function grantProbeCap(capability) {
   }
 }
 try {
-  writeFixtures(PLUGINS_DIR);
-  await sleep(2500);
   c = await attach(PORT, isPetPage);
   r.info("已连接", c.url);
+  const preseeded = new Set(((await invoke(c)("plugins_list")).v ?? []).map((m) => m.id));
+  const missingPreseed = PRESEED_PLUGIN_IDS.filter((id) => !preseeded.has(id));
+  if (missingPreseed.length) {
+    throw new Error(`D07 预置 fixture 缺失: ${missingPreseed.join(", ")}；请用 PET_E2E_PRESEED=1 npm run dev:debug 或 GITHUB_ACTIONS 启动`);
+  }
+  const enabledAtBoot = await readEnabledIds(invoke(c));
+  const zzEnabledAtBoot = enabledAtBoot.filter((id) => String(id).startsWith("zz."));
+  if (zzEnabledAtBoot.length) {
+    throw new Error(`D07 启动前清单仍含 zz.*: ${zzEnabledAtBoot.join(", ")}`);
+  }
+  r.check("D07 启动前预置 fixture 齐全", true, missingPreseed.length === 0);
+  r.check("D07 启动前清单不含 zz.*", [], zzEnabledAtBoot);
   const INSTALL = `(async () => {
     if (!window.__wh || !Array.isArray(window.__canary)) {
       const { bus } = await import('/src/runtime/event-bus.ts');
@@ -499,11 +529,14 @@ try {
     );
   }
 
+  // D07 窗口 A 终点：预置 superset 已在启动前写入，后续热安装组才允许重建 zz.probe。
+  probeRuntimeWritesAllowed = true;
   r.group("热安装 / 热移除（不重启宿主，仅靠 plugins 目录 watcher）");
   // 先造出「有启用记录但目录不存在」的状态：此时不该有任何激活。
   // 探针此刻还在跑，目录被移走会让宠物窗整页热重载（本卡的新行为）：先武装
   // load 事件再删目录，等这次重载真的落地 —— 不等的话它会掀掉下面刚要埋的哨兵。
   const removalArmed = armPageReload();
+  assertProbeRuntimeWritesAllowed("probe fixture 写入");
   removeFixtures(PLUGINS_DIR);
   if (await removalArmed) await sleep(600); // 与 reloadAndWait 同口径：等新文档的 reconcile 跑完
   await setEnabled([PROBE_ID]);
@@ -514,6 +547,7 @@ try {
   // 哨兵：整段测试期间页面一旦被重载，下面的结论就都不成立
   await c.ev(`window.__hotSentinel = "armed"`);
   r.check("仅有启用记录、目录缺失时不激活", false, await c.ev(`(window.__probeActivated ?? 0) >= 1`));
+  assertProbeRuntimeWritesAllowed("probe fixture 写入");
   writeFixtures(PLUGINS_DIR);
   r.check("放入目录后免重启即激活", true, await waitUntil(c, `(window.__probeActivated ?? 0) >= 1`, 20_000));
   r.check("目录变动的广播带得出变更的插件 id", true, await waitUntil(c, sawChangedId(PROBE_ID), 10_000));
@@ -612,6 +646,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   // HEAD 形状走 watcher → reconcile → deactivate 那条路（deactivate 计数器可观察）。
   // 两条形状的共同结论必须都成立：插件停了。先武装 load 事件再删目录。
   const goneArmed = armPageReload();
+  assertProbeRuntimeWritesAllowed("probe fixture 写入");
   removeFixtures(PLUGINS_DIR);
   const goneByReload = await goneArmed;
   if (goneByReload) await sleep(600); // 等新文档的 reconcile 跑完
@@ -629,6 +664,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   r.check("widget 容器随之移除", 0, await c.ev(`document.querySelectorAll(${JSON.stringify(removedSelector)}).length`));
 
   r.group("存储门禁：能力授权收在 Rust 侧（绕过 JS 桥的直接 invoke）");
+  assertProbeRuntimeWritesAllowed("probe fixture 写入");
   writeFixtures(PLUGINS_DIR);
   await sleep(1200);
   await revoke(PROBE_ID); // 起点确定：探针手里没有 storage
@@ -1082,6 +1118,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   r.group("http 代理与按域名授权（#21）");
   // 热安装那组测试结束时删掉了 fixture，这里要自己造回来：
   // 否则宿主报的是「读不到 manifest」，会被误判成鉴权规则失效
+  assertProbeRuntimeWritesAllowed("probe fixture 写入");
   writeFixtures(PLUGINS_DIR);
   await sleep(1200);
   const LOCAL_URL = "http://localhost:1420/src/index.html";
@@ -1657,13 +1694,13 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     // 免得早先的挂载/开关用例被同意框打断。
     r.group("agent:hooks 受控能力（settings 区专属）");
     const TEMP_ROOT = resolve(import.meta.dirname, "../../temp");
-    const hookDir = join(PLUGINS_DIR, PROBE_ID);
+    const hookId = PRESEED_HOOK_ID;
     // S3 之后 settings 区一律进 Worker：探针必须按 Worker 契约写 —— 没有 window / document，
     // 建节点只能用 ctx.dom，事实只能经 ctx.bus 回传。两条 bus 能力按 manifest 声明，
     // 并在本组开头真拿到授权（见下 grantProbeCap），否则 publish / subscribe 会被能力门禁拦下。
     const hookManifest = (permits) =>
       JSON.stringify({
-        id: PROBE_ID,
+        id: hookId,
         name: "钩子能力探针",
         version: "0.0.0",
         entry: "index.js",
@@ -1672,37 +1709,13 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
         permissions: ["bus:publish", "bus:subscribe", ...permits],
         description: "验证 agent:hooks 的受控注入面与同意流程。",
       });
-    const HOOK_WIDGET = `export function mount(root, ctx) {
-  const node = ctx.dom.createElement("div");
-  node.className = "zz-hookprobe";
-  node.textContent = ctx.region;
-  root.append(node);
-  ctx.bus.publish("${PROBE_ID}:fact", {
-    region: ctx.region,
-    hostIsUndefined: typeof ctx.host === "undefined",
-    hasAgentHooks: !!(ctx.host && ctx.host.agentHooks),
-    keys: ctx.host ? Object.keys(ctx.host).sort() : [],
-  });
-  ctx.bus.subscribe("${PROBE_ID}:cmd", async (msg) => {
-    const api = ctx.host && ctx.host.agentHooks;
-    let out;
-    if (!api) out = { ok: false, e: "no host.agentHooks on ctx" };
-    else {
-      try { out = { ok: true, v: await api[msg.name]() }; }
-      catch (e) { out = { ok: false, e: String(e && e.message ? e.message : e) }; }
-    }
-    ctx.bus.publish("${PROBE_ID}:res", { id: msg.id, region: ctx.region, ...out });
-  });
-}
-export function unmount() {}
-`;
     /** 收事实：探针在 Worker 里写不了 window，事实只能由本窗口的总线订阅者接住 */
     const WATCH_HOOK_FACTS = `(async () => {
       const { bus } = await import('/src/runtime/event-bus.ts');
       window.__hookFacts = [];
       window.__hookRes = [];
-      bus.subscribe('${PROBE_ID}:fact', (p) => window.__hookFacts.push(p));
-      bus.subscribe('${PROBE_ID}:res', (p) => window.__hookRes.push(p));
+      bus.subscribe('${hookId}:fact', (p) => window.__hookFacts.push(p));
+      bus.subscribe('${hookId}:res', (p) => window.__hookRes.push(p));
       return true;
     })()`;
     /** 把探针挂进某个区：容器共用同一个临时槽，槽缺就先建 */
@@ -1718,7 +1731,7 @@ export function unmount() {}
     const hookPin = (on) =>
       sc.ev(
         on
-          ? `localStorage.setItem('host:widget-realm-plugin-host', ${JSON.stringify(PROBE_ID)}); true`
+          ? `localStorage.setItem('host:widget-realm-plugin-host', ${JSON.stringify(hookId)}); true`
           : `localStorage.removeItem('host:widget-realm-plugin-host'); true`,
       );
     let hookCallSeq = 0;
@@ -1727,7 +1740,7 @@ export function unmount() {}
       const id = ++hookCallSeq;
       await sc.ev(`(async () => {
         const { bus } = await import('/src/runtime/event-bus.ts');
-        bus.inject('${PROBE_ID}:cmd', { id: ${id}, name: ${JSON.stringify(name)} });
+        bus.inject('${hookId}:cmd', { id: ${id}, name: ${JSON.stringify(name)} });
         return true;
       })()`);
       const hit = `((window.__hookRes || []).find((r) => r.id === ${id} && r.region === "settings")) ?? null`;
@@ -1736,18 +1749,14 @@ export function unmount() {}
       return sc.ev(hit);
     };
 
-    writeFileSync(join(hookDir, "widget.js"), HOOK_WIDGET);
-    writeFileSync(join(hookDir, "manifest.json"), hookManifest([]));
-    mkdirSync(join(TEMP_ROOT, "b2"), { recursive: true });
-    await sleep(900);
 
     // 起点确定：清掉上一次（可能崩溃留下）的旧授权，否则 permission_check 会短路掉声明校验。
     // 必须排在下面拿 bus 授权之前：permission_revoke 是 revoke_all，会把 bus 能力一并清掉。
-    await sCall("permission_revoke", { pluginId: PROBE_ID });
+    await sCall("permission_revoke", { pluginId: hookId });
 
     // 探针的事实只能经总线回传，所以两条 bus 能力要真授权（各自一个真实同意框）
-    r.check("探针经同意框拿到 bus:publish（Worker 里回传事实的前提）", true, await grantProbeCap("bus:publish"));
-    r.check("探针经同意框拿到 bus:subscribe（Worker 里收指令的前提）", true, await grantProbeCap("bus:subscribe"));
+    r.check("探针经同意框拿到 bus:publish（Worker 里回传事实的前提）", true, await grantProbeCap("bus:publish", hookId));
+    r.check("探针经同意框拿到 bus:subscribe（Worker 里收指令的前提）", true, await grantProbeCap("bus:subscribe", hookId));
     await sc.ev(WATCH_HOOK_FACTS);
 
     // S3 的正身：例外名单里点着 zz.probe，settings 区照样进 Worker
@@ -1770,14 +1779,14 @@ export function unmount() {}
     r.check(
       "例外名单点着这个插件，settings 区仍进 Worker（S3）",
       "worker",
-      (await waitWidgetRealm(sc, PROBE_ID, "settings", "worker", 20_000)).actual,
+      (await waitWidgetRealm(sc, hookId, "settings", "worker", 20_000)).actual,
     );
     // 另两区照旧认例外名单：把名单摘掉它们才进 Worker —— 顺带钉住「名单只管 badge / overlay」
     await hookPin(false);
     await sc.ev(mountHookRegion("badge"));
     await sc.ev(mountHookRegion("overlay"));
-    r.check("badge 区进 Worker", "worker", (await waitWidgetRealm(sc, PROBE_ID, "badge", "worker", 20_000)).actual);
-    r.check("overlay 区进 Worker", "worker", (await waitWidgetRealm(sc, PROBE_ID, "overlay", "worker", 20_000)).actual);
+    r.check("badge 区进 Worker", "worker", (await waitWidgetRealm(sc, hookId, "badge", "worker", 20_000)).actual);
+    r.check("overlay 区进 Worker", "worker", (await waitWidgetRealm(sc, hookId, "overlay", "worker", 20_000)).actual);
     await hookPin(true); // 后面几组仍按老前提（例外名单开着）跑
 
     const factsOk = await waitUntil(sc, `(window.__hookFacts || []).length >= 3`, 20_000).catch(() => false);
@@ -1806,14 +1815,19 @@ export function unmount() {}
 
     // 此刻探针确定没有 agent:hooks，且下面这次调用不会弹同意框（窗口门禁过了走的是能力校验）
     const hookSnapBefore = JSON.stringify((await sCall("agent_hooks_status")).v);
-    const unauthUninstall = await sCall("agent_hooks_uninstall", { pluginId: PROBE_ID });
+    const unauthUninstall = await sCall("agent_hooks_uninstall", { pluginId: hookId });
     const hookSnapAfter = JSON.stringify((await sCall("agent_hooks_status")).v);
     r.check(
       "设置窗带 pluginId 但未授权 agent:hooks：能力门禁拒且配置快照未动",
       "denied|true",
       `${unauthUninstall.code}|${hookSnapBefore === hookSnapAfter}`,
     );
-    const undeclared = await hookCall("status");
+    const undeclared = await sc.ev(`(async () => {
+      const { createAgentHooksApi } = await import('/src/runtime/bridge.ts');
+      const api = createAgentHooksApi({ id: ${JSON.stringify(PROBE_ID)}, name: '未声明钩子探针', permissions: ['agent:hooks'] });
+      try { await api.status(); return { ok: true }; }
+      catch (e) { return { ok: false, e: String(e?.message ?? e) } }
+    })()`);
     r.check(
       "未声明 agent:hooks：settings 区调用被拒（未声明的能力不弹框，直接拒）",
       true,
@@ -1821,29 +1835,27 @@ export function unmount() {}
     );
 
     // 声明后：首次调用应弹同意框。先拒绝一次，再同意。
-    writeFileSync(join(hookDir, "manifest.json"), hookManifest(["agent:hooks"]));
-    await sleep(500);
-    const restoreHookProbe = await enableForConsent(PROBE_ID);
+    const restoreHookProbe = await enableForConsent(hookId);
     const pendingDeny = hookCall("status");
-    const consentDeny = await driveConsent("deny", PROBE_ID);
+    const consentDeny = await driveConsent("deny", hookId);
     r.check("同意框列出了 agent:hooks", true, consentDeny.caps.some((x) => x.includes("agent:hooks")));
     // 同意框标题是既有文案 `${plugin_name}（${plugin_id}）`（consent/main.ts:34），断言整串
-    r.check("同意框显示的是探针插件名（既有文案含 id）", "钩子能力探针（zz.probe）", consentDeny.name);
+    r.check("同意框显示的是探针插件名（既有文案含 id）", `钩子能力探针（${hookId}）`, consentDeny.name);
     const denied = await pendingDeny;
     r.check("拒绝后调用被拒（默认拒绝语义）", true, denied.ok === false && /权限被拒绝/.test(denied.e));
 
     // ADR-0013 I4：同轮第二次申请命中拒绝锁，不再弹窗；停用/启用清锁后才允许恢复。
     const pendingAllow = hookCall("status");
-    const noSecondConsent = await waitNoConsent(PROBE_ID);
+    const noSecondConsent = await waitNoConsent(hookId);
     const deniedAgain = await pendingAllow;
     r.check("拒绝后同轮不再弹（第二次无新窗）", true, noSecondConsent);
     r.check("拒绝后第二次调用仍被拒", true, deniedAgain.ok === false && /权限被拒绝/.test(deniedAgain.e));
 
-    const restoreAllow = await enableForConsent(PROBE_ID);
+    const restoreAllow = await enableForConsent(hookId);
     let allowed;
     try {
       const pendingRetry = hookCall("status");
-      const consentAllow = await driveConsent("allow", PROBE_ID);
+      const consentAllow = await driveConsent("allow", hookId);
       r.check("停用再启用后拒绝锁已清（可再次弹窗）", true, consentAllow.caps.some((x) => x.includes("agent:hooks")));
       allowed = await pendingRetry;
     } finally {
@@ -1856,9 +1868,9 @@ export function unmount() {}
     // 宠物窗主 realm：绕过 JS 桥直接 invoke 必须被窗口门禁拒（label=pet）
     const petStatus = await call("agent_hooks_status");
     r.check("宠物窗直接 invoke status 被拒（label=pet）", true, petStatus.ok === false && /设置窗/.test(String(petStatus.e)));
-    const petInstall = await call("agent_hooks_install", { pluginId: PROBE_ID });
+    const petInstall = await call("agent_hooks_install", { pluginId: hookId });
     r.check("宠物窗带 pluginId 的 install 同样被窗口门禁拒", true, petInstall.ok === false && /设置窗/.test(String(petInstall.e)));
-    const petUninstall = await call("agent_hooks_uninstall", { pluginId: PROBE_ID });
+    const petUninstall = await call("agent_hooks_uninstall", { pluginId: hookId });
     r.check("宠物窗直接 invoke agent_hooks_uninstall（带 pluginId）被窗口门禁拒", "denied", petUninstall.code);
 
     // 写盘类断言只在宿主被指到 temp/ 时跑（PET_AGENT_CONFIG_FILES 启动方式）；
@@ -1958,14 +1970,14 @@ export function unmount() {}
     r.check(
       "设置页在 manifest 改写后刷新出 agent:hooks 权限",
       true,
-      await waitUntil(sc, `document.querySelector('.nav-item[data-view=${JSON.stringify(PROBE_ID)}]')?.dataset.search?.includes('agent:hooks') === true`, 10_000),
+      await waitUntil(sc, `document.querySelector('.nav-item[data-view=${JSON.stringify(hookId)}]')?.dataset.search?.includes('agent:hooks') === true`, 10_000),
     );
     // 重载把 window 上的订阅与桥缓存都清了：重挂 settings 区那一个（例外名单开着，它照样进 Worker）、
     // 重订事实通道，再走一次 status 把缓存填上
     await hookPin(true);
     await sc.ev(WATCH_HOOK_FACTS);
     await sc.ev(mountHookRegion("settings"));
-    await waitWidgetRealm(sc, PROBE_ID, "settings", "worker", 20_000);
+    await waitWidgetRealm(sc, hookId, "settings", "worker", 20_000);
     const regrant = await hookCall("status");
     r.check("重载后凭已授权记录直接放行（不再弹框）", true, regrant.ok === true);
 
@@ -1979,7 +1991,7 @@ export function unmount() {}
       return ready;
     };
 
-    const navOpened = await clickReady(`.nav-item[data-view=${JSON.stringify(PROBE_ID)}]`);
+    const navOpened = await clickReady(`.nav-item[data-view=${JSON.stringify(hookId)}]`);
     const hasRevokeBtn = navOpened && (await waitUntil(sc, `!!document.querySelector('.btn-revoke')`, 8_000).catch(() => false));
     r.check("插件壳上出现「撤销授权」（class=btn-revoke，声明列表已刷新）", true, hasRevokeBtn);
 
@@ -1989,7 +2001,7 @@ export function unmount() {}
     r.check(
       "撤销前桥缓存里有 agent:hooks（下面「失效」才是真的变化）",
       true,
-      (await sc.ev(`(async () => (await import('/src/runtime/bridge.ts')).grantedCapabilities(${JSON.stringify(PROBE_ID)}).includes('agent:hooks'))()`)) === true,
+      (await sc.ev(`(async () => (await import('/src/runtime/bridge.ts')).grantedCapabilities(${JSON.stringify(hookId)}).includes('agent:hooks'))()`)) === true,
     );
     if (hasRevokeBtn) await clickReady(".btn-revoke");
     const stripUp = hasRevokeBtn === true && (await waitUntil(sc, `document.getElementById('revoke-uninstall')?.checked === true`, 5_000).catch(() => false));
@@ -2016,13 +2028,13 @@ export function unmount() {}
     r.check(
       "「只撤能力」后桥的能力缓存失效",
       true,
-      await waitUntil(sc, `(async () => !(await import('/src/runtime/bridge.ts')).grantedCapabilities(${JSON.stringify(PROBE_ID)}).includes('agent:hooks'))()`, 5_000),
+      await waitUntil(sc, `(async () => !(await import('/src/runtime/bridge.ts')).grantedCapabilities(${JSON.stringify(hookId)}).includes('agent:hooks'))()`, 5_000),
     );
 
     // 分支二「连带卸载」：写盘，仅 temp 模式
     if (underTemp) {
       await clickReady(`.nav-item[data-view=pet]`);
-      await clickReady(`.nav-item[data-view=${JSON.stringify(PROBE_ID)}]`);
+      await clickReady(`.nav-item[data-view=${JSON.stringify(hookId)}]`);
       const hasBtn2 = await waitUntil(sc, `!!document.querySelector('.btn-revoke')`, 8_000).catch(() => false);
       r.check("重新进入插件页后撤销按钮再次可用", true, hasBtn2);
       if (hasBtn2) await clickReady(".btn-revoke");
@@ -2043,7 +2055,7 @@ export function unmount() {}
       }
     }
 
-    await sc.ev(`(async () => { await window.__hookHost.unmount(${JSON.stringify(PROBE_ID)}); document.getElementById('hook-probe-slot')?.remove(); return true; })()`);
+    await sc.ev(`(async () => { await window.__hookHost.unmount(${JSON.stringify(hookId)}); document.getElementById('hook-probe-slot')?.remove(); return true; })()`);
     await clickReady(`.nav-item[data-view=pet]`);
     await restoreHookProbe();
 
@@ -2093,43 +2105,8 @@ export function unmount() {}
   // ---------- B3：气泡常驻状态行（宿主侧） ----------
   // 两个 fixture（id 不同）验「每个插件各占一条 + 回落」；同一份入口脚本靠 ctx.pluginId 区分 topic。
   r.group("B3 常驻状态行：显示 / 单行几何 / 仲裁回落 / 台词优先 / 回收");
-  const STATUS_A = "zz.status";
-  const STATUS_B = "zz.status2";
-  const STATUS_INDEX = `let live = true;
-export async function activate(ctx) {
-  const pid = ctx.pluginId;
-  // 下线之后不再回包：否则在途/迟到的那条 :res 会在下一套件里变成
-  // 'bus relay failed: … 插件没有安装'（verify:worker 的零噪音门会红）
-  const reply = (id, body) => { if (live) ctx.bus.publish(pid + ":res", Object.assign({ id: id }, body)); };
-  ctx.bus.subscribe(pid + ":cmd", async (msg) => {
-    try {
-      if (msg.action === "set") reply(msg.id, { ok: true, v: await ctx.pet.setStatus(msg.text) });
-      else if (msg.action === "clear") reply(msg.id, { ok: true, v: await ctx.pet.setStatus(null) });
-      else if (msg.action === "say") { await ctx.pet.say(String(msg.text)); reply(msg.id, { ok: true }); }
-      else if (msg.action === "boom") { reply(msg.id, { ok: true }); setTimeout(() => { throw new Error("B3 崩溃探针：故意未捕获"); }, 0); }
-      else reply(msg.id, { ok: false, e: "未知 action" });
-    } catch (e) {
-      reply(msg.id, { ok: false, e: String(e && e.message ? e.message : e) });
-    }
-  });
-}
-export function deactivate() { live = false; }
-`;
-  const statusManifest = (id) =>
-    JSON.stringify({
-      id,
-      name: `常驻行探针 ${id}`,
-      version: "0.0.0",
-      entry: "index.js",
-      permissions: ["pet:say", "bus:publish", "bus:subscribe"],
-      description: "验证气泡常驻行的显示、仲裁与回收（B3）。",
-    });
-  for (const id of [STATUS_A, STATUS_B]) {
-    const dir = join(PLUGINS_DIR, id);
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, "index.js"), STATUS_INDEX);
-    writeFileSync(join(dir, "manifest.json"), statusManifest(id));
-  }
+  const STATUS_A = PRESEED_STATUS_A;
+  const STATUS_B = PRESEED_STATUS_B;
   // 采样器必须等 reload 之后再装：window 上的东西（订阅与数组）会被那次重载整个冲掉 ——
   // 上一版就栽在这儿，结果每条 statusCall 都等满 15s 超时
   const installedCollectors = `(async () => {
@@ -2517,26 +2494,7 @@ export function deactivate() { live = false; }
 
   // ---------- ADR-0013 判据 1–11：直接对宿主发 permission_request ----------
   r.group("ADR-0013：同意合流 / 拒绝锁 / 未启用门禁");
-  const CONSENT_ID = "zz.consent";
-  const consentDir = join(PLUGINS_DIR, CONSENT_ID);
-  mkdirSync(consentDir, { recursive: true });
-  writeFileSync(join(consentDir, "index.js"), "export function activate() {}\nexport function deactivate() {}\n");
-  writeFileSync(
-    join(consentDir, "manifest.json"),
-    JSON.stringify({
-      id: CONSENT_ID,
-      name: "同意合流探针",
-      version: "0.0.0",
-      entry: "index.js",
-      permissions: ["storage", "notify"],
-      description: "验证 ADR-0013 的合流、去重、拒绝锁与未启用门禁。",
-    }),
-  );
-  await waitUntil(
-    c,
-    `(async () => { const m = await window.__TAURI_INTERNALS__.invoke('plugins_list'); return m.some((x) => x.id === ${JSON.stringify(CONSENT_ID)}); })()`,
-    5_000,
-  );
+  const CONSENT_ID = PRESEED_CONSENT_ID;
   const askConsent = (caps) => invoke(c)("permission_request", { pluginId: CONSENT_ID, capabilities: caps });
   const checkConsent = async (cap) => {
     const res = await invoke(c)("permission_check", { pluginId: CONSENT_ID, capability: cap });
@@ -2677,7 +2635,6 @@ export function deactivate() { live = false; }
   // 清理探针：停用、移除目录，避免污染后续套件
   const consentBefore = await readEnabledIds(invoke(c));
   await setEnabled(consentBefore.filter((id) => id !== CONSENT_ID));
-  rmSync(consentDir, { recursive: true, force: true });
   // 有意拒绝/停用的都是直接 permission_request，不应经过 doActivate；按插件 id 精确核销为 0 条。
   const consentNoise = c.noise.filter(
     (n) => n.includes("plugin-runtime.ts:166") && n.includes(CONSENT_ID),
@@ -2712,10 +2669,22 @@ export function deactivate() { live = false; }
   aborted = true;
   console.error("\n验证中断: " + String(err?.message ?? err).split("\n").slice(0, 3).join(" | "));
 } finally {
-  removeFixtures(PLUGINS_DIR);
-  // B3 那两个探针目录（zz.status / zz.status2）**不在这里删**：删掉之后，插件迟到的 `:res`
-  // 会在下一套件里中继成 `bus relay failed: … 插件没有安装`（verify:worker 的零噪音门会红）。
-  // 残留由上层的「构建前后清掉残留探针插件」那一步统一收拾（e2e.yml，2026-10-18 加）。
+  // D07 C5：先把清单里的 zz.* 剔掉并读回，再删目录；否则删目录触发的 reconcile
+  // 仍会看到清单里的 zz.*，把它们激活并弹授权窗。
+  try {
+    if (c) {
+      const beforeCleanup = await readEnabledIds(invoke(c));
+      const cleanIds = beforeCleanup.filter((id) => !String(id).startsWith("zz."));
+      if (cleanIds.length !== beforeCleanup.length) await setEnabled(cleanIds);
+      const afterCleanup = await readEnabledIds(invoke(c));
+      r.check("D07 收尾清单不含 zz.*", [], afterCleanup.filter((id) => String(id).startsWith("zz.")));
+    }
+  } catch (err) {
+    console.error("D07 收尾清理启停清单失败: " + String(err?.message ?? err));
+  }
+  removePreseedFixtures(PLUGINS_DIR);
+  // D07：预置的 zz.consent/zz.status/hook 与热安装组的 zz.probe 由上面的
+  // 「先剔清单、再删目录」统一收口；后续套件不再看到这些 fixture。
   // 探针留在宿主 realm 那条例外只服务于本套件的页面全局断言，不该活到下一轮真实使用里
   await c?.ev(`localStorage.removeItem('host:realm-plugin-host')`).catch(() => undefined);
   await c?.ev(`localStorage.removeItem('host:widget-realm-plugin-host')`).catch(() => undefined);
