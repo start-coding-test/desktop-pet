@@ -558,7 +558,7 @@ group("同意框刷新与拒绝文案");
   check(
     "同意框用 consent_details 轮询同一 req_id",
     consentSrc.includes('hostCall<ConsentDetails>("consent_details"') &&
-      consentSrc.includes("setInterval"),
+      consentSrc.includes("timer = setInterval("),
     true,
   );
   check(
