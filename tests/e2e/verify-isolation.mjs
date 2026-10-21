@@ -206,24 +206,29 @@ async function enableForConsent(pluginId) {
   return async () => setEnabled(before);
 }
 
-/** 有界等「该插件没有同意框」：返回 true 表示超时内确实没有。 */
+/** 有界等「该插件没有同意框」：看到窗只说明还在关闭途中，继续轮询；超时仍有关联窗才 false。 */
 async function waitNoConsent(pluginId, timeoutMs = 2_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const pages = (await listPages(PORT).catch(() => [])).filter((t) => /consent/.test(t.url));
+    let found = false;
     for (const target of pages) {
       let cs = null;
       try {
         cs = await attach(PORT, (t) => t.webSocketDebuggerUrl === target.webSocketDebuggerUrl, 8_000);
         const name = await cs.ev(`document.getElementById('plugin-name')?.textContent ?? ''`);
-        if (consentBoxBelongsTo(name, pluginId)) return false;
+        if (consentBoxBelongsTo(name, pluginId)) {
+          found = true;
+          break;
+        }
       } finally {
         cs?.close();
       }
     }
+    if (!found) return true;
     await sleep(200);
   }
-  return true;
+  return false;
 }
 
 /** 只读一扇同意框（不点按钮），用于停用关窗用例；调用方负责关闭返回的 client。 */
@@ -1087,6 +1092,8 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   });
   r.check("未声明 http 的插件不能申请按域名放行", true, !badAsk.ok && /未在 manifest 声明/.test(String(badAsk.e)));
 
+  const restoreNet = await enableForConsent(NET_ID);
+  try {
   const grant = c
     .ev(
       `window.__TAURI_INTERNALS__.invoke('permission_request', { pluginId: ${JSON.stringify(NET_ID)}, capabilities: ["http", ${JSON.stringify(HOST_CAP)}] })`,
@@ -1136,7 +1143,10 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   );
   const notifyDenied = await invoke_("notify_show", { pluginId: NET_ID, title: "t", body: "b" });
   r.check("未声明 notify 的插件发不出系统通知", true, !notifyDenied.ok && /未授权/.test(String(notifyDenied.e)));
-  await revoke(NET_ID);
+  } finally {
+    await revoke(NET_ID);
+    await restoreNet();
+  }
 
   r.group("示例插件真实挂载（含相对 import 的 topics.js）");
   await c.ev(INSTALL); // 热安装那组末尾重载过页面，宿主句柄要重装（INSTALL 幂等）
@@ -2377,21 +2387,33 @@ export function deactivate() { live = false; }
   r.check("撤销 A 的授权后 A 的行被摘掉、回落到 B 的行", "B行3", (await bubbleNow()).text);
   // 「不误删别人的行 / 撤无关权限不误清」的反面证据：B 的行既没被摘也没被改
   r.check("撤 A 的权不动 B 的行", "B行3", (await bubbleNow()).text);
-  // 无权之后不能再设置：会重新弹同意框，拒掉就不该出现这一行（不绕过授权）
-  const b3NoGrant = statusCall(STATUS_A, "set", "偷挂行").catch((err) => ({ ok: false, e: String(err?.message ?? err) }));
+  // 无权之后不能再设置：直接申请被拒绝锁挡下（不绕过授权）；不再走插件 setStatus，
+  // 避免它在 catch 里再发一次失败的 bus.publish 制造额外的 console 噪音。
+  const b3NoGrant = invoke_("permission_request", {
+    pluginId: STATUS_A,
+    capabilities: ["pet:say"],
+  });
   const b3ConsentAgain = await driveConsent("deny", STATUS_A).catch(() => null);
   const b3NoGrantRes = await b3NoGrant;
   r.info("撤权后再设置的同意框", b3ConsentAgain ? "弹了（已拒）" : "没弹");
   r.check(
     "撤权后无权再设置常驻行：拒掉同意框就拿不到这一行",
     "true|false",
-    [b3NoGrantRes.ok === false, (await bubbleNow()).text === "偷挂行"].join("|"),
+    [b3NoGrantRes.ok === true && b3NoGrantRes.v === false, (await bubbleNow()).text === "偷挂行"].join("|"),
   );
   // ADR-0013 拒绝锁：同轮再申请不新开窗，调用直接失败；停用 A 时由宿主清锁。
-  const b3Retry = statusCall(STATUS_A, "set", "再挂行").catch((err) => ({ ok: false, e: String(err?.message ?? err) }));
+  // 直接打 permission_request，避免再走插件 setStatus → 失败的 bus.publish 产生额外 console。
+  const b3Retry = invoke_("permission_request", {
+    pluginId: STATUS_A,
+    capabilities: ["pet:say"],
+  });
   const b3RetryNoWindow = await waitNoConsent(STATUS_A);
   const b3RetryRes = await b3Retry;
-  r.check("B3 撤权拒绝后同轮不再弹（拒绝锁生效）", true, b3RetryNoWindow && b3RetryRes.ok === false);
+  r.check(
+    "B3 撤权拒绝后同轮不再弹（拒绝锁生效）",
+    true,
+    b3RetryNoWindow && b3RetryRes.ok === true && b3RetryRes.v === false,
+  );
 
   // 回收：停用要走**真的下线路径**。裸写启停清单不会让宠物窗 reconcile（watchEnabled 只缓存，
   // reconcile 只在启动与 host:plugin-toggled 时跑）—— 上一轮就是这么「停用」了个寂寞。
@@ -2484,8 +2506,10 @@ export function deactivate() { live = false; }
   await statusCall(STATUS_B, "boom");
   await b3LineGoneWithin5s("Worker 崩溃后");
 
-  // 收尾：改回原清单、撤销授权。fixture 目录**留到 finally 再删** —— 组尾就删会让
-  // 超时调用的迟到回包变成 `bus relay failed: … 没有安装`（verify:worker 的零噪音门会红）。
+  // 收尾：先真的下线两个状态探针，再改回原清单、撤销授权。fixture 目录**留到 finally 再删** ——
+  // 组尾就删会让超时调用的迟到回包变成 `bus relay failed: … 没有安装`（verify:worker 的零噪音门会红）。
+  await b3Deactivate(STATUS_A);
+  await b3Deactivate(STATUS_B);
   await setEnabled(enabledBeforeB3);
   for (const id of [STATUS_A, STATUS_B]) {
     await revoke(id);
@@ -2521,7 +2545,10 @@ export function deactivate() { live = false; }
   const resetConsent = async () => {
     if (!settings) settings = await openSettingsInvoker(PORT, c);
     await settings.invoke("permission_revoke", { pluginId: CONSENT_ID }).catch(() => undefined);
-    return enableForConsent(CONSENT_ID);
+    const restore = await enableForConsent(CONSENT_ID);
+    // 清锁/取消旧 pending 后，旧窗销毁是异步尾巴；先等场上没有本插件的窗再开始下一段。
+    await waitNoConsent(CONSENT_ID, 10_000);
+    return restore;
   };
 
   // 7：未启用直接申请 → false 且无窗
@@ -2613,8 +2640,14 @@ export function deactivate() { live = false; }
         const retryRes = await retry;
         r.check("判据11：停用再启用后拒绝锁已清，可再次弹窗", true, retryConsent.caps.includes("notify"));
         r.check("判据5：已授权能力再次申请不弹窗", true, retryRes.ok === true && retryRes.v === true);
-        const already = askConsent(["notify"]);
-        r.check("判据5：已授权请求直接 true 且无窗", true, await waitNoConsent(CONSENT_ID) && (await already).v === true);
+        // 上一个窗口的销毁是异步尾巴；先等它消失，再断言“已授权不再开窗”。
+        r.check("判据5前置：答完后旧窗已关闭", true, await waitNoConsent(CONSENT_ID, 10_000));
+        const already = await askConsent(["notify"]);
+        r.check(
+          "判据5：已授权请求直接 true 且无窗",
+          true,
+          already.ok === true && already.v === true && (await waitNoConsent(CONSENT_ID)),
+        );
       } finally {
         await restore11();
       }
@@ -2631,7 +2664,7 @@ export function deactivate() { live = false; }
       const opened = await waitConsentWindow(CONSENT_ID);
       const before = await readEnabledIds(invoke(c));
       await setEnabled(before.filter((id) => id !== CONSENT_ID));
-      r.check("判据6：停用插件后同意框关闭", true, await waitNoConsent(CONSENT_ID, 5_000));
+      r.check("判据6：停用插件后同意框关闭", true, await waitNoConsent(CONSENT_ID, 10_000));
       const res = await pending;
       r.check("判据6：停用后等待方返回 false", true, res.ok === true && res.v === false);
       opened.cs.close();

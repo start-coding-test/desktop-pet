@@ -250,6 +250,14 @@ try {
   await reloadAndWait(settings.client);
   await waitUntil(settings.client, `!!window.__TAURI_INTERNALS__`, 15_000);
 
+  // 宿主启停门禁：探针先启用（并先移除一次以清旧拒绝锁），否则 permission_request 直接 false。
+  {
+    const current = await readEnabledIds(invoke);
+    const without = current.filter((id) => id !== PROBE_ID);
+    await writeEnabledIds(settings.invoke, without);
+    await writeEnabledIds(settings.invoke, [...without, PROBE_ID]);
+  }
+
   // 从设置页 realm 构造探针的 agentHooks 通道再调 status()：agent_hooks_* 带 pluginId 的调用
   // 除设置窗门禁外还要逐项校验 agent:hooks 已授权（commands/agent.rs 的 assert_caller），
   // 而桥在放行前会先 permission_request —— 探针起手必然没授权，所以这扇框必然要弹。
