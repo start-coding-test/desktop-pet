@@ -81,20 +81,25 @@ function consentBoxBelongsTo(name, wantId) {
 async function driveConsent(how, wantId = "", waitCaps = null) {
   const deadline = Date.now() + 20_000;
   let others = 0;
+  /** D09-D9 A：读不到的页数。跳过它继续轮询到 20 秒，绝不把「读不到」当成「没有框」。 */
+  let unreadable = 0;
+  let lastAttachError = "";
   /** 扫到过的框标题（去重）：失败时原文带出去，用来区分「框根本没开」和「开的是别人的框」 */
   const seenTitles = [];
   while (Date.now() < deadline) {
     const pages = (await listPages(PORT).catch(() => [])).filter((t) => /consent/.test(t.url));
     for (const target of pages) {
-      let cs = null;
+      const { cs, unreadable: miss, error } = await attachListedPage(target);
+      if (!cs) {
+        unreadable += miss;
+        lastAttachError = String(error ?? "").split("\n")[0];
+        continue;
+      }
       try {
-        cs = await attach(PORT, (t) => t.webSocketDebuggerUrl === target.webSocketDebuggerUrl, 8_000);
         const name = await cs.ev(`document.getElementById('plugin-name')?.textContent ?? ''`);
         if (!seenTitles.includes(name)) seenTitles.push(name);
         if (!consentBoxBelongsTo(name, wantId)) {
           others += 1;
-          cs.close();
-          cs = null;
           continue;
         }
         const seen = {
@@ -118,13 +123,13 @@ async function driveConsent(how, wantId = "", waitCaps = null) {
         }
         return seen;
       } finally {
-        cs?.close();
+        cs.close();
       }
     }
     await sleep(400);
   }
   throw new Error(
-    `20 秒内没等到 ${wantId ? `「${wantId}」的` : ""}同意框（场上扫到的框标题：[${seenTitles.join(" | ") || "一个都没有"}]，按名字跳过没点 ${others} 个）`,
+    `20 秒内没等到 ${wantId ? `「${wantId}」的` : ""}同意框（场上扫到的框标题：[${seenTitles.join(" | ") || "一个都没有"}]，按名字跳过没点 ${others} 个，attach 读不到 ${unreadable} 页${lastAttachError ? `，最后一次原文：${lastAttachError}` : ""}）`,
   );
 }
 
@@ -287,65 +292,144 @@ async function enableForConsent(pluginId) {
 }
 
 /**
+ * D09-D9 A：只吞「attach 这一页没成功」这一类失败，按文案匹配。
+ * 本轮实测到的形状就两条：刚应答完的同意框会在 `/json/list` 里残留几帧，attach 它时 websocket 报错
+ * （`cdp.mjs:29` 的原文），或者列出来到 attach 之间窗已经消失（`cdp.mjs:19` 的原文）。
+ * 其余异常（CDP 协议错误、求值报错、宿主报错）**一律外抛** —— 把它们一起吞掉就是拿容错当遮羞布，
+ * 也正是要防的那条「catch-all」。下面两条文案由自测判据钉住，其中第三条是反向对照（不许误吞）。
+ */
+const ATTACH_FAILURES = [/CDP websocket 连接失败/, /等不到匹配的 target/];
+function isAttachFailure(err) {
+  const msg = String(err?.message ?? err ?? "");
+  return ATTACH_FAILURES.some((re) => re.test(msg));
+}
+
+/** 按「已列出来的那一页」attach；attach 类失败折成 `{ cs: null, unreadable: 1 }`，其他异常外抛。 */
+async function attachListedPage(target, timeoutMs = 8_000) {
+  try {
+    return {
+      cs: await attach(PORT, (t) => t.webSocketDebuggerUrl === target.webSocketDebuggerUrl, timeoutMs),
+      unreadable: 0,
+      error: null,
+    };
+  } catch (err) {
+    if (!isAttachFailure(err)) throw err;
+    return { cs: null, unreadable: 1, error: String(err?.message ?? err) };
+  }
+}
+
+/**
+ * D09-D9 B：把「每个样本可能带读不到的页」的采样序列折成判定。
+ * `unreadable > 0` 的样本是**未确认**：既不算「一扇窗也没有」也不算「数到了几扇」，不进 `every`。
+ * 有效样本必须**不少于总样本的一半**（`valid * 2 >= total`，整数等价为向上取整，比一半更严不差），
+ * 不够就 `state = SKIPPED-<n>` —— 调用方据此具名红，绝不拿「剩下那条碰巧对」当成立。
+ * `want === 0`（断言「不该有窗」）时不要求「至少一次非 0」，那条只服务数窗判据。
+ * 纯函数；被 `noConsentThroughout` 与 `sampleConsentCounts` 真实调用，并由套件尾部自测证伪。
+ */
+function tallySamples(samples, want) {
+  const total = samples.length;
+  const unreadable = samples.reduce((n, s) => n + (s.unreadable > 0 ? 1 : 0), 0);
+  const valid = samples.filter((s) => s.unreadable === 0).map((s) => s.count);
+  const enough = total > 0 && valid.length * 2 >= total;
+  const matched = valid.length > 0 && valid.every((n) => n === want) && (want === 0 || valid.some((n) => n > 0));
+  const state = !enough ? `SKIPPED-${unreadable}` : matched ? "成立" : "不成立";
+  return { total, unreadable, valid, enough, matched, ok: enough && matched, state };
+}
+
+/** 只列出同意框页（归属仍要逐页读标题才算，这里只是粗筛，少几倍 CDP 往返）。 */
+async function consentTargets() {
+  return (await listPages(PORT).catch(() => [])).filter((t) => /consent/.test(t.url));
+}
+
+/**
+ * 判据实际值的统一形状：成立时仍是 `true`（各站期望值一字不动），不成立时把判定串当实际值带出去 ——
+ * `r.check` 失败行会原文打印它，所以「不成立 / SKIPPED-n / 窗没出现」和不可读页数直接进失败清单。
+ */
+const consentVerdict = (res) => (res.ok ? true : `${res.state}（不可读页 ${res.unreadable}）`);
+
+const attachToTarget = (t) => attach(PORT, (x) => x.webSocketDebuggerUrl === t.webSocketDebuggerUrl, 8_000);
+
+/**
+ * 逐页读同意框的底座：属于 `pluginId` 的收进 `windows`，attach 不起来的计 `unreadable` 并跳过该页。
+ * `connect` 只为自测注入「必然读不到的一页」而存在（实跑一律 `attachToTarget`）——
+ * 自测用手写真 `attach()` 失败，而不是手写一条错误文案冒充失败，否则测的是我自己的字符串。
+ * `deep` 才读能力表与窗口 label（数窗、并集判定用）。
+ */
+async function readConsentPages(pluginId, deep, targets, connect) {
+  const windows = [];
+  let unreadable = 0;
+  let lastError = "";
+  for (const target of targets) {
+    let cs = null;
+    try {
+      cs = await connect(target);
+    } catch (err) {
+      if (!isAttachFailure(err)) throw err;
+      unreadable += 1;
+      lastError = String(err?.message ?? err).split("\n")[0];
+      continue;
+    }
+    try {
+      const name = await cs.ev(`document.getElementById('plugin-name')?.textContent ?? ''`);
+      if (!consentBoxBelongsTo(name, pluginId)) continue;
+      windows.push(
+        deep
+          ? {
+              name,
+              caps: await cs.ev(`[...document.querySelectorAll('#cap-list li')].map(li => li.textContent)`),
+              label: await cs.ev(`window.__TAURI_INTERNALS__.metadata.currentWindow.label`),
+            }
+          : { name },
+      );
+    } finally {
+      cs.close();
+    }
+  }
+  return { windows, unreadable, lastError };
+}
+
+/**
  * D09 W-1：「这一轮扫描有没有看到该插件的同意框」的样本序列 → 「整个观察期内都没出现」吗。
- * 空数组按「没观察 = 没证据」判不成立。纯函数，被 `waitNoConsent` 与 `noConsentThroughout` 真实调用，
+ * 空数组按「没观察 = 没证据」判不成立。纯函数，被 `waitNoConsent` 真实调用，
  * 并由套件尾部的两条自测判据证伪（D09-D1 第 4 条：不许只测一个没人用的函数）。
  */
 function absentThrough(samples) {
   return samples.length > 0 && samples.every((found) => !found);
 }
 
-/** 一轮扫描：场上有没有属于该插件的同意框（true=看到）。 */
-async function scanConsentFound(pluginId) {
-  const pages = (await listPages(PORT).catch(() => [])).filter((t) => /consent/.test(t.url));
-  for (const target of pages) {
-    let cs = null;
-    try {
-      cs = await attach(PORT, (t) => t.webSocketDebuggerUrl === target.webSocketDebuggerUrl, 8_000);
-      const name = await cs.ev(`document.getElementById('plugin-name')?.textContent ?? ''`);
-      if (consentBoxBelongsTo(name, pluginId)) return true;
-    } finally {
-      cs?.close();
-    }
-  }
-  return false;
+/** 一轮扫描：该插件的窗数 + 这一轮有多少页读不到（`unreadable > 0` ⇒ 这一轮证明不了任何事）。 */
+async function scanConsent(pluginId) {
+  const { windows, unreadable } = await readConsentPages(pluginId, false, await consentTargets(), attachToTarget);
+  return { count: windows.length, found: windows.length > 0, unreadable };
 }
 
-/** 属于该插件的同意框清单（label + 窗口里列出的能力），用于数窗与并集判定。 */
+/** 属于该插件的同意框清单（label + 窗口里列出的能力），用于数窗与并集判定；附本轮不可读页数。 */
 async function consentWindowsFor(pluginId) {
-  const out = [];
-  const pages = (await listPages(PORT).catch(() => [])).filter((t) => /consent/.test(t.url));
-  for (const target of pages) {
-    let cs = null;
-    try {
-      cs = await attach(PORT, (t) => t.webSocketDebuggerUrl === target.webSocketDebuggerUrl, 8_000);
-      const name = await cs.ev(`document.getElementById('plugin-name')?.textContent ?? ''`);
-      if (!consentBoxBelongsTo(name, pluginId)) continue;
-      out.push({
-        name,
-        caps: await cs.ev(`[...document.querySelectorAll('#cap-list li')].map(li => li.textContent)`),
-        label: await cs.ev(`window.__TAURI_INTERNALS__.metadata.currentWindow.label`),
-      });
-    } finally {
-      cs?.close();
-    }
-  }
-  return out;
+  return readConsentPages(pluginId, true, await consentTargets(), attachToTarget);
 }
 
 /**
  * 「等窗消失」的有界等待（前置、判据5前置、判据6、resetConsent 都走这条）。
  * 语义**保持**「最新一次扫描没有窗即成立」—— 窗本来就是先开后关的，改成累计观察会把这几处判反
  * （D09-D1 第 5 条）。判定仍然过一遍 `absentThrough`（第 4 条）。
+ * D09-D9 C：本轮有页读不到时按**仍存在**处理（读不到不等于消失了），继续轮询到原超时。
  */
 async function waitNoConsent(pluginId, timeoutMs = 2_000) {
+  return (await waitNoConsentProbe(pluginId, timeoutMs)).gone;
+}
+
+/** `waitNoConsent` 的取证版本：把「等了几轮、有几轮读不到页」带出来，红时写进 detail。 */
+async function waitNoConsentProbe(pluginId, timeoutMs = 2_000) {
   const deadline = Date.now() + timeoutMs;
+  const scans = [];
   for (;;) {
-    const found = await scanConsentFound(pluginId);
-    // 只看**这一次**扫描（累计观察是 noConsentThroughout 的口径）：这几处调用方等的是
-    // 「先开后关」的尾巴，累计样本会让它们永远判 false（D09-D1 第 5 条）。
-    if (absentThrough([found])) return true;
-    if (Date.now() >= deadline) return false;
+    const { found, unreadable } = await scanConsent(pluginId);
+    scans.push({ found, unreadable });
+    const gone = absentThrough([found]) && unreadable === 0;
+    if (gone) return { gone, unreadable, scans };
+    if (Date.now() >= deadline) {
+      return { gone: false, unreadable: scans.reduce((n, s) => n + s.unreadable, 0), scans };
+    }
     await sleep(200);
   }
 }
@@ -354,51 +438,86 @@ async function waitNoConsent(pluginId, timeoutMs = 2_000) {
  * 「不该出现窗」的用法（D09 W-1 新增）：连续采样满 `OBSERVE_MS`，任何一次看到窗就判 false。
  * 原来 `waitNoConsent` 是扫到第一次没有就返回 true 的瞬时快照 —— 去掉拒绝锁时开窗是几百毫秒后的事，
  * 那种写法抓不到，判据不可证伪。这里才是「观察期内始终没有」的判定。
+ * D09-D9 B：带不可读页的样本是**未确认**（`tallySamples`），有效样本不到一半 ⇒ `SKIPPED-n`，
+ * 两种都让 `ok=false` —— 调用方的期望值仍是 `true`，红时 detail 里带着是哪种。
  */
 async function noConsentThroughout(pluginId, observeMs = OBSERVE_MS) {
   const samples = [];
   const until = Date.now() + observeMs;
   for (;;) {
-    samples.push(await scanConsentFound(pluginId));
-    if (samples.some((found) => found)) return false;
+    samples.push(await scanConsent(pluginId));
+    if (samples.some((s) => s.found)) break;
     if (Date.now() >= until) break;
     await sleep(200);
   }
-  return absentThrough(samples);
+  const verdict = tallySamples(samples, 0);
+  return {
+    ok: verdict.ok,
+    state: verdict.state,
+    unreadable: verdict.unreadable,
+    counts: samples.map((s) => s.count),
+    samples,
+  };
 }
 
 /**
- * D09 W-2：连续采样「这个插件到底几扇窗」，判定要求**每个样本都恰为 want 且至少一次非 0**。
+ * D09 W-2：连续采样「这个插件到底几扇窗」，判定要求**每个有效样本都恰为 want 且至少一次非 0**。
  * 单次快照会让「第二扇窗晚开」的变异（合流键退回 req_id）因时序而存活 —— 和 W-1 是同一个毛病。
  * 先有界地等第一扇出现（这是等窗出现，不是观察期），再连续采满 `observeMs`。
- * 返回值带 `counts` 原文，红的时候能把采样序列贴出来。
+ * 返回值带 `counts` 原文，红的时候能把采样序列贴出来；`unreadable` 是本轮所有采样里读不到的页数合计。
  */
 async function sampleConsentCounts(pluginId, want, observeMs = OBSERVE_MS, firstWaitMs = 10_000) {
   const waited = [];
-  const observed = [];
-  let windows = [];
+  const samples = [];
+  let unreadableTotal = 0;
+  let last = [];
+  let lastUnreadable = 0;
   const untilFirst = Date.now() + firstWaitMs;
   for (;;) {
-    windows = await consentWindowsFor(pluginId);
-    waited.push(windows.length);
-    if (windows.length > 0) break;
+    const scan = await consentWindowsFor(pluginId);
+    waited.push({ count: scan.windows.length, unreadable: scan.unreadable });
+    unreadableTotal += scan.unreadable;
+    last = scan.windows;
+    lastUnreadable = scan.unreadable;
+    if (last.length > 0) break;
     if (Date.now() >= untilFirst) {
       // 第一扇窗始终没出现：判定不能拿这个当「数到了 0 扇 ⇒ 合流正确」，调用方必须先具名红一次
-      return { appeared: false, ok: false, waited, counts: observed, last: windows };
+      return {
+        appeared: false,
+        ok: false,
+        state: "窗没出现",
+        waited,
+        samples,
+        counts: [],
+        unreadable: unreadableTotal,
+        last,
+      };
     }
     await sleep(200);
   }
   const until = Date.now() + observeMs;
   for (;;) {
-    observed.push(windows.length);
+    samples.push({ count: last.length, unreadable: lastUnreadable });
     if (Date.now() >= until) break;
     await sleep(200);
-    windows = await consentWindowsFor(pluginId);
+    const scan = await consentWindowsFor(pluginId);
+    unreadableTotal += scan.unreadable;
+    last = scan.windows;
+    lastUnreadable = scan.unreadable;
   }
   // D09-D4 类 2：判定只吃**观察期**样本。等第一扇出现那几轮必然是 0（窗是异步建的），
   // 把它们算进 every() 会让这条结构必红 —— 第一轮就是这么红的（counts 原文 [0,0,1,1,…]）。
-  const ok = observed.length > 0 && observed.every((n) => n === want) && observed.some((n) => n > 0);
-  return { appeared: true, ok, waited, counts: observed, last: windows };
+  const verdict = tallySamples(samples, want);
+  return {
+    appeared: true,
+    ok: verdict.ok,
+    state: verdict.state,
+    waited,
+    samples,
+    counts: samples.map((s) => s.count),
+    unreadable: unreadableTotal,
+    last,
+  };
 }
 
 /**
@@ -424,28 +543,44 @@ function settledWithin(promise, ms = DENY_LOCK_SETTLE_MS) {
   );
 }
 
-/** 只读一扇同意框（不点按钮），用于停用关窗用例；调用方负责关闭返回的 client。 */
+/**
+ * 只读一扇同意框（不点按钮），用于停用关窗用例；调用方负责关闭返回的 client。
+ * D09-D9 C：读不到的页**跳过并继续轮询** —— 不可读页不能用来判「窗出现了」，
+ * 也不能让它把整组带走；到点仍没等到就照原样抛，但把「有几页读不到、最后一次是哪句原文」带上。
+ */
 async function waitConsentWindow(pluginId, timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs;
+  let unreadable = 0;
+  let lastError = "";
   while (Date.now() < deadline) {
-    const pages = (await listPages(PORT).catch(() => [])).filter((t) => /consent/.test(t.url));
-    for (const target of pages) {
-      const cs = await attach(PORT, (t) => t.webSocketDebuggerUrl === target.webSocketDebuggerUrl, 8_000);
-      const name = await cs.ev(`document.getElementById('plugin-name')?.textContent ?? ''`);
-      if (!consentBoxBelongsTo(name, pluginId)) {
-        cs.close();
+    for (const target of await consentTargets()) {
+      const { cs, unreadable: miss, error } = await attachListedPage(target);
+      if (!cs) {
+        unreadable += miss;
+        lastError = String(error ?? "").split("\n")[0];
         continue;
       }
-      return {
-        caps: await cs.ev(`[...document.querySelectorAll('#cap-list li')].map(li => li.textContent)`),
-        name,
-        label: await cs.ev(`window.__TAURI_INTERNALS__.metadata.currentWindow.label`),
-        cs,
-      };
+      let keep = false;
+      try {
+        const name = await cs.ev(`document.getElementById('plugin-name')?.textContent ?? ''`);
+        if (!consentBoxBelongsTo(name, pluginId)) continue;
+        const out = {
+          caps: await cs.ev(`[...document.querySelectorAll('#cap-list li')].map(li => li.textContent)`),
+          name,
+          label: await cs.ev(`window.__TAURI_INTERNALS__.metadata.currentWindow.label`),
+          cs,
+        };
+        keep = true;
+        return out;
+      } finally {
+        if (!keep) cs.close();
+      }
     }
     await sleep(200);
   }
-  throw new Error(`20 秒内没等到「${pluginId}」的同意框（只读）`);
+  throw new Error(
+    `20 秒内没等到「${pluginId}」的同意框（只读；attach 读不到 ${unreadable} 页${lastError ? `，最后一次原文：${lastError}` : ""}）`,
+  );
 }
 
 /**
@@ -2123,7 +2258,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
       "false",
       racedAllow === CONSENT_NOT_SETTLED ? "TIMEOUT" : String(racedAllow?.ok),
     );
-    r.check("拒绝后同轮不再弹（第二次无新窗）", true, await noConsentThroughout(hookId));
+    r.check("拒绝后同轮不再弹（第二次无新窗）", true, consentVerdict(await noConsentThroughout(hookId)));
     r.check("拒绝后第二次调用仍被拒", true, deniedAgain.ok === false && /权限被拒绝/.test(deniedAgain.e));
 
     const restoreAllow = await enableForConsent(hookId);
@@ -2507,10 +2642,14 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     const sampled = await sampleConsentCounts(id, 1);
     r.info(
       `B3 数窗采样原文 ${id}`,
-      JSON.stringify({ 等第一扇: sampled.waited, 观察期: sampled.counts }),
+      JSON.stringify({ 等第一扇: sampled.waited, 观察期: sampled.samples, 不可读页合计: sampled.unreadable }),
     );
-    r.check(`B3 前置：${id} 的第一扇同意框在 10s 内出现（否则是采样瞎了，不是合流对了）`, true, sampled.appeared);
-    r.check(`B3：${id} 的窗数全程恰为 1（逐插件连续数窗）`, true, sampled.ok);
+    r.check(
+      `B3 前置：${id} 的第一扇同意框在 10s 内出现（否则是采样瞎了，不是合流对了）`,
+      true,
+      sampled.appeared ? true : `窗没出现（attach 读不到 ${sampled.unreadable} 页）`,
+    );
+    r.check(`B3：${id} 的窗数全程恰为 1（逐插件连续数窗）`, true, consentVerdict(sampled));
     const consent = await driveConsent("allow", id).catch((err) => ({ error: String(err?.message ?? err) }));
     b3Consents.push(consent);
     const caps = consent?.caps ?? null;
@@ -2746,10 +2885,13 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
       ? "TIMEOUT"
       : [b3RetryRes.ok === true, b3RetryRes.v === false].join("|"),
   );
+  const b3LockNoWindow = await noConsentThroughout(STATUS_A);
   r.check(
     "B3 撤权拒绝后同轮不再弹（拒绝锁生效）",
     true,
-    (await noConsentThroughout(STATUS_A)) && b3RetryRes.ok === true && b3RetryRes.v === false,
+    b3LockNoWindow.ok && b3RetryRes.ok === true && b3RetryRes.v === false
+      ? true
+      : `${consentVerdict(b3LockNoWindow)}｜调用 ok=${b3RetryRes.ok} v=${b3RetryRes.v}`,
   );
 
   // 回收：停用要走**真的下线路径**。裸写启停清单不会让宠物窗 reconcile（watchEnabled 只缓存，
@@ -2922,13 +3064,55 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     `${absentThrough([false, false])}|${absentThrough([])}`,
   );
 
+  // ---- D09-D9 E：attach 容错自己的三条自测（E1/E3 在这儿，E2 放在「场上确有一扇窗」的那一组里）----
+  // 造的假页走**真 `attach()`**：predicate 永不命中，超时由 cdp.mjs:19 自己抛
+  // 「等不到匹配的 target」。不自造 Error —— 手写文案的话，测的就是我自己的字符串而不是容错。
+  const BLIND_WS = "ws://selftest/attach-must-fail";
+  const BLIND_PAGE = { url: "http://localhost:1420/src/consent.html", webSocketDebuggerUrl: BLIND_WS };
+  const blindConnect = () => attach(PORT, () => false, 1_500);
+  const mixedConnect = (t) => (t.webSocketDebuggerUrl === BLIND_WS ? blindConnect() : attachToTarget(t));
+
+  // E1：读不到的页被折成 unreadable（不抛错），且「无窗」判据据此判**未确认**、具名红并带上页数。
+  const blindScan = await readConsentPages(CONSENT_ID, false, [BLIND_PAGE], mixedConnect);
+  r.check("自测：attach 读不到的那一页折成 unreadable=1，不抛错也不当噪音", 1, blindScan.unreadable);
+  const blindVerdict = tallySamples([{ count: blindScan.windows.length, unreadable: blindScan.unreadable }], 0);
+  r.check(
+    "自测：全是 unreadable 样本时「无窗」判未确认（SKIPPED-n），ok 为 false",
+    "SKIPPED-1|false|true",
+    `${blindVerdict.state}|${blindVerdict.ok}|${consentVerdict(blindVerdict) !== true}`,
+  );
+
+  // E3：未确认样本既不算「0 扇」也不算「1 扇」，不进 every；有效样本恰好一半时按「不低于一半」成立。
+  r.check(
+    "自测：unreadable 样本判未确认、不进 every，覆盖率按不低于一半",
+    "SKIPPED-1|SKIPPED-1|成立|SKIPPED-2",
+    [
+      tallySamples([{ count: 1, unreadable: 1 }], 1).state,
+      tallySamples([{ count: 0, unreadable: 2 }], 1).state,
+      tallySamples([{ count: 1, unreadable: 0 }, { count: 1, unreadable: 1 }], 1).state,
+      tallySamples([{ count: 1, unreadable: 0 }, { count: 1, unreadable: 1 }, { count: 1, unreadable: 1 }], 1).state,
+    ].join("|"),
+  );
+
+  // 反向对照：容错只认那两条 attach 文案，宿主错误/求值错误不许被吞（catch-all 正是要防的东西）。
+  r.check(
+    "自测：attach 容错只认两条文案，其他异常不许误吞",
+    "true|true|false|false",
+    [
+      isAttachFailure(new Error("CDP websocket 连接失败: http://localhost:1420/src/consent.html")),
+      isAttachFailure(new Error("等不到匹配的 target（port=9223）")),
+      isAttachFailure(new Error("[zz.status] 权限被拒绝: bus:publish")),
+      isAttachFailure(new Error("写启停清单失败: permission_denied")),
+    ].join("|"),
+  );
+
   // 7：未启用直接申请 → false 且无窗
   {
     const before = await readEnabledIds(invoke(c));
     await setEnabled(before.filter((id) => id !== CONSENT_ID));
     const res = await askConsent(["storage"]);
     r.check("未启用插件直接申请返回 false", true, res.ok === true && res.v === false);
-    r.check("未启用插件不弹同意框（连续观察 1.2s 无窗）", true, await noConsentThroughout(CONSENT_ID));
+    r.check("未启用插件不弹同意框（连续观察 1.2s 无窗）", true, consentVerdict(await noConsentThroughout(CONSENT_ID)));
     await setEnabled(before);
   }
 
@@ -2937,15 +3121,44 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     const restore = await resetConsent();
     try {
       const first = askConsent(["storage"]);
-      // D09 W-2：数窗要连续采样满 OBSERVE_MS，每个样本都恰为 1 且至少一次非 0。
+      // D09 W-2：数窗要连续采样满 OBSERVE_MS，每个**有效**样本都恰为 1 且至少一次非 0。
       // 单次快照等于没判 ——「第二扇窗晚开」的变异（合流键退回 req_id）就是靠时序活下来的。
       const s1 = await sampleConsentCounts(CONSENT_ID, 1);
-      r.info("判据1 数窗采样原文", JSON.stringify({ 等第一扇: s1.waited, 观察期: s1.counts }));
-      r.check("判据1 前置：第一扇同意框在 10s 内出现（否则是采样瞎了，不是合流对了）", true, s1.appeared);
-      r.check("判据1：首次启用时该插件的窗数全程恰为 1", true, s1.ok);
+      r.info("判据1 数窗采样原文", JSON.stringify({ 等第一扇: s1.waited, 观察期: s1.samples, 不可读页合计: s1.unreadable }));
+      r.check(
+        "判据1 前置：第一扇同意框在 10s 内出现（否则是采样瞎了，不是合流对了）",
+        true,
+        s1.appeared ? true : `窗没出现（attach 读不到 ${s1.unreadable} 页）`,
+      );
+      r.check("判据1：首次启用时该插件的窗数全程恰为 1", true, consentVerdict(s1));
       // 正对照：窗明明开着的时候，两个「无窗」helper 都必须返回 false —— 证明扫描抓得到窗。
-      r.check("对照：窗开着时 waitNoConsent 必须返回 false（证明扫描不瞎）", false, await waitNoConsent(CONSENT_ID, 600));
-      r.check("对照：窗开着时 noConsentThroughout 也必须返回 false", false, await noConsentThroughout(CONSENT_ID, 600));
+      const control1 = await waitNoConsentProbe(CONSENT_ID, 600);
+      r.check(
+        "对照：窗开着时 waitNoConsent 必须返回 false（证明扫描不瞎）",
+        false,
+        control1.gone ? `扫描判成已消失（不可读页 ${control1.unreadable}）` : false,
+      );
+      const control2 = await noConsentThroughout(CONSENT_ID, 600);
+      r.check(
+        "对照：窗开着时 noConsentThroughout 也必须返回 false",
+        false,
+        control2.ok ? `扫描判成无窗：${control2.state}` : false,
+      );
+      // D09-D9 E2：场上此刻**确实**有一扇本插件的窗。把一页必 attach 失败的假页混在它前面，
+      // 扫描必须跳过假页、照样在可读页上发现这扇窗 —— 证明「读不到」没被当成「场上没窗」。
+      const mixedScan = await readConsentPages(
+        CONSENT_ID,
+        false,
+        [BLIND_PAGE, ...(await consentTargets())],
+        mixedConnect,
+      );
+      r.check(
+        "自测：混进一页读不到的假页后，真着的那扇窗仍被发现（unreadable 不吞可读页）",
+        true,
+        mixedScan.windows.length > 0 && mixedScan.unreadable === 1
+          ? true
+          : `发现 ${mixedScan.windows.length} 扇 / 读不到 ${mixedScan.unreadable} 页`,
+      );
       const consent = await driveConsent("allow", CONSENT_ID, ["storage"]);
       const firstRes = await first;
       r.check("判据1：首次启用只一扇同意框", true, consent.label.startsWith("consent-"));
@@ -2956,9 +3169,13 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
         const a = askConsent(["storage"]);
         const b = askConsent(["notify"]);
         const s2 = await sampleConsentCounts(CONSENT_ID, 1);
-        r.info("判据2 数窗采样原文", JSON.stringify({ 等第一扇: s2.waited, 观察期: s2.counts }));
-        r.check("判据2 前置：并发时第一扇同意框在 10s 内出现", true, s2.appeared);
-        r.check("判据2：两个并发请求期间该插件的窗数全程恰为 1", true, s2.ok);
+        r.info("判据2 数窗采样原文", JSON.stringify({ 等第一扇: s2.waited, 观察期: s2.samples, 不可读页合计: s2.unreadable }));
+        r.check(
+          "判据2 前置：并发时第一扇同意框在 10s 内出现",
+          true,
+          s2.appeared ? true : `窗没出现（attach 读不到 ${s2.unreadable} 页）`,
+        );
+        r.check("判据2：两个并发请求期间该插件的窗数全程恰为 1", true, consentVerdict(s2));
         r.check(
           "判据2：那一扇窗列的是两项并集（各出现一次）",
           "1|1",
@@ -3024,7 +3241,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
           ? "TIMEOUT"
           : [secondRes.ok === true, secondRes.v === false].join("|"),
       );
-      r.check("判据4：拒绝后同轮不再弹窗（连续观察 1.2s 无窗）", true, await noConsentThroughout(CONSENT_ID));
+      r.check("判据4：拒绝后同轮不再弹窗（连续观察 1.2s 无窗）", true, consentVerdict(await noConsentThroughout(CONSENT_ID)));
 
       // 设置页撤销授权不清拒绝锁（I4）
       await settings.invoke("permission_revoke", { pluginId: CONSENT_ID });
@@ -3039,7 +3256,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
           ? "TIMEOUT"
           : [afterRevokeRes.ok === true, afterRevokeRes.v === false].join("|"),
       );
-      r.check("I4：撤销授权不清拒绝锁、仍不弹窗（连续观察 1.2s 无窗）", true, await noConsentThroughout(CONSENT_ID));
+      r.check("I4：撤销授权不清拒绝锁、仍不弹窗（连续观察 1.2s 无窗）", true, consentVerdict(await noConsentThroughout(CONSENT_ID)));
       r.check("I4：撤销授权后同轮仍直接 false", true, afterRevokeRes.ok === true && afterRevokeRes.v === false);
 
       // 停用再启用清锁（判据11）
@@ -3053,12 +3270,20 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
         // I3（已授权不再弹）的实质由紧下面这两条承担，它们一个字没动。
         r.check("判据11：清锁后再次申请的答复为 true", true, retryRes.ok === true && retryRes.v === true);
         // 上一个窗口的销毁是异步尾巴；先等它消失，再断言“已授权不再开窗”。
-        r.check("判据5前置：答完后旧窗已关闭", true, await waitNoConsent(CONSENT_ID, 10_000));
+        const settled5 = await waitNoConsentProbe(CONSENT_ID, 10_000);
+        r.check(
+          "判据5前置：答完后旧窗已关闭",
+          true,
+          settled5.gone ? true : `没确认关掉（等满 10s，attach 读不到 ${settled5.unreadable} 页）`,
+        );
         const already = await askConsent(["notify"]);
+        const alreadyNoWindow = await noConsentThroughout(CONSENT_ID);
         r.check(
           "判据5：已授权请求直接 true 且无窗",
           true,
-          already.ok === true && already.v === true && (await noConsentThroughout(CONSENT_ID)),
+          already.ok === true && already.v === true && alreadyNoWindow.ok
+            ? true
+            : `答复 ok=${already.ok} v=${already.v}｜${consentVerdict(alreadyNoWindow)}`,
         );
       } finally {
         await restore11();
@@ -3080,14 +3305,16 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
       // 起算点就是上面那次停用调用返回之后（不含任何观察期）；红时把实际耗时带进 detail，
       // 一眼分清「窗根本没关」与「关得慢」——要放宽得由日志原文去改 ADR，不许在代码里悄悄放。
       const closedStartedAt = Date.now();
-      const closedInBudget = await waitNoConsent(CONSENT_ID, 5_000);
+      const closedProbe = await waitNoConsentProbe(CONSENT_ID, 5_000);
       const closedElapsed = Date.now() - closedStartedAt;
-      r.info("判据6 关窗读数", `预算 5000ms，实测 ${closedElapsed}ms`);
+      r.info("判据6 关窗读数", `预算 5000ms，实测 ${closedElapsed}ms，attach 读不到 ${closedProbe.unreadable} 页`);
       // 实际值带耗时：红的时候失败清单里就直接写着「没关，已等 Xms」，不用再回去翻日志
       r.check(
         "判据6：停用插件后同意框关闭",
         "5s 内关掉",
-        closedInBudget ? "5s 内关掉" : `5s 内没关掉（已等 ${closedElapsed}ms）`,
+        closedProbe.gone
+          ? "5s 内关掉"
+          : `5s 内没关掉（已等 ${closedElapsed}ms，attach 读不到 ${closedProbe.unreadable} 页）`,
       );
       const res = await pending;
       r.check("判据6：停用后等待方返回 false", true, res.ok === true && res.v === false);
