@@ -276,6 +276,10 @@ function publishPanel() {
       fetchedAt: Number(snapshot?.fetched_at) || 0,
       daily: daily.map((day) => ({ ...day, by_model: { ...day.by_model } })),
       records: records.map((record) => ({ ...record })),
+      // C07 只读投影：缓存命中率需要 charts 的 cache_read_tokens；不改 schema/持久化。
+      charts: Object.fromEntries(
+        Object.entries(chartsByDay).map(([day, buckets]) => [day, buckets.map((bucket) => ({ ...bucket }))]),
+      ),
     });
     if (published && typeof published.catch === "function") {
       void published.catch(() => undefined);
