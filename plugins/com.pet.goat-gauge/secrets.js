@@ -7,6 +7,12 @@ export const COOKIE_SECRET = "cookie";
 export const KEY_MODE_SECRETS = [KEY_SECRET];
 export const INTERNAL_ORIGIN = "https://commandcode.ai";
 export const INTERNAL_REFERER = "https://commandcode.ai/";
+export const COOKIE_EXPIRED_TEXT = "会话已过期，明细暂停";
+
+/** 视图只显示固定掩码，不带长度、前缀或哈希。 */
+export function maskCookie(value) {
+  return typeof value === "string" && value.length > 0 ? "••••" : "";
+}
 
 const MARKER_KEYS = new Set(["savedAt", "secured", "cookieState", "conflict"]);
 const COOKIE_UNAVAILABLE = "unavailable";

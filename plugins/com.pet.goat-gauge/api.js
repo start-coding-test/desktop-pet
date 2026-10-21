@@ -2,6 +2,7 @@
 // Key 只出现在 Authorization 头里；错误消息与日志都不带 Key。
 import { isAuthStatus, isThrottleStatus } from "./throttle.js";
 import { buildInternalRequest } from "./internal.js";
+import { COOKIE_EXPIRED_TEXT } from "./secrets.js";
 import { noteFailure, out, resetThrottle } from "./index.js";
 
 const BASE = "https://api.commandcode.ai";
@@ -97,7 +98,7 @@ async function requestInternal(path, cookie, options = {}) {
   const { url, headers } = buildInternalRequest(path, cookie, options);
   const res = await out(url, { method: "GET", headers });
   if (isAuthStatus(res.status)) {
-    throw new ApiError("auth", "会话已过期，明细暂停。", res.status);
+    throw new ApiError("auth", COOKIE_EXPIRED_TEXT, res.status);
   }
   if (isThrottleStatus(res.status)) {
     throw new ApiError("throttle", "Command Code 暂时限制了查询，请稍后重试。", res.status);

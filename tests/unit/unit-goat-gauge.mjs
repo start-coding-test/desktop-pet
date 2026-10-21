@@ -36,8 +36,11 @@ const {
   migrate,
   sanitizeAlertsFired,
   sanitizeConfig,
+  sanitizeCountedThrough,
   sanitizeCred,
+  sanitizeDaily,
   sanitizeHistory,
+  sanitizeRecords,
   sanitizeSnapshot,
   SCHEMA_VERSION,
 } = await import(new URL("../../plugins/com.pet.goat-gauge/store-schema.js", import.meta.url));
@@ -61,9 +64,14 @@ const {
   keyHeaders,
   classifyInternalStatus,
   isKeyModeSecret,
+  COOKIE_EXPIRED_TEXT,
+  maskCookie,
 } = await import(new URL("../../plugins/com.pet.goat-gauge/secrets.js", import.meta.url));
 const { buildInternalRequest, mergeChartBuckets, mergeUsagePages, nextPageCursor } = await import(
   new URL("../../plugins/com.pet.goat-gauge/internal.js", import.meta.url)
+);
+const { mergeDaily, replaceChartDays } = await import(
+  new URL("../../plugins/com.pet.goat-gauge/daily.js", import.meta.url)
 );
 
 /* ============================ planInfo ============================ */
@@ -1159,4 +1167,138 @@ group("C06 internal 翻页与请求");
   ]);
   eq("charts 按 model+time_bucket 去重", 2, charts.length);
   eq("charts 后到页为准", 2, charts.find((bucket) => bucket.time_bucket === "2026-01-01").requests);
+}
+
+/* ============================ C06 schema 3 / daily / 验收 ============================ */
+group("C06 schema 3 / daily / 验收");
+
+eq("schema 版本字面量=3", 3, SCHEMA_VERSION);
+
+{
+  const store = migrate({
+    schema: 2,
+    config: { refreshSec: 60 },
+    cred: { apiKey: "", savedAt: 0 },
+    records: [{ id: "r1", created_at: "2026-01-01T00:00:00Z", at_ms: 1 }],
+    daily: [{ day: "2026-01-01", at_ms: 1, requests: 1 }],
+    counted_through_ms: 1,
+    charts_by_day: { "2026-01-01": [{ model: "m", time_bucket: "2026-01-01" }] },
+  });
+  eq("schema 2→3", 3, store.schema);
+  eq("迁移保留 records", 1, store.records.length);
+  eq("迁移保留 daily", 1, store.daily.length);
+  eq("迁移保留水位", 1, store.counted_through_ms);
+  eq("迁移保留 charts", 1, store.charts_by_day["2026-01-01"].length);
+}
+
+{
+  const records = Array.from({ length: 400 }, (_, i) => ({
+    id: `r${i}`,
+    created_at: "2026-01-01T00:00:00Z",
+    at_ms: i + 1,
+  }));
+  eq("records 只留 300", 300, sanitizeRecords(records).length);
+  eq("坏 records 丢弃", 0, sanitizeRecords([{ id: "x" }, { id: "y", created_at: "z", at_ms: 0 }]).length);
+  const base = Date.UTC(2026, 0, 1);
+  const days = Array.from({ length: 100 }, (_, i) => ({
+    day: localDayKey(base - i * 86_400_000, "UTC"),
+    at_ms: base - i * 86_400_000,
+  }));
+  eq("daily 只留 90", 90, sanitizeDaily(days).length);
+  eq("坏水位归零", 0, sanitizeCountedThrough("x"));
+  eq("负水位归零", 0, sanitizeCountedThrough(-1));
+}
+
+{
+  const day1 = Date.UTC(2026, 0, 1, 23, 0, 0);
+  const day2 = Date.UTC(2026, 0, 2, 1, 0, 0);
+  const records = [
+    { id: "a", at_ms: day1, model: "m", tokens_in: 1, tokens_out: 2, cost_total: 0.1 },
+    { id: "b", at_ms: day1, model: "m", tokens_in: 3, tokens_out: 4, cost_total: 0.2 },
+    { id: "c", at_ms: day2, model: "n", tokens_in: 5, tokens_out: 6, cost_total: 0.3 },
+  ];
+  const result = mergeDaily(records, [], 0, { timeZone: "UTC" });
+  eq("daily 跨本地日", 2, result.daily.length);
+  const first = result.daily.find((day) => day.day === "2026-01-01");
+  eq("daily 首日 requests", 2, first.requests);
+  eq("daily 首日 tokens_in", 4, first.tokens_in);
+  eq("daily 首日 by_model", 2, first.by_model.m.requests);
+  eq("水位取最大 at_ms", day2, result.counted_through_ms);
+
+  const equal = mergeDaily(
+    [{ id: "x", at_ms: day2, tokens_in: 9 }],
+    result.daily,
+    result.counted_through_ms,
+    { timeZone: "UTC" },
+  );
+  eq("at_ms == 水位不计入", 0, equal.added);
+  eq("== 水位不推日", result.daily.length, equal.daily.length);
+
+  const older = mergeDaily(
+    [{ id: "old", at_ms: day1, tokens_in: 9 }],
+    result.daily,
+    result.counted_through_ms,
+    { timeZone: "UTC" },
+  );
+  eq("晚到旧记录被水位跳过", 0, older.added);
+}
+
+{
+  const base = Date.UTC(2026, 0, 1);
+  const previous = Array.from({ length: 95 }, (_, i) => ({
+    day: localDayKey(base - i * 86_400_000, "UTC"),
+    at_ms: base - i * 86_400_000,
+    requests: 1,
+    tokens_in: 1,
+    tokens_out: 1,
+    cost_total: 0,
+    by_model: {},
+  }));
+  const trimmed = mergeDaily([], previous, 0, { timeZone: "UTC" }).daily;
+  eq("daily 90 天裁剪", 90, trimmed.length);
+  check("daily 裁剪掉最旧", !trimmed.some((day) => day.day === localDayKey(base - 95 * 86_400_000, "UTC")));
+}
+
+{
+  const next = replaceChartDays(
+    { "2026-01-01": [{ model: "m", time_bucket: "2026-01-01T00:00:00Z", requests: 1 }] },
+    [
+      { model: "m", time_bucket: "2026-01-01T05:00:00Z", requests: 2 },
+      { model: "m", time_bucket: "2026-01-02T05:00:00Z", requests: 1 },
+    ],
+    { timeZone: "UTC" },
+  );
+  eq("charts 整日替换", 2, next["2026-01-01"][0].requests);
+  eq("charts 新日写入", 1, next["2026-01-02"][0].requests);
+}
+
+eq("Cookie 只回显固定掩码", "••••", maskCookie("fake-cookie"));
+check("掩码不含 Cookie 值/长度", !maskCookie("fake-cookie").includes("fake") && maskCookie("fake-cookie").length === 4);
+eq("空 Cookie 无掩码", "", maskCookie(""));
+eq("过期文案", "会话已过期，明细暂停", COOKIE_EXPIRED_TEXT);
+
+{
+  const manifest = JSON.parse(
+    readFileSync(new URL("../../plugins/com.pet.goat-gauge/manifest.json", import.meta.url), "utf8"),
+  );
+  check(
+    "manifest 声明 http（首次 internal 走宿主同意框）",
+    Array.isArray(manifest.permissions) && manifest.permissions.includes("http"),
+  );
+}
+
+{
+  const mainSrc = readFileSync(
+    new URL("../../plugins/com.pet.goat-gauge/main.js", import.meta.url),
+    "utf8",
+  );
+  check("视图只回显掩码", mainSrc.includes("masked: maskCookie(cookie)"));
+  check("过期错误用统一文案", mainSrc.includes("COOKIE_EXPIRED_TEXT"));
+  const panelStart = mainSrc.indexOf("function publishPanel");
+  const panelEnd = mainSrc.indexOf("function syncOverlay");
+  const panelBlock = panelStart >= 0 && panelEnd > panelStart ? mainSrc.slice(panelStart, panelEnd) : "";
+  check(
+    "panel 不含 Cookie/Key 值",
+    panelBlock.length > 0 && !panelBlock.toLowerCase().includes("cookie") && !panelBlock.includes("apiKey"),
+  );
 }

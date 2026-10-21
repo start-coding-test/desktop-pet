@@ -12,7 +12,8 @@ import {
   isThrottleError,
 } from "./api.js";
 import { mergeChartBuckets, mergeUsagePages, nextPageCursor } from "./internal.js";
-import { clearCookieAfterAuthFailure, migrateSecrets } from "./secrets.js";
+import { mergeDaily, replaceChartDays } from "./daily.js";
+import { clearCookieAfterAuthFailure, COOKIE_EXPIRED_TEXT, maskCookie, migrateSecrets } from "./secrets.js";
 import { demoSnapshot, DEMO_SCENARIOS } from "./demo.js";
 import { appendHistory } from "./history.js";
 import { buildSnapshot, maskKey } from "./normalize.js";
@@ -29,7 +30,10 @@ let cookie = "";
 let cookieState = "none";
 let secretsReady = false;
 let records = [];
-let chartCache = [];
+let daily = [];
+let countedThroughMs = 0;
+/** @type {Record<string, Array<Record<string, any>>>} */
+let chartsByDay = {};
 /** @type {Record<string, any> | null} */
 let snapshot = null;
 /** @type {Array<Array<number | null>>} */
@@ -86,6 +90,10 @@ async function persist(keys) {
     snapshot,
     history,
     alertsFired,
+    records,
+    daily,
+    counted_through_ms: countedThroughMs,
+    charts_by_day: chartsByDay,
   };
   for (const key of keys) {
     try {
@@ -99,7 +107,18 @@ async function persist(keys) {
 async function restore() {
   if (!ctx) return;
   const raw = {};
-  for (const key of ["schema", "config", "cred", "snapshot", "history", "alertsFired"]) {
+  for (const key of [
+    "schema",
+    "config",
+    "cred",
+    "snapshot",
+    "history",
+    "alertsFired",
+    "records",
+    "daily",
+    "counted_through_ms",
+    "charts_by_day",
+  ]) {
     try {
       raw[key] = await ctx.storage.get(key);
     } catch (err) {
@@ -112,6 +131,10 @@ async function restore() {
   snapshot = store.snapshot;
   history = store.history;
   alertsFired = store.alertsFired;
+  records = store.records;
+  daily = store.daily;
+  countedThroughMs = store.counted_through_ms;
+  chartsByDay = store.charts_by_day;
   needsSchemaWrite = raw.schema !== SCHEMA_VERSION;
   lastRefreshAt = Number(snapshot?.fetched_at) || 0;
   await restoreSecrets(raw);
@@ -186,9 +209,10 @@ function publishView() {
     usage: snapshot?.usage ?? null,
     alerts: snapshot?.alerts ?? [],
     config: cloneConfig(),
-    cookie: { configured: !!cookie, state: cookieState },
+    cookie: { configured: !!cookie, state: cookieState, masked: maskCookie(cookie) },
     records,
-    charts: chartCache,
+    daily,
+    charts: chartsByDay,
     net: {
       lastMinute: gate.stats().window,
       cooldownReason,
@@ -250,6 +274,8 @@ function publishPanel() {
     const published = ctx.bus.publish(TOPIC_PANEL, {
       history: history.map((row) => [...row]),
       fetchedAt: Number(snapshot?.fetched_at) || 0,
+      daily: daily.map((day) => ({ ...day, by_model: { ...day.by_model } })),
+      records: records.map((record) => ({ ...record })),
     });
     if (published && typeof published.catch === "function") {
       void published.catch(() => undefined);
@@ -404,6 +430,7 @@ async function refreshInternal() {
     const pages = [];
     const seen = new Set();
     let cursor = "";
+    let complete = false;
     for (let i = 0; i < 5; i += 1) {
       const page = await fetchInternalUsage(cookie, { cursor });
       pages.push(page);
@@ -412,14 +439,28 @@ async function refreshInternal() {
         if (record?.id) seen.add(record.id);
       }
       const next = nextPageCursor(page, seen);
-      if (!next) break;
+      if (!next) {
+        complete = true;
+        break;
+      }
       cursor = next;
     }
-    records = mergeUsagePages(pages);
+    const merged = mergeUsagePages(pages);
     const chartsPage = await fetchInternalCharts(cookie);
-    chartCache = mergeChartBuckets([
+    const buckets = mergeChartBuckets([
       { data: chartsPage?.charts ?? chartsPage?.data ?? chartsPage?.records ?? [] },
     ]);
+    if (complete) {
+      // 只有整批翻页完整成功才提交 daily/水位；部分页或 charts 失败不推进。
+      const nextDaily = mergeDaily(merged, daily, countedThroughMs);
+      records = merged;
+      daily = nextDaily.daily;
+      countedThroughMs = nextDaily.counted_through_ms;
+      chartsByDay = replaceChartDays(chartsByDay, buckets);
+      await persist(["records", "daily", "counted_through_ms", "charts_by_day"]);
+    } else {
+      records = merged;
+    }
     cookieState = "ready";
   } catch (err) {
     if (isAuthError(err)) {
@@ -429,7 +470,7 @@ async function refreshInternal() {
       });
       cookie = "";
       cookieState = "expired";
-      lastError = "会话已过期，明细暂停";
+      lastError = COOKIE_EXPIRED_TEXT;
       status(lastError, "warn");
       return;
     }
@@ -680,7 +721,9 @@ async function handleCmd(cmd) {
       cookie = "";
       cookieState = "none";
       records = [];
-      chartCache = [];
+      daily = [];
+      countedThroughMs = 0;
+      chartsByDay = {};
       try {
         await ctx.storage.set("cookieState", cookieState);
       } catch {
