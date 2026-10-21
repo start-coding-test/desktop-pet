@@ -130,6 +130,21 @@ async function driveConsent(how, wantId = "", waitCaps = null) {
 const isPetPage = (t) => /localhost:1420\/(src\/)?index\.html$/.test(t.url);
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
+/** D07-D5：只记录、不断言。按三个插件累计并记录相对上次标记的增量原文。 */
+let consoleLedgerMark = 0;
+function logConsoleLedger(label) {
+  const noise = c?.noise ?? [];
+  const since = noise.slice(consoleLedgerMark);
+  const matched = (arr, id) =>
+    arr.filter((n) => n.includes(id) && (n.includes("plugin-runtime.ts:166") || n.includes("bus relay failed")));
+  const ids = ["zz.probe", "zz.consent", "zz.status"];
+  const totals = Object.fromEntries(ids.map((id) => [id, matched(noise, id).length]));
+  const deltas = Object.fromEntries(ids.map((id) => [id, matched(since, id).length]));
+  const deltaLines = Object.fromEntries(ids.map((id) => [id, matched(since, id)]));
+  r.info(`D07 console ledger ${label}`, JSON.stringify({ totals, deltas, deltaLines }));
+  consoleLedgerMark = noise.length;
+}
+
 /**
  * 「本体压住 overlay」的真窗判据：交回 `tools/win-zorder.ps1` 的退出码 + 它打的 ASCII 机器行。
  * 拼成一条字符串是为了失败时一眼分清 `overlay-covers-pet`（承诺真的破了）与
@@ -538,6 +553,7 @@ try {
 
   // D07 窗口 A 终点：预置 superset 已在启动前写入，后续热安装组才允许重建 zz.probe。
   probeRuntimeWritesAllowed = true;
+  logConsoleLedger("before hot install");
   r.group("热安装 / 热移除（不重启宿主，仅靠 plugins 目录 watcher）");
   // 先造出「有启用记录但目录不存在」的状态：此时不该有任何激活。
   // 探针此刻还在跑，目录被移走会让宠物窗整页热重载（本卡的新行为）：先武装
@@ -1699,6 +1715,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     // 探针复用 zz.probe 目录（.gitignore 已忽略、收尾统一删除）。把它的 widget 换成
     // 「钩子能力探针」：mount 本身不发起任何调用，只把 ctx 形状与手动调用函数挂到 window，
     // 免得早先的挂载/开关用例被同意框打断。
+    logConsoleLedger("before agent hooks");
     r.group("agent:hooks 受控能力（settings 区专属）");
     const TEMP_ROOT = resolve(import.meta.dirname, "../../temp");
     const hookId = PRESEED_HOOK_ID;
@@ -2077,6 +2094,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     r.check("状态读回的是改后的键", "Ctrl+Alt+F9", (await sCall("hotkey_status")).v?.accelerator);
     r.check("改回默认值", "CommandOrControl+Alt+P", (await sCall("hotkey_set", { accelerator: "CommandOrControl+Alt+P" })).v);
 
+    logConsoleLedger("after agent hooks");
     r.group("hotkey_test：试注册命令的门禁、语法码与不改现状");
     const petHotkeyTest = await call("hotkey_test", { accelerator: "Ctrl+Alt+F8" });
     r.check("宠物窗直接 invoke hotkey_test 被窗口门禁拒", "denied", petHotkeyTest.code);
@@ -2111,6 +2129,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
 
   // ---------- B3：气泡常驻状态行（宿主侧） ----------
   // 两个 fixture（id 不同）验「每个插件各占一条 + 回落」；同一份入口脚本靠 ctx.pluginId 区分 topic。
+  logConsoleLedger("before B3");
   r.group("B3 常驻状态行：显示 / 单行几何 / 仲裁回落 / 台词优先 / 回收");
   const STATUS_A = PRESEED_STATUS_A;
   const STATUS_B = PRESEED_STATUS_B;
@@ -2499,6 +2518,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     await revoke(id);
   }
 
+  logConsoleLedger("after B3");
   // ---------- ADR-0013 判据 1–11：直接对宿主发 permission_request ----------
   r.group("ADR-0013：同意合流 / 拒绝锁 / 未启用门禁");
   const CONSENT_ID = PRESEED_CONSENT_ID;
@@ -2648,6 +2668,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   );
   r.check("ADR-0013 新组/清理窗口 console 精确核销：zz.consent=1", 1, consentNoise.length);
 
+  logConsoleLedger("after ADR-0013");
   r.group("宿主页面自身未产生 CSP 违规或未捕获异常");
   // 上面的递归测试会刻意打一条 console.error，它是被测行为的证据，不该混进这里的零容忍
   r.info("导航过渡期告警（reload 切断在飞 IPC 的产物，单独归类）", String(c.transitionNoise.length));
