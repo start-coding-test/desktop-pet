@@ -1,7 +1,7 @@
 // 验证用临时插件 fixture：由脚本写入 plugins/、跑完删除（.gitignore 已忽略这两个名字，
 // 中途崩溃也不会被误提交）。前缀 zz. 便于人工识别残留。
-import { mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve, sep } from "node:path";
 
 export const PROBE_ID = "zz.probe";
 export const NET_ID = "zz.net"; // 只声明 http：用于验证「按域名逐个授权」这条规则
@@ -273,4 +273,69 @@ export function writePreseedFixtures(pluginsDir) {
 /** verify-isolation 收尾删除：只删 fixture 目录，不碰清单（清单由调用方先清理）。 */
 export function removePreseedFixtures(pluginsDir) {
   clearPreseedFixtures(pluginsDir);
+}
+
+function findPrePetBackups(dir, out = []) {
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const entry of entries) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) findPrePetBackups(full, out);
+    else if (entry.name.endsWith(".pre-pet-backup")) out.push(full);
+  }
+  return out;
+}
+
+/**
+ * D07-D16：E2E 启动前清掉测试自建的 agent 临时状态。只允许 tempRoot 下的路径；
+ * 宿主第一次改写配置会留下 *.pre-pet-backup，下一轮 agent_hooks_status 会把它们
+ * 也算进 files（上一轮 files=4 的来源）。两份 live 样例复位成只有用户自己的条目。
+ * 纯调用式，不 import 时不产生任何磁盘副作用。
+ */
+export function cleanAgentTempState({ tempRoot, configFiles, agentHome }) {
+  const root = resolve(tempRoot);
+  const files = (configFiles ?? []).map((p) => resolve(p));
+  if (files.length !== 2) throw new Error(`PET_AGENT_CONFIG_FILES 应为 2 个文件，实得 ${files.length}`);
+  for (const file of files) {
+    if (!file.startsWith(root + sep)) throw new Error(`拒绝清理 temp/ 外的 agent 配置: ${file}`);
+  }
+  const home = agentHome ? resolve(agentHome) : "";
+  if (home && !home.startsWith(root + sep)) {
+    throw new Error(`拒绝清理 temp/ 外的 PET_AGENT_HOME: ${home}`);
+  }
+  const removedBackups = findPrePetBackups(root);
+  for (const file of removedBackups) rmSync(file, { force: true });
+  const removedDirs = [];
+  if (home) {
+    for (const name of [".zcode", ".codex", ".workbuddy"]) {
+      const dir = join(home, name);
+      if (existsSync(dir)) {
+        rmSync(dir, { recursive: true, force: true });
+        removedDirs.push(dir);
+      }
+    }
+  }
+  const foreignOnly = (tag) =>
+    JSON.stringify(
+      {
+        theme: "dark",
+        note: `keep-${tag}`,
+        hooks: { PreToolUse: [{ hooks: [{ type: "command", command: `other-tool-${tag} --notify`, timeout: 5 }] }] },
+      },
+      null,
+      2,
+    );
+  files.forEach((file, i) => {
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, foreignOnly(i === 0 ? "a" : "b"));
+  });
+  const live = files.filter(existsSync);
+  if (live.length !== 2) throw new Error(`agent 临时配置读回失败: 期望 2 个文件，实得 ${live.length}`);
+  const leftovers = findPrePetBackups(root);
+  if (leftovers.length) throw new Error(`agent 临时备份未清干净: ${leftovers.join(", ")}`);
+  return { files: live, removedBackups, removedDirs };
 }

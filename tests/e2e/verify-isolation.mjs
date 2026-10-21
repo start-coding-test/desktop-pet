@@ -416,6 +416,28 @@ try {
     guardRejected = true;
   }
   r.check("D07 窗口 A 前拒绝 zz.probe 运行时写入（M7 杀手）", true, guardRejected);
+
+  // D07-D16：套件启动前 agent 临时状态必须只剩两份 live 样例、且都在 temp/ 下。
+  // dev-debug 已在 spawn 前删掉 *.pre-pet-backup；这里从宿主状态页读回，防止清理静默失效。
+  if (env.PET_AGENT_CONFIG_FILES) {
+    if (!settings) settings = await openSettingsInvoker(PORT, c);
+    const hookStatus = await settings.invoke("agent_hooks_status");
+    const hookFiles = Array.isArray(hookStatus.v?.files) ? hookStatus.v.files : [];
+    const hookTempRoot = resolve(import.meta.dirname, "../../temp");
+    const hookFilesUnderTemp =
+      hookFiles.length === 2 && hookFiles.every((f) => resolve(String(f.path)).startsWith(hookTempRoot + sep));
+    r.check("D07 启动前 agent 状态可读", true, hookStatus.ok === true);
+    r.check("D07 启动前 agent 临时配置只剩 2 个文件", 2, hookFiles.length);
+    r.check("D07 启动前 agent 配置都在 temp/ 下", true, hookFilesUnderTemp);
+    r.check(
+      "D07 启动前 agent 状态页为默认 qoder/12/0",
+      ["qoder", 12, 0],
+      [hookStatus.v?.agent, hookStatus.v?.expectedPerFile, hookStatus.v?.managed],
+    );
+  } else {
+    r.info("跳过 agent 临时状态检查", "未设 PET_AGENT_CONFIG_FILES（非 E2E 启动）");
+  }
+
   const INSTALL = `(async () => {
     if (!window.__wh || !Array.isArray(window.__canary)) {
       const { bus } = await import('/src/runtime/event-bus.ts');
@@ -2313,6 +2335,18 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   r.check("基线：没挂常驻行时气泡是收起的", false, b3BaselineShow);
   // 上面那一段结尾把设置窗关了，句柄也随窗作废：本组要写启停清单与撤授权，重开一扇
   settings = await openSettingsInvoker(PORT, c);
+  // D07-D16：上一轮可能留下 zz.status/zz.status2 的授权（B3 收尾的 revoke 若静默失败，
+  // 下一次 doActivate 的 permission_check 会直接放行，不再弹同意框）。启用前清掉所有
+  // zz.* 旧授权并读回；只动测试插件的授权，不碰用户插件。
+  const b3GrantsBefore = (await settings.invoke("permission_list")).v ?? {};
+  for (const id of Object.keys(b3GrantsBefore)) {
+    if (String(id).startsWith("zz.")) await revoke(id);
+  }
+  const b3GrantsAfter = (await settings.invoke("permission_list")).v ?? {};
+  const b3ZzLeft = Object.entries(b3GrantsAfter)
+    .filter(([id, caps]) => String(id).startsWith("zz.") && (caps ?? []).length > 0)
+    .map(([id]) => id);
+  r.check("B3 启用前授权表不含 zz.*（旧授权已清）", [], b3ZzLeft);
   await setEnabled([...new Set([...enabledBeforeB3, STATUS_A, STATUS_B])]);
   await reloadAndWait(c);
   // 激活会为两个 fixture 各弹一次同意框（声明的三项能力）

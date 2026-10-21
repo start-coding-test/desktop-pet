@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { argv, env, platform } from "node:process";
 import {
+  cleanAgentTempState,
   clearPreseedFixtures,
   prunePreseedEnabledIds,
   removePreseedFixtures,
@@ -36,6 +37,20 @@ function preseed() {
   clearPreseedFixtures(pluginsDir);
   writePreseedFixtures(pluginsDir);
   prunePreseedEnabled();
+  const configFiles = String(env.PET_AGENT_CONFIG_FILES ?? "")
+    .split(";")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  // E2E 作业必须带两套 agent 样例；本地不带这个 env 时保持原行为。
+  if (configFiles.length) {
+    cleanAgentTempState({
+      tempRoot: fileURLToPath(new URL("../temp", import.meta.url)),
+      configFiles,
+      agentHome: env.PET_AGENT_HOME ?? "",
+    });
+  } else if (env.GITHUB_ACTIONS === "true") {
+    throw new Error("GITHUB_ACTIONS 下缺 PET_AGENT_CONFIG_FILES，拒绝在脏 agent 状态下启动");
+  }
 }
 
 if (GATE) {
