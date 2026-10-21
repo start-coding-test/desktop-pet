@@ -201,7 +201,7 @@ async function clearCred(timeoutMs = 8000) {
 }
 
 async function peekWidget() {
-  const res = await hostInvoke(c)("bus_peek", { topic: `${PID}:widget` });
+  const res = await hostInvoke(c)("bus_peek", { topic: `${PID}:widget`, pluginId: PID });
   return res.ok ? res.v : null;
 }
 
