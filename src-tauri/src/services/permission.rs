@@ -640,10 +640,15 @@ fn deliver_pending(app: &AppHandle, pending: PendingConsent, granted: bool) {
     }
 }
 
-/// 停用/卸载时的取消入口。`clear_denied` 为 true 时同时清掉该插件的旧拒绝锁；
-/// 两者都不写新锁。找不到 pending 时仍可以只清锁（停用路径）。
-pub fn cancel_pending_for_plugin(app: &AppHandle, plugin_id: &str, clear_denied: bool) {
-    let state = app.state::<PermissionState>();
+/// 停用/卸载时要做的收口决策。抽出来的唯一理由：`resolve_consent` 往下三层都要真 `AppHandle`，
+/// 单测造不出它，于是「找 pending → 选收口类型」这一步过去只能靠源码文本断言钉（见 D03 审计 F-3）。
+enum CancelPlan {
+    Resolve { req_id: String, end: ConsentEnd },
+    ClearDenied,
+    Nothing,
+}
+
+fn cancel_plan(state: &PermissionState, plugin_id: &str, clear_denied: bool) -> CancelPlan {
     let req_id = {
         let book = state.consent.lock().unwrap_or_else(|p| p.into_inner());
         book.pending
@@ -651,15 +656,29 @@ pub fn cancel_pending_for_plugin(app: &AppHandle, plugin_id: &str, clear_denied:
             .find(|(_, pending)| pending.plugin_id == plugin_id)
             .map(|(id, _)| id.clone())
     };
-    if let Some(req_id) = req_id {
-        let end = if clear_denied {
-            ConsentEnd::Disabled
-        } else {
-            ConsentEnd::Uninstalled
-        };
-        resolve_consent(app, state.inner(), &req_id, end);
-    } else if clear_denied {
-        state.clear_denied(plugin_id);
+    match req_id {
+        Some(req_id) => CancelPlan::Resolve {
+            req_id,
+            end: if clear_denied {
+                ConsentEnd::Disabled
+            } else {
+                ConsentEnd::Uninstalled
+            },
+        },
+        None if clear_denied => CancelPlan::ClearDenied,
+        None => CancelPlan::Nothing,
+    }
+}
+
+/// 停用/卸载时的取消入口。`clear_denied` 为 true 时同时清掉该插件的旧拒绝锁；
+/// 两者都不写新锁。找不到 pending 时仍可以只清锁（停用路径）。
+pub fn cancel_pending_for_plugin(app: &AppHandle, plugin_id: &str, clear_denied: bool) {
+    let state = app.state::<PermissionState>();
+    // 决策在 `cancel_plan` 里做完（锁已释放），这里只按它收口 —— 与抽取前的持锁范围、调用顺序一致。
+    match cancel_plan(state.inner(), plugin_id, clear_denied) {
+        CancelPlan::Resolve { req_id, end } => resolve_consent(app, state.inner(), &req_id, end),
+        CancelPlan::ClearDenied => state.clear_denied(plugin_id),
+        CancelPlan::Nothing => {}
     }
 }
 
