@@ -224,6 +224,25 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// F1（B09）：撤销授权走的是 `StoreState::clear_plugin` 的 `remove_dir_all`，
+    /// 同目录的 `secrets.json` 必须一起被带走 —— 不能只测 secrets.rs 里无调用方的 clear。
+    #[test]
+    fn clear_plugin_removes_both_store_and_secrets() {
+        let root = tmp_store(&format!("both-{}", std::process::id()));
+        let dir = root.join("com.pet.todo");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("store.json"), "{\"a\":1}").unwrap();
+        fs::write(dir.join("secrets.json"), "{\"schema\":1,\"entries\":{}}").unwrap();
+        let store = store_rooted_at(root.clone());
+        store.clear_plugin("com.pet.todo").unwrap();
+        assert!(!dir.join("store.json").exists(), "store.json 还在");
+        assert!(
+            !dir.join("secrets.json").exists(),
+            "凭据文件没被带走：ADR-0012 第 7 条不成立"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn concurrent_writes_keep_both_keys() {
         // 两个「窗口」并发写同一插件的不同键：读-改-写必须串行，两个键都要留下

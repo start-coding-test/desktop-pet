@@ -224,8 +224,9 @@ impl SecretsStore {
         Ok(())
     }
 
-    /// 独立清理入口。当前撤销授权走 `store::clear_plugin` 的 `remove_dir_all`，同目录的
-    /// `secrets.json` 会被一并删掉；这个函数供测试与以后拆出独立目录时使用。
+    /// 独立清理入口。生产清理路径 = `store::clear_plugin` 的 `remove_dir_all`
+    /// （同目录的 `secrets.json` 会被一并删掉）；本函数无调用方，仅供测试与以后
+    /// 拆出独立目录时使用。
     #[allow(dead_code)]
     pub fn clear_plugin(&self) -> Result<(), HostError> {
         let _guard = SECRETS_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -684,17 +685,62 @@ mod tests {
         let call_at = body
             .find("let result = unsafe {")
             .expect("找不到 DPAPI 调用块");
-        let call = &body[call_at..];
-        let call_end = call.find("\n    };").expect("找不到 DPAPI 调用块结尾");
-        let call = &call[..call_end];
-        assert!(
-            call.contains("CRYPTPROTECT_UI_FORBIDDEN"),
-            "DPAPI 调用必须带 UI_FORBIDDEN"
+        let call_end = body[call_at..]
+            .find("\n    };")
+            .expect("找不到 DPAPI 调用块结尾");
+        // `\n    };` 共 7 个字符；call_end 是相对 call_at 的偏移，必须加上起点。
+        let call = &body[call_at..call_at + call_end + 7];
+        let flags = call.matches("CRYPTPROTECT_UI_FORBIDDEN").count();
+        assert_eq!(
+            flags, 2,
+            "protect 与 unprotect 两侧都要带 UI_FORBIDDEN，实际 {flags} 处"
         );
         assert!(
             !call.contains("CRYPTPROTECT_LOCAL_MACHINE"),
             "DPAPI 不得用机器级作用域"
         );
+        // 5 = protect 侧 2 个 None, + unprotect 侧 3 个 None,（当前字面量）。
+        let nones = call.matches("None,").count();
+        assert_eq!(
+            nones, 5,
+            "5 = protect 侧 2 + unprotect 侧 3，实际 {nones} 处"
+        );
+        assert!(
+            !call.contains("Some(&mut"),
+            "不许给 DPAPI 传 provider/reserved 结构"
+        );
+        assert!(!call.contains("CryptKeyProvider"), "不许换 provider");
+    }
+
+    /// F5（B09）：真实 DPAPI 后端（不是 Fake）写盘时不得出现明文；Windows CI 直接覆盖。
+    #[cfg(windows)]
+    #[test]
+    fn real_dpapi_backend_writes_no_plaintext_to_disk() {
+        let root = tmp_dir("dpapi-disk");
+        let store = SecretsStore::at(plugin_path(&root, "com.pet.todo").unwrap(), "com.pet.todo");
+        let secret = "fake-cookie-for-real-dpapi";
+        store.set("apiKey", secret).unwrap();
+        let raw = fs::read_to_string(&store.path).unwrap();
+        assert!(
+            !raw.contains(secret),
+            "真 DPAPI 路径把明文写进了文件: {raw}"
+        );
+        assert!(
+            raw.contains("\"alg\": \"dpapi\"") && raw.contains("\"schema\": 1"),
+            "信封形状变了: {raw}"
+        );
+        assert_eq!(
+            store.get("apiKey").unwrap().as_deref(),
+            Some(secret),
+            "往返后值变了"
+        );
+        store.set("apiKey", "rotated-value").unwrap();
+        let after = fs::read_to_string(&store.path).unwrap();
+        assert!(
+            !after.contains(secret) && !after.contains("rotated-value"),
+            "覆盖后泄露了值"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
