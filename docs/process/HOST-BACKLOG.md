@@ -394,6 +394,7 @@ MVP 范围：<这一轮只做什么>
 | G2 | `ctx.http.request` 只返回 `status` / `content_type` / `body` / `truncated`，没有响应头。 | 429 无法读 `Retry-After`，只用本地冷却阶梯 60s→2m→5m→15m→30m。 | 在 `HttpResponse` 增加 `headers`（至少 `retry-after`）或 `retryAfterMs` 字段；桥与 Rust 同改。 |
 | G3 | Widget 在 Worker 里没有 `matchMedia` / 主题能力，无法跟随系统深浅色。 | badge / overlay 固定深色、设置页固定浅色；不接 `navigator.clipboard`，外链只显示文本。 | 评估 `ctx.theme` 或 `layout` 推送带 `colorScheme`；剪贴板另开能力卡。 |
 | G4 | 系统代理 / `HTTP(S)_PROXY`：宿主 `ureq::AgentBuilder` 未配置 proxy，代码没有读取系统/Clash 代理的路径（`src-tauri/src/services/http.rs:40-50`）。 | 需要代理才出网的环境（Clash `127.0.0.1:7897`）可能失败；插件没有绕过方式。 | 评估 `ctx.http.request` 读取系统代理或增加显式 proxy 配置；另拆宿主卡，本行仅登记 C05 预检发现。 |
+| G5 | C06 的 `/internal/usage` 与 `/internal/usage/charts` 出口同样受 G4 的宿主无代理限制（`src-tauri/src/services/http.rs:40-50`）；插件侧没有 proxy 参数。 | 需要代理的环境里 internal 明细不可达；Key 路径也一并失败，UI 只能显示冷却/错误。 | 与 G4 同一宿主缺口，C06 不修改宿主；真站/代理可达性由 PM 本机验收，runner 的 internal 用例使用假响应。 |
 
 ## 6. 宿主凭据存储（B07，2026-10-21）
 

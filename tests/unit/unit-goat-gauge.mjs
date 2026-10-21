@@ -36,8 +36,11 @@ const {
   migrate,
   sanitizeAlertsFired,
   sanitizeConfig,
+  sanitizeCountedThrough,
   sanitizeCred,
+  sanitizeDaily,
   sanitizeHistory,
+  sanitizeRecords,
   sanitizeSnapshot,
   SCHEMA_VERSION,
 } = await import(new URL("../../plugins/com.pet.goat-gauge/store-schema.js", import.meta.url));
@@ -49,6 +52,26 @@ const {
 } = await import(new URL("../../plugins/com.pet.goat-gauge/views/write.js", import.meta.url));
 const { DEMO_SCENARIOS, demoSnapshot } = await import(
   new URL("../../plugins/com.pet.goat-gauge/demo.js", import.meta.url)
+);
+const {
+  KEY_MODE_SECRETS,
+  INTERNAL_ORIGIN,
+  INTERNAL_REFERER,
+  migrateSecrets,
+  clearCookieAfterAuthFailure,
+  assertInternalPath,
+  internalHeaders,
+  keyHeaders,
+  classifyInternalStatus,
+  isKeyModeSecret,
+  COOKIE_EXPIRED_TEXT,
+  maskCookie,
+} = await import(new URL("../../plugins/com.pet.goat-gauge/secrets.js", import.meta.url));
+const { buildInternalRequest, mergeChartBuckets, mergeUsagePages, nextPageCursor } = await import(
+  new URL("../../plugins/com.pet.goat-gauge/internal.js", import.meta.url)
+);
+const { mergeDaily, replaceChartDays } = await import(
+  new URL("../../plugins/com.pet.goat-gauge/daily.js", import.meta.url)
 );
 
 /* ============================ planInfo ============================ */
@@ -906,3 +929,376 @@ eq("normalizeCredits 兼容 window_limits", true, (() => {
   const { limits } = normalizeCredits({ data: { window_limits: { limited: true } } });
   return limits.limited === true;
 })());
+
+/* ============================ C06 secrets 迁移与认证隔离 ============================ */
+group("C06 secrets 迁移与认证隔离");
+
+function fakeSecrets(initial = {}) {
+  const store = { ...initial };
+  const calls = [];
+  return {
+    store,
+    calls,
+    async get(key) {
+      calls.push(`get:${key}`);
+      return store[key] ?? null;
+    },
+    async set(key, value) {
+      calls.push(`set:${key}`);
+      store[key] = value;
+    },
+    async delete(key) {
+      calls.push(`delete:${key}`);
+      delete store[key];
+    },
+  };
+}
+
+function fakeStorage() {
+  const store = {};
+  const calls = [];
+  return {
+    store,
+    calls,
+    async set(key, value) {
+      calls.push(`set:${key}`);
+      store[key] = value;
+    },
+  };
+}
+
+await (async () => {
+  const secrets = fakeSecrets();
+  const storage = fakeStorage();
+  const result = await migrateSecrets({
+    legacy: { apiKey: "fake-key", cookie: "fake-cookie", savedAt: 123 },
+    secrets,
+    storage,
+  });
+  deep("迁移成功两项", result.migrated, ["apiKey", "cookie"]);
+  eq("迁移后 secret apiKey", "fake-key", secrets.store.apiKey);
+  eq("迁移后 secret cookie", "fake-cookie", secrets.store.cookie);
+  deep("迁移成功标记只含非敏感字段", storage.store.cred, { savedAt: 123, secured: true });
+  check(
+    "迁移顺序：copy→verify→clear",
+    secrets.calls.join("|") === "get:apiKey|set:apiKey|get:apiKey|get:cookie|set:cookie|get:cookie" &&
+      storage.calls.join("|") === "set:cred",
+    secrets.calls.join("|") + " / " + storage.calls.join("|"),
+  );
+  check(
+    "迁移标记不含凭据值",
+    !JSON.stringify(storage.store).includes("fake-key") &&
+      !JSON.stringify(storage.store).includes("fake-cookie"),
+    JSON.stringify(storage.store),
+  );
+})();
+
+await (async () => {
+  const secrets = fakeSecrets();
+  const storage = fakeStorage();
+  // set 成功但读回不一致：不得写标记/清明文
+  secrets.get = async (key) => (secrets.store[key] ? "wrong" : null);
+  const result = await migrateSecrets({
+    legacy: { apiKey: "fake-key" },
+    secrets,
+    storage,
+  });
+  check("verify 失败：不清明文", storage.calls.length === 0, storage.calls.join("|"));
+  check("verify 失败：如实返回 failed", result.failed.includes("apiKey"), result.failed.join(","));
+})();
+
+await (async () => {
+  const secrets = fakeSecrets({ apiKey: "other-value" });
+  const storage = fakeStorage();
+  const result = await migrateSecrets({
+    legacy: { apiKey: "fake-key", savedAt: 5 },
+    secrets,
+    storage,
+  });
+  eq("冲突：不覆盖 secret", "other-value", secrets.store.apiKey);
+  check("冲突：不调用 set", !secrets.calls.includes("set:apiKey"), secrets.calls.join("|"));
+  deep("冲突：仍清明文并留标记", storage.store.cred, { savedAt: 5, secured: true, conflict: true });
+  deep("冲突：如实返回", result.conflicts, ["apiKey"]);
+})();
+
+await (async () => {
+  let setAttempts = 0;
+  const secrets = {
+    store: {},
+    calls: [],
+    async get(key) {
+      this.calls.push(`get:${key}`);
+      return this.store[key] ?? null;
+    },
+    async set(key, value) {
+      setAttempts += 1;
+      this.calls.push(`set:${key}`);
+      if (setAttempts === 1) throw new Error("transient");
+      this.store[key] = value;
+    },
+    async delete(key) {
+      this.calls.push(`delete:${key}`);
+      delete this.store[key];
+    },
+  };
+  const storage = fakeStorage();
+  const result = await migrateSecrets({
+    legacy: { apiKey: "fake-key" },
+    secrets,
+    storage,
+    attempts: 2,
+    delayMs: 0,
+  });
+  check("瞬时失败重试后成功", result.migrated.includes("apiKey") && secrets.store.apiKey === "fake-key");
+  eq("重试后写标记", "set:cred", storage.calls[0]);
+})();
+
+await (async () => {
+  const secrets = fakeSecrets({ apiKey: "keep-key", cookie: "fake-cookie" });
+  const storage = fakeStorage();
+  const result = await clearCookieAfterAuthFailure({ secrets, storage });
+  deep("internal 401 只删 Cookie", secrets.calls, ["delete:cookie"]);
+  eq("internal 401 后 Key 保留", "keep-key", secrets.store.apiKey);
+  eq("internal 401 后 Cookie 清空", undefined, secrets.store.cookie);
+  eq("internal 401 状态", "expired", result.cookieState);
+  eq("internal 401 标记", "expired", storage.store.cookieState);
+})();
+
+deep(
+  "internal 请求头含 Cookie/Origin/Referer",
+  internalHeaders("fake-cookie"),
+  [
+    ["accept", "application/json"],
+    ["user-agent", "DesktopPet-GOATGauge/0.1"],
+    ["cookie", "fake-cookie"],
+    ["origin", INTERNAL_ORIGIN],
+    ["referer", INTERNAL_REFERER],
+  ],
+);
+check(
+  "Key 请求头不含 Cookie",
+  !JSON.stringify(keyHeaders("fake-key")).toLowerCase().includes("cookie"),
+  JSON.stringify(keyHeaders("fake-key")),
+);
+eq("internal 401 分类", "expired", classifyInternalStatus(401));
+eq("internal 403 分类", "expired", classifyInternalStatus(403));
+eq("internal 429 分类", "throttle", classifyInternalStatus(429));
+eq("internal 200 分类", "ok", classifyInternalStatus(200));
+eq("internal 500 分类", "upstream", classifyInternalStatus(500));
+
+check(
+  "internal 非白名单路径拒绝",
+  (() => {
+    try {
+      assertInternalPath("/internal/other");
+      return false;
+    } catch {
+      return true;
+    }
+  })(),
+  "/internal/other 未被拒",
+);
+deep("Key 模式只读 apiKey", KEY_MODE_SECRETS, ["apiKey"]);
+check("Key 模式不读 cookie", isKeyModeSecret("apiKey") && !isKeyModeSecret("cookie"));
+
+group("C06 internal 翻页与请求");
+
+{
+  const pages = [
+    {
+      records: [
+        { id: "a", createdAt: "2026-01-01T00:00:00Z", meta: { model: "m" } },
+        { id: "b", createdAt: "2026-01-02T00:00:00Z" },
+      ],
+    },
+    {
+      data: [
+        { id: "a", createdAt: "2026-01-03T00:00:00Z" },
+        { id: "c", createdAt: "2026-01-01T12:00:00Z" },
+      ],
+    },
+  ];
+  const merged = mergeUsagePages(pages);
+  deep("records 跨页去重 + 按时间降序", merged.map((record) => record.id), ["a", "b", "c"]);
+  eq("records 上限生效", 2, mergeUsagePages(pages, { limit: 2 }).length);
+  check("records 缺 id 丢弃", merged.every((record) => typeof record.id === "string" && record.id.length > 0));
+}
+
+{
+  const page = { records: [{ id: "a" }], nextCursor: "next" };
+  eq("有新 id 时继续翻页", "next", nextPageCursor(page, new Set()));
+  eq("无新 id 时停止翻页", null, nextPageCursor(page, new Set(["a"])));
+  eq("空页停止翻页", null, nextPageCursor({ records: [], nextCursor: "x" }, new Set()));
+}
+
+{
+  const request = buildInternalRequest("/internal/usage", "fake-cookie", {
+    cursor: "abc",
+    orgId: "o1",
+  });
+  eq("internal URL", "https://api.commandcode.ai/internal/usage?cursor=abc&orgId=o1", request.url);
+  check(
+    "internal Cookie 只在请求头",
+    request.headers.some(([key, value]) => key === "cookie" && value === "fake-cookie") &&
+      !request.url.includes("fake-cookie"),
+  );
+  check(
+    "internal 拒绝非白名单路径",
+    (() => {
+      try {
+        buildInternalRequest("/internal/other", "fake-cookie");
+        return false;
+      } catch {
+        return true;
+      }
+    })(),
+  );
+}
+
+{
+  const charts = mergeChartBuckets([
+    { data: [{ model: "m", timeBucket: "2026-01-01", requests: 1 }] },
+    {
+      data: [
+        { model: "m", timeBucket: "2026-01-01", requests: 2 },
+        { model: "m", timeBucket: "2026-01-02", requests: 1 },
+      ],
+    },
+  ]);
+  eq("charts 按 model+time_bucket 去重", 2, charts.length);
+  eq("charts 后到页为准", 2, charts.find((bucket) => bucket.time_bucket === "2026-01-01").requests);
+}
+
+/* ============================ C06 schema 3 / daily / 验收 ============================ */
+group("C06 schema 3 / daily / 验收");
+
+eq("schema 版本字面量=3", 3, SCHEMA_VERSION);
+
+{
+  const store = migrate({
+    schema: 2,
+    config: { refreshSec: 60 },
+    cred: { apiKey: "", savedAt: 0 },
+    records: [{ id: "r1", created_at: "2026-01-01T00:00:00Z", at_ms: 1 }],
+    daily: [{ day: "2026-01-01", at_ms: 1, requests: 1 }],
+    counted_through_ms: 1,
+    charts_by_day: { "2026-01-01": [{ model: "m", time_bucket: "2026-01-01" }] },
+  });
+  eq("schema 2→3", 3, store.schema);
+  eq("迁移保留 records", 1, store.records.length);
+  eq("迁移保留 daily", 1, store.daily.length);
+  eq("迁移保留水位", 1, store.counted_through_ms);
+  eq("迁移保留 charts", 1, store.charts_by_day["2026-01-01"].length);
+}
+
+{
+  const records = Array.from({ length: 400 }, (_, i) => ({
+    id: `r${i}`,
+    created_at: "2026-01-01T00:00:00Z",
+    at_ms: i + 1,
+  }));
+  eq("records 只留 300", 300, sanitizeRecords(records).length);
+  eq("坏 records 丢弃", 0, sanitizeRecords([{ id: "x" }, { id: "y", created_at: "z", at_ms: 0 }]).length);
+  const base = Date.UTC(2026, 0, 1);
+  const days = Array.from({ length: 100 }, (_, i) => ({
+    day: localDayKey(base - i * 86_400_000, "UTC"),
+    at_ms: base - i * 86_400_000,
+  }));
+  eq("daily 只留 90", 90, sanitizeDaily(days).length);
+  eq("坏水位归零", 0, sanitizeCountedThrough("x"));
+  eq("负水位归零", 0, sanitizeCountedThrough(-1));
+}
+
+{
+  const day1 = Date.UTC(2026, 0, 1, 23, 0, 0);
+  const day2 = Date.UTC(2026, 0, 2, 1, 0, 0);
+  const records = [
+    { id: "a", at_ms: day1, model: "m", tokens_in: 1, tokens_out: 2, cost_total: 0.1 },
+    { id: "b", at_ms: day1, model: "m", tokens_in: 3, tokens_out: 4, cost_total: 0.2 },
+    { id: "c", at_ms: day2, model: "n", tokens_in: 5, tokens_out: 6, cost_total: 0.3 },
+  ];
+  const result = mergeDaily(records, [], 0, { timeZone: "UTC" });
+  eq("daily 跨本地日", 2, result.daily.length);
+  const first = result.daily.find((day) => day.day === "2026-01-01");
+  eq("daily 首日 requests", 2, first.requests);
+  eq("daily 首日 tokens_in", 4, first.tokens_in);
+  eq("daily 首日 by_model", 2, first.by_model.m.requests);
+  eq("水位取最大 at_ms", day2, result.counted_through_ms);
+
+  const equal = mergeDaily(
+    [{ id: "x", at_ms: day2, tokens_in: 9 }],
+    result.daily,
+    result.counted_through_ms,
+    { timeZone: "UTC" },
+  );
+  eq("at_ms == 水位不计入", 0, equal.added);
+  eq("== 水位不推日", result.daily.length, equal.daily.length);
+
+  const older = mergeDaily(
+    [{ id: "old", at_ms: day1, tokens_in: 9 }],
+    result.daily,
+    result.counted_through_ms,
+    { timeZone: "UTC" },
+  );
+  eq("晚到旧记录被水位跳过", 0, older.added);
+}
+
+{
+  const base = Date.UTC(2026, 0, 1);
+  const previous = Array.from({ length: 95 }, (_, i) => ({
+    day: localDayKey(base - i * 86_400_000, "UTC"),
+    at_ms: base - i * 86_400_000,
+    requests: 1,
+    tokens_in: 1,
+    tokens_out: 1,
+    cost_total: 0,
+    by_model: {},
+  }));
+  const trimmed = mergeDaily([], previous, 0, { timeZone: "UTC" }).daily;
+  eq("daily 90 天裁剪", 90, trimmed.length);
+  check("daily 裁剪掉最旧", !trimmed.some((day) => day.day === localDayKey(base - 95 * 86_400_000, "UTC")));
+}
+
+{
+  const next = replaceChartDays(
+    { "2026-01-01": [{ model: "m", time_bucket: "2026-01-01T00:00:00Z", requests: 1 }] },
+    [
+      { model: "m", time_bucket: "2026-01-01T05:00:00Z", requests: 2 },
+      { model: "m", time_bucket: "2026-01-02T05:00:00Z", requests: 1 },
+    ],
+    { timeZone: "UTC" },
+  );
+  eq("charts 整日替换", 2, next["2026-01-01"][0].requests);
+  eq("charts 新日写入", 1, next["2026-01-02"][0].requests);
+}
+
+eq("Cookie 只回显固定掩码", "••••", maskCookie("fake-cookie"));
+check("掩码不含 Cookie 值/长度", !maskCookie("fake-cookie").includes("fake") && maskCookie("fake-cookie").length === 4);
+eq("空 Cookie 无掩码", "", maskCookie(""));
+eq("过期文案", "会话已过期，明细暂停", COOKIE_EXPIRED_TEXT);
+
+{
+  const manifest = JSON.parse(
+    readFileSync(new URL("../../plugins/com.pet.goat-gauge/manifest.json", import.meta.url), "utf8"),
+  );
+  check(
+    "manifest 声明 http（首次 internal 走宿主同意框）",
+    Array.isArray(manifest.permissions) && manifest.permissions.includes("http"),
+  );
+}
+
+{
+  const mainSrc = readFileSync(
+    new URL("../../plugins/com.pet.goat-gauge/main.js", import.meta.url),
+    "utf8",
+  );
+  check("视图只回显掩码", mainSrc.includes("masked: maskCookie(cookie)"));
+  check("过期错误用统一文案", mainSrc.includes("COOKIE_EXPIRED_TEXT"));
+  const panelStart = mainSrc.indexOf("function publishPanel");
+  const panelEnd = mainSrc.indexOf("function syncOverlay");
+  const panelBlock = panelStart >= 0 && panelEnd > panelStart ? mainSrc.slice(panelStart, panelEnd) : "";
+  check(
+    "panel 不含 Cookie/Key 值",
+    panelBlock.length > 0 && !panelBlock.toLowerCase().includes("cookie") && !panelBlock.includes("apiKey"),
+  );
+}
