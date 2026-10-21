@@ -2669,10 +2669,11 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   const b3NoGrantRes = await b3NoGrant;
   const b3AttemptConsole = consoleWindow(b3AttemptConsoleStart, [STATUS_A]);
   r.info("撤权后再设置的同意框", b3ConsentAgain ? "弹了（已拒）" : "没弹");
+  // 标签与期望串一字不改；改的是它前面那次真调用回来了
+  // （原实质=插件试过且被拒 → 新实质同；取代者=它自己，另加下面两条把它拆细）
   r.check(
     "撤权后无权再设置常驻行：拒掉同意框就拿不到这一行",
     "true|false",
-    // 标签与期望串一字不改；改的是它前面那次真调用回来了（原实质=插件试过且被拒，新实质同，取代者=它自己）
     [b3NoGrantRes.ok === false, (await bubbleNow()).text === "偷挂行"].join("|"),
   );
   r.check(
