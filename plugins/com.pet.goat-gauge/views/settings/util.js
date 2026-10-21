@@ -52,5 +52,10 @@ export const SETTINGS_CSS = `
   .g-form { display: flex; flex-direction: column; gap: 8px; }
   .g-error { color: #d92d20; }
   .g-note { color: #b54708; font-size: 11.5px; }
+  .g-detail-tabs { margin-bottom: 4px; }
+  .g-detail-table { display: flex; flex-direction: column; gap: 2px; }
+  .g-detail-row { display: grid; grid-template-columns: 138px minmax(0, 1fr) 96px 92px;
+    gap: 8px; padding: 3px 0; border-bottom: 1px solid #f2f4f7; font-size: 11.5px; }
+  .g-detail-pager { justify-content: flex-end; }
   ${RING_CSS}
 `;

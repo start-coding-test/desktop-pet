@@ -73,6 +73,19 @@ const { buildInternalRequest, mergeChartBuckets, mergeUsagePages, nextPageCursor
 const { mergeDaily, replaceChartDays } = await import(
   new URL("../../plugins/com.pet.goat-gauge/daily.js", import.meta.url)
 );
+const {
+  DETAIL_RANGES,
+  PAGE_SIZE,
+  timeRange,
+  inRange,
+  modelCostRing,
+  cacheHitRate,
+  paginate,
+  detailsModel,
+} = await import(new URL("../../plugins/com.pet.goat-gauge/views/settings/details.js", import.meta.url));
+const { buildPanelPayload, COOKIE_STATES } = await import(
+  new URL("../../plugins/com.pet.goat-gauge/panel.js", import.meta.url)
+);
 
 /* ============================ planInfo ============================ */
 group("planInfo");
@@ -1298,7 +1311,121 @@ eq("过期文案", "会话已过期，明细暂停", COOKIE_EXPIRED_TEXT);
   const panelEnd = mainSrc.indexOf("function syncOverlay");
   const panelBlock = panelStart >= 0 && panelEnd > panelStart ? mainSrc.slice(panelStart, panelEnd) : "";
   check(
-    "panel 不含 Cookie/Key 值",
-    panelBlock.length > 0 && !panelBlock.toLowerCase().includes("cookie") && !panelBlock.includes("apiKey"),
+    "panel 不含 Cookie/Key 值（允许 cookieState 枚举）",
+    panelBlock.length > 0 && !panelBlock.includes("apiKey") && !/["']cookie["']\s*:/.test(panelBlock),
   );
+}
+
+/* ============================ C07 明细看板 ============================ */
+group("C07 明细看板");
+
+eq("明细范围四档", 4, DETAIL_RANGES.length);
+eq("分页 20/页", 20, PAGE_SIZE);
+
+{
+  const now = Date.UTC(2026, 0, 10, 12, 0, 0);
+  const today = timeRange("today", now, "UTC");
+  eq("今天起点 UTC 00:00", Date.UTC(2026, 0, 10), today.start_ms);
+  eq("今天终点次日 00:00", Date.UTC(2026, 0, 11), today.end_ms);
+  eq("今天含起点", true, inRange(today.start_ms, today));
+  eq("今天不含终点", false, inRange(today.end_ms, today));
+  const week = timeRange("7", now, "UTC");
+  eq("7 天起点含今天的第 7 个日历日", Date.UTC(2026, 0, 4), week.start_ms);
+  eq("7 天终点次日", Date.UTC(2026, 0, 11), week.end_ms);
+  const month = timeRange("30", now, "UTC");
+  eq("30 天起点", Date.UTC(2025, 11, 12), month.start_ms);
+  const all = timeRange("all", now, "UTC");
+  eq("全部无起点", 0, all.start_ms);
+  eq("全部无终点", Infinity, all.end_ms);
+}
+
+{
+  // 2026-03-08 美国东部进入夏令时：7 个日历日 = 167 小时（23h 的那天）。
+  const now = Date.UTC(2026, 2, 10, 16, 0, 0);
+  const week = timeRange("7", now, "America/New_York");
+  check("DST 7 日历日跨度 167h", (week.end_ms - week.start_ms) / 3_600_000 === 167, String((week.end_ms - week.start_ms) / 3_600_000));
+}
+
+{
+  const ring = modelCostRing([
+    { day: "2026-01-10", cost_total: 3, by_model: { m: { cost_total: 1 }, n: { cost_total: 2 } } },
+    { day: "2026-01-09", cost_total: 1, by_model: { m: { cost_total: 1 } } },
+  ]);
+  eq("模型环总额", 4, ring.total);
+  eq("模型环与 daily 成本一致", true, ring.consistent);
+  check("模型环按成本降序", ring.models[0].cost >= ring.models[1].cost);
+  check("模型环百分比合计 100", Math.abs(ring.models.reduce((sum, item) => sum + item.pct, 0) - 100) <= 1e-9);
+  eq("无 by_model 空态", 0, modelCostRing([{ day: "2026-01-10", cost_total: 0 }]).models.length);
+}
+
+eq("缓存命中率 50/(50+50)", 0.5, cacheHitRate({ cacheReadTokens: 50, tokensIn: 50 }));
+eq("缓存命中率 input 已含缓存", 0.5, cacheHitRate({ cacheReadTokens: 50, tokensIn: 100, inputIncludesCache: true }));
+eq("缓存命中率分母 0", null, cacheHitRate({ cacheReadTokens: 0, tokensIn: 0 }));
+
+{
+  const items = Array.from({ length: 45 }, (_, i) => i);
+  const p2 = paginate(items, 2);
+  deep("第 2 页 20 条", p2.items[0] === 20 && p2.items.length === 20 && p2.items[19] === 39, true);
+  eq("第 2 页页码", 2, p2.page);
+  eq("页数 3", 3, p2.page_count);
+  const p3 = paginate(items, 3);
+  eq("最后一页不补空行", 5, p3.items.length);
+  eq("页码越界夹到最后一页", 3, paginate(items, 99).page);
+  eq("页码 0 夹到 1", 1, paginate(items, 0).page);
+}
+
+{
+  const now = Date.UTC(2026, 0, 10, 12, 0, 0);
+  const panel = {
+    fetchedAt: now,
+    records: [
+      { id: "a", at_ms: Date.UTC(2026, 0, 10, 9), model: "m", tokens_in: 1, tokens_out: 2, cost_total: 1 },
+      { id: "b", at_ms: Date.UTC(2026, 0, 9, 9), model: "n", tokens_in: 3, tokens_out: 4, cost_total: 2 },
+    ],
+    daily: [
+      { day: "2026-01-10", at_ms: Date.UTC(2026, 0, 10, 9), tokens_in: 1, cost_total: 1, by_model: { m: { cost_total: 1 } } },
+    ],
+    charts: { "2026-01-10": [{ time_bucket: "2026-01-10T00:00:00Z", cache_read_tokens: 5 }] },
+  };
+  const model = detailsModel(panel, { rangeKey: "today", page: 1, now, timeZone: "UTC" });
+  eq("today 只保留今天 records", 1, model.records.length);
+  eq("today 只保留今天 daily", 1, model.daily.length);
+  eq("today 模型环", 1, model.ring.models.length);
+  eq("today 缓存命中率", 5 / 6, model.cache);
+}
+
+{
+  const source = readFileSync(new URL("../../plugins/com.pet.goat-gauge/main.js", import.meta.url), "utf8");
+  const panelSource = readFileSync(new URL("../../plugins/com.pet.goat-gauge/panel.js", import.meta.url), "utf8");
+  check("panel 只读投影 charts", source.includes("buildPanelPayload") && panelSource.includes("charts: Object.fromEntries"));
+  check("明细不调用 matchMedia", !/matchMedia\s*\(/.test(readFileSync(new URL("../../plugins/com.pet.goat-gauge/views/settings/details.js", import.meta.url), "utf8")));
+}
+
+{
+  const payload = buildPanelPayload({
+    history: [[1, 2]],
+    fetchedAt: 123,
+    daily: [{ day: "2026-01-10", cost_total: 1, by_model: { m: { cost_total: 1 } } }],
+    records: [{ id: "r1", at_ms: 1, model: "m" }],
+    charts: { "2026-01-10": [{ model: "m", time_bucket: "2026-01-10", cache_read_tokens: 5 }] },
+    cookieState: "expired",
+  });
+  deep("panel 键集固定", Object.keys(payload).sort(), [
+    "charts",
+    "cookieState",
+    "daily",
+    "fetchedAt",
+    "history",
+    "records",
+  ]);
+  eq("panel cookieState 枚举", "expired", payload.cookieState);
+  check(
+    "panel 不含 Cookie/Key 值",
+    !JSON.stringify(payload).includes("cookie-goat-e2e") &&
+      !JSON.stringify(payload).includes("sk-goat-e2e") &&
+      !("apiKey" in payload) &&
+      !("cookie" in payload),
+  );
+  eq("panel cookieState 非法值回落 none", "none", buildPanelPayload({ cookieState: "bogus" }).cookieState);
+  eq("panel 允许的 cookieState 枚举", true, COOKIE_STATES.includes("unavailable") && COOKIE_STATES.includes("expired"));
 }

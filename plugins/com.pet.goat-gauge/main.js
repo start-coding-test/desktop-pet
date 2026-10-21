@@ -12,6 +12,7 @@ import {
   isThrottleError,
 } from "./api.js";
 import { mergeChartBuckets, mergeUsagePages, nextPageCursor } from "./internal.js";
+import { buildPanelPayload } from "./panel.js";
 import { mergeDaily, replaceChartDays } from "./daily.js";
 import { clearCookieAfterAuthFailure, COOKIE_EXPIRED_TEXT, maskCookie, migrateSecrets } from "./secrets.js";
 import { demoSnapshot, DEMO_SCENARIOS } from "./demo.js";
@@ -271,12 +272,17 @@ function publishUsage(prev, next) {
 function publishPanel() {
   if (!ctx) return;
   try {
-    const published = ctx.bus.publish(TOPIC_PANEL, {
-      history: history.map((row) => [...row]),
-      fetchedAt: Number(snapshot?.fetched_at) || 0,
-      daily: daily.map((day) => ({ ...day, by_model: { ...day.by_model } })),
-      records: records.map((record) => ({ ...record })),
-    });
+    const published = ctx.bus.publish(
+      TOPIC_PANEL,
+      buildPanelPayload({
+        history,
+        fetchedAt: Number(snapshot?.fetched_at) || 0,
+        daily,
+        records,
+        charts: chartsByDay,
+        cookieState,
+      }),
+    );
     if (published && typeof published.catch === "function") {
       void published.catch(() => undefined);
     }

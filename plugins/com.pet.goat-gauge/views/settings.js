@@ -2,6 +2,7 @@
 import { TOPIC_CMD, TOPIC_PANEL, TOPIC_STATUS, TOPIC_WIDGET } from "../topics.js";
 import { addStyle, tag } from "./dom.js";
 import { mountDashboard } from "./settings/dashboard.js";
+import { mountDetails } from "./settings/details.js";
 import { mountOnboarding } from "./settings/onboarding.js";
 import { mountPrefs } from "./settings/prefs.js";
 import { mountTrend } from "./settings/trend.js";
@@ -30,15 +31,18 @@ export function mountSettings(root, ctx, cleanups) {
   const onboarding = mountOnboarding(ctx, state);
   const dashboard = mountDashboard(ctx, cleanups);
   const trend = mountTrend(ctx, state);
+  const details = mountDetails(ctx, state);
   const prefs = mountPrefs(ctx, state);
 
   const panes = {
     overview: tag(dom, "div", "g-pane"),
     trend: tag(dom, "div", "g-pane"),
+    details: tag(dom, "div", "g-pane"),
     prefs: tag(dom, "div", "g-pane"),
   };
   panes.overview.append(onboarding.box, dashboard.box);
   panes.trend.append(trend.box);
+  panes.details.append(details.box);
   panes.prefs.append(prefs.box);
 
   const buttons = {};
@@ -53,6 +57,7 @@ export function mountSettings(root, ctx, cleanups) {
   for (const [key, label] of [
     ["overview", "概览"],
     ["trend", "趋势"],
+    ["details", "明细"],
     ["prefs", "设置"],
   ]) {
     const buttonNode = tag(dom, "button", "g-tab");
@@ -63,7 +68,7 @@ export function mountSettings(root, ctx, cleanups) {
     buttons[key] = buttonNode;
   }
 
-  wrap.append(tabs, statusLine, panes.overview, panes.trend, panes.prefs);
+  wrap.append(tabs, statusLine, panes.overview, panes.trend, panes.details, panes.prefs);
   root.append(wrap);
   setTab("overview");
 
@@ -73,6 +78,7 @@ export function mountSettings(root, ctx, cleanups) {
     dashboard.render(state.lastView);
     prefs.render(state.lastView);
     trend.render(state.lastPanel);
+    details.render(state.lastPanel, state.lastView);
   };
 
   cleanups.push(ctx.bus.subscribe(TOPIC_WIDGET, (view) => render(view ?? {})));
