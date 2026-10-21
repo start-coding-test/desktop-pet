@@ -2,29 +2,113 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::oneshot;
+use tokio::time::Instant;
 
 use super::store::StoreState;
 use crate::fsutil::write_atomic;
 use crate::host_error::{HostError, DENIED, INTERNAL, INVALID_ARG, NOT_FOUND};
 use crate::ids::is_safe_id;
 
+/// 同意框的组级等待上限。窗口/组从第一个请求起算，后续追加的请求共享剩余时间。
+const CONSENT_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// 插件权限管理：授权表持久化 + 首次调用未授权能力时弹同意框。
 /// 进程内插件不是硬安全边界，这里是策略层（见 ARCHITECTURE.md 信任模型）。
 pub struct PermissionState {
     file: Mutex<Option<PathBuf>>,
     granted: Mutex<HashMap<String, Vec<String>>>,
-    pending: Mutex<HashMap<String, PendingConsent>>,
+    consent: Mutex<ConsentBook>,
 }
 
 struct PendingConsent {
-    sender: oneshot::Sender<bool>,
     plugin_id: String,
     plugin_name: String,
     caps: Vec<String>,
+    waiters: Vec<oneshot::Sender<bool>>,
+    window_label: String,
+    deadline: Instant,
+}
+
+/// pending 与拒绝锁共用一把锁：答复拒绝、停用清锁、追加能力必须原子，
+/// 否则新请求会插在「已答复拒绝」和「已写拒绝锁」之间再开一扇窗。
+#[derive(Default)]
+struct ConsentBook {
+    pending: HashMap<String, PendingConsent>,
+    denied: HashSet<String>,
+}
+
+enum BeginOutcome {
+    AlreadyGranted,
+    Denied,
+    Joined {
+        rx: oneshot::Receiver<bool>,
+    },
+    Created {
+        req_id: String,
+        rx: oneshot::Receiver<bool>,
+        window_label: String,
+        deadline: Instant,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ConsentEnd {
+    Allow,
+    Deny,
+    Closed,
+    Timeout,
+    Disabled,
+    Uninstalled,
+    WindowFailed,
+}
+
+impl ConsentEnd {
+    fn grants(self) -> bool {
+        matches!(self, Self::Allow)
+    }
+
+    fn latches(self) -> bool {
+        matches!(self, Self::Deny | Self::Closed | Self::Timeout)
+    }
+
+    fn clears_denied(self) -> bool {
+        matches!(self, Self::Disabled)
+    }
+}
+
+/// 请求里尚未授权且本轮请求内不重复的能力（保序）。pending 里已有的能力由调用方再过滤。
+fn unique_ungranted(requested: &[String], granted: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for cap in requested {
+        if granted.contains(cap) || out.contains(cap) {
+            continue;
+        }
+        out.push(cap.clone());
+    }
+    out
+}
+
+/// 未启用（清单缺失/读坏也是未启用）时不弹窗。纯函数便于单测启用门禁。
+fn plugin_enabled_for_consent(enabled: Option<&[String]>, plugin_id: &str) -> bool {
+    enabled
+        .map(|ids| ids.iter().any(|id| id == plugin_id))
+        .unwrap_or(false)
+}
+
+/// pending 里已经不在盘的插件 id（去重、保序）。只用于取消，不碰授权表。
+fn orphan_pending_ids(pending: &[String], known: &HashSet<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for id in pending {
+        if !known.contains(id) && !out.contains(id) {
+            out.push(id.clone());
+        }
+    }
+    out
 }
 
 #[derive(Serialize, Clone)]
@@ -40,7 +124,7 @@ impl PermissionState {
         Self {
             file: Mutex::new(None),
             granted: Mutex::new(HashMap::new()),
-            pending: Mutex::new(HashMap::new()),
+            consent: Mutex::new(ConsentBook::default()),
         }
     }
 
@@ -102,7 +186,9 @@ impl PermissionState {
             .unwrap_or_default()
     }
 
-    pub fn grant(&self, plugin_id: &str, caps: &[String]) {
+    /// 只改内存，不落盘。allow 收口在 consent 锁内调用它，随后在锁外 `save()`，
+    /// 这样「移除 pending」和「新授权可见」之间不会被新请求看到旧快照。
+    fn grant_in_memory(&self, plugin_id: &str, caps: &[String]) {
         let mut map = self.granted.lock().unwrap_or_else(|p| p.into_inner());
         let entry = map.entry(plugin_id.to_string()).or_default();
         for c in caps {
@@ -110,7 +196,13 @@ impl PermissionState {
                 entry.push(c.clone());
             }
         }
-        drop(map);
+    }
+
+    /// 测试与其他能力域的单测用：内存授权 + 落盘。生产 allow 路径走
+    /// `grant_in_memory` + 锁外 `save()`，避免在 consent 锁里做文件 IO。
+    #[cfg(test)]
+    pub fn grant(&self, plugin_id: &str, caps: &[String]) {
+        self.grant_in_memory(plugin_id, caps);
         self.save();
     }
 
@@ -125,17 +217,139 @@ impl PermissionState {
         revoked
     }
 
-    /// 丢弃挂起的同意请求：drop sender 后等待方立刻按「拒绝」返回，
-    /// 不必空等 60s 超时。同意框被关闭时由 on_window_event 调用。
-    pub fn discard_pending(&self, req_id: &str) {
-        let dropped = self
-            .pending
+    /// 在 consent 锁内完成查找/创建与追加。锁序固定为 consent → granted：
+    /// allow 路径也会在同一把 consent 锁里写入内存授权，避免新请求读到过期 granted 快照。
+    fn begin_consent(
+        &self,
+        plugin_id: &str,
+        plugin_name: &str,
+        requested: &[String],
+        req_id: String,
+        ttl: Duration,
+    ) -> BeginOutcome {
+        let mut book = self.consent.lock().unwrap_or_else(|p| p.into_inner());
+        let granted = self
+            .granted
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .remove(req_id);
-        if dropped.is_some() {
-            log::info!("同意框未作答即关闭，按拒绝处理: {req_id}");
+            .get(plugin_id)
+            .cloned()
+            .unwrap_or_default();
+        let ungranted = unique_ungranted(requested, &granted);
+        if ungranted.is_empty() {
+            return BeginOutcome::AlreadyGranted;
         }
+        if book.denied.contains(plugin_id) {
+            return BeginOutcome::Denied;
+        }
+
+        let existing = book
+            .pending
+            .iter()
+            .find(|(_, pending)| pending.plugin_id == plugin_id)
+            .map(|(id, _)| id.clone());
+        if let Some(existing_req) = existing {
+            let pending = book
+                .pending
+                .get_mut(&existing_req)
+                .expect("刚按 plugin_id 找到的 pending 不该消失");
+            for cap in ungranted {
+                if !pending.caps.contains(&cap) {
+                    pending.caps.push(cap);
+                }
+            }
+            let (tx, rx) = oneshot::channel();
+            pending.waiters.push(tx);
+            return BeginOutcome::Joined { rx };
+        }
+
+        let (tx, rx) = oneshot::channel();
+        let window_label = format!("consent-{req_id}");
+        let deadline = Instant::now() + ttl;
+        book.pending.insert(
+            req_id.clone(),
+            PendingConsent {
+                plugin_id: plugin_id.to_string(),
+                plugin_name: plugin_name.to_string(),
+                caps: ungranted,
+                waiters: vec![tx],
+                window_label: window_label.clone(),
+                deadline,
+            },
+        );
+        BeginOutcome::Created {
+            req_id,
+            rx,
+            window_label,
+            deadline,
+        }
+    }
+
+    /// 移除 pending 并按收口类型处理授权/拒绝锁。等待方已全部离开时不授权、不写拒绝锁，
+    /// 只把 pending 移除（既有 `receiver dropped` 口径）；停用仍会先清掉旧拒绝锁。
+    fn finish_consent(&self, req_id: &str, end: ConsentEnd) -> Result<PendingConsent, HostError> {
+        let mut book = self.consent.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(pending) = book.pending.remove(req_id) else {
+            return Err(HostError::new(NOT_FOUND, "request not found"));
+        };
+        let PendingConsent {
+            plugin_id,
+            plugin_name,
+            caps,
+            waiters,
+            window_label,
+            deadline,
+        } = pending;
+        let live: Vec<_> = waiters
+            .into_iter()
+            .filter(|sender| !sender.is_closed())
+            .collect();
+        if end.clears_denied() {
+            book.denied.remove(&plugin_id);
+        }
+        if live.is_empty() {
+            return Err(HostError::new(INTERNAL, "receiver dropped"));
+        }
+        if end.grants() {
+            self.grant_in_memory(&plugin_id, &caps);
+        } else if end.latches() {
+            book.denied.insert(plugin_id.clone());
+        }
+        Ok(PendingConsent {
+            plugin_id,
+            plugin_name,
+            caps,
+            waiters: live,
+            window_label,
+            deadline,
+        })
+    }
+
+    fn pending_exists(&self, req_id: &str) -> bool {
+        self.consent
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pending
+            .contains_key(req_id)
+    }
+
+    fn pending_plugin_ids(&self) -> Vec<String> {
+        let book = self.consent.lock().unwrap_or_else(|p| p.into_inner());
+        let mut ids = Vec::new();
+        for pending in book.pending.values() {
+            if !ids.contains(&pending.plugin_id) {
+                ids.push(pending.plugin_id.clone());
+            }
+        }
+        ids
+    }
+
+    fn clear_denied(&self, plugin_id: &str) {
+        self.consent
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .denied
+            .remove(plugin_id);
     }
 
     pub fn list(&self) -> HashMap<String, Vec<String>> {
@@ -215,14 +429,19 @@ fn undeclared_caps(declared: &[String], requested: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// 插件目录变动后回收孤儿授权。
+/// 插件目录变动后回收孤儿授权与孤儿 pending。
 /// 读不到目录时什么都不做 —— 宁可留着过期授权，也不要在一次临时 IO 失败上把用户给过的权限抹掉。
 pub fn prune_orphan_grants(app: &AppHandle) {
     let Ok(ids) = crate::commands::plugins::installed_plugin_ids(app) else {
         return;
     };
     let known: HashSet<String> = ids.into_iter().collect();
-    let removed = app.state::<PermissionState>().retain_known(&known);
+    let state = app.state::<PermissionState>();
+    let removed = state.retain_known(&known);
+    // 正在弹窗的插件通常还没有授权，不会出现在 removed 里；必须独立遍历 pending。
+    for id in orphan_pending_ids(&state.pending_plugin_ids(), &known) {
+        cancel_pending_for_plugin(app, &id, false);
+    }
     if !removed.is_empty() {
         log::info!("回收已卸载插件的授权: {}", removed.join(", "));
         // 目录都没了，能力也收走了，它的悬浮层再没人能关（同 permission_revoke 那条理由）
@@ -243,7 +462,7 @@ pub fn permission_check(
 }
 
 /// 请求授权：只受理 manifest 已声明的能力；已全部授权则立即放行；
-/// 否则弹同意框阻塞等待用户决定（60s 超时视为拒绝）
+/// 未启用直接拒绝、不弹窗；其余按 plugin_id 合流到同一 pending。
 #[tauri::command]
 pub async fn permission_request(
     app: AppHandle,
@@ -254,13 +473,7 @@ pub async fn permission_request(
     checked_plugin_id(&plugin_id)?;
     let declared = crate::commands::plugins::declared_capabilities(&app, &plugin_id)?;
     ensure_declared(&plugin_id, &declared, &capabilities)?;
-    if capabilities.iter().all(|c| state.is_granted(&plugin_id, c)) {
-        return Ok(true);
-    }
-    // 同意框上的名字只认磁盘 manifest（ADR-0011）：以前它是调用方传进来的入参，
-    // 于是绕过 JS 桥的插件能把同意框显示成任意名字 —— 而同意的对象恰恰是「这个插件是谁」。
-    let plugin_name = crate::commands::plugins::manifest_display_name(&app, &plugin_id)?;
-    ask_user(app, &state, plugin_id, plugin_name, capabilities).await
+    request_consent(app, state.inner(), plugin_id, capabilities).await
 }
 
 /// 「未声明就不许申请」这条规则单独成函数（ADR-0005）。
@@ -285,50 +498,84 @@ fn ensure_declared(
     ))
 }
 
-/// 弹同意框并阻塞等答复：登记挂起项、开窗、装关窗看门狗、超时与清理都住在这里，
-/// 命令体只留一次委托（ADR-0005）。
-async fn ask_user(
+/// 请求授权的主路径：全授权 → 启用门禁 → 锁内合流；只有新组才开窗。
+/// 命令体只做 id/声明校验与一次委托（ADR-0005）。
+async fn request_consent(
     app: AppHandle,
-    state: &tauri::State<'_, PermissionState>,
+    state: &PermissionState,
     plugin_id: String,
-    plugin_name: String,
     capabilities: Vec<String>,
 ) -> Result<bool, HostError> {
+    if capabilities.iter().all(|c| state.is_granted(&plugin_id, c)) {
+        return Ok(true);
+    }
+    // 未启用（清单缺失/读坏也算）一律不弹；已全授权的情况已在上面直接放行。
+    if !plugin_enabled_for_consent(
+        crate::services::enabled::list_ids(&app).as_deref(),
+        &plugin_id,
+    ) {
+        return Ok(false);
+    }
+    let plugin_name = crate::commands::plugins::manifest_display_name(&app, &plugin_id)?;
     let req_id = format!("r{}", uuid::Uuid::new_v4().simple());
-    let (tx, rx) = oneshot::channel::<bool>();
-    state
-        .pending
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(
-            req_id.clone(),
-            PendingConsent {
-                sender: tx,
-                plugin_id: plugin_id.clone(),
-                plugin_name: plugin_name.clone(),
-                caps: capabilities.clone(),
-            },
-        );
+    match state.begin_consent(
+        &plugin_id,
+        &plugin_name,
+        &capabilities,
+        req_id,
+        CONSENT_TIMEOUT,
+    ) {
+        BeginOutcome::AlreadyGranted => Ok(true),
+        BeginOutcome::Denied => Ok(false),
+        BeginOutcome::Joined { rx, .. } => Ok(rx.await.unwrap_or(false)),
+        BeginOutcome::Created {
+            req_id,
+            rx,
+            window_label,
+            deadline,
+        } => open_consent_window(app, state, &plugin_id, req_id, rx, window_label, deadline).await,
+    }
+}
 
-    let label = format!("consent-{}", req_id);
-    let win = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("src/consent.html".into()))
-        .title("权限确认")
-        .inner_size(420.0, 320.0)
-        .resizable(false)
-        .always_on_top(true)
-        .decorations(false)
-        .build()
-        .map_err(|e| {
-            state
-                .pending
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&req_id);
-            consent_window_error(e)
-        })?;
+/// 新组才走到这里。开窗前复核启用状态，开窗后复核 pending 是否仍在；
+/// 停用/卸载与首次开窗交错时，保证不留下没有 pending 的孤窗。
+async fn open_consent_window(
+    app: AppHandle,
+    state: &PermissionState,
+    plugin_id: &str,
+    req_id: String,
+    rx: oneshot::Receiver<bool>,
+    window_label: String,
+    deadline: Instant,
+) -> Result<bool, HostError> {
+    if !plugin_enabled_for_consent(
+        crate::services::enabled::list_ids(&app).as_deref(),
+        plugin_id,
+    ) {
+        resolve_consent(&app, state, &req_id, ConsentEnd::Disabled);
+        return Ok(false);
+    }
+    let win = match WebviewWindowBuilder::new(
+        &app,
+        &window_label,
+        WebviewUrl::App("src/consent.html".into()),
+    )
+    .title("权限确认")
+    .inner_size(420.0, 320.0)
+    .resizable(false)
+    .always_on_top(true)
+    .decorations(false)
+    .build()
+    {
+        Ok(win) => win,
+        Err(e) => {
+            resolve_consent(&app, state, &req_id, ConsentEnd::WindowFailed);
+            return Err(consent_window_error(e));
+        }
+    };
     let _ = win.set_focus();
-    // 用户把同意框直接关掉（Alt+F4 / 托盘退出等）时必须立刻按「拒绝」结束等待，
-    // 否则那次插件调用要空等满 60s 超时
+    // 用户把同意框直接关掉（Alt+F4 / 托盘退出等）时必须立刻收口整组等待方，
+    // 否则那次插件调用要空等满 60s 超时。
     {
         let app_for_close = app.clone();
         let req_for_close = req_id.clone();
@@ -338,28 +585,82 @@ async fn ask_user(
                 tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed
             ) {
                 if let Some(state) = app_for_close.try_state::<PermissionState>() {
-                    state.discard_pending(&req_for_close);
+                    resolve_consent(
+                        &app_for_close,
+                        state.inner(),
+                        &req_for_close,
+                        ConsentEnd::Closed,
+                    );
                 }
             }
         });
     }
+    if !state.pending_exists(&req_id) {
+        let _ = win.close();
+        return Ok(rx.await.unwrap_or(false));
+    }
+    spawn_consent_timeout(app, req_id.clone(), deadline);
+    Ok(rx.await.unwrap_or(false))
+}
 
-    let answer = tokio::time::timeout(std::time::Duration::from_secs(60), rx).await;
-    // 无论结果如何都清理窗口与挂起项
-    if let Some(w) = app.get_webview_window(&label) {
-        let _ = w.close();
+fn spawn_consent_timeout(app: AppHandle, req_id: String, deadline: Instant) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep_until(deadline).await;
+        if let Some(state) = app.try_state::<PermissionState>() {
+            resolve_consent(&app, state.inner(), &req_id, ConsentEnd::Timeout);
+        }
+    });
+}
+
+/// 统一收口：移除 pending、按类型授权/写拒绝锁、逐个 waiter 发送、关闭旧窗。
+/// 找不到 pending 时只尝试关掉旧 label（迟到 Destroyed/超时不能误伤新 pending）。
+fn resolve_consent(app: &AppHandle, state: &PermissionState, req_id: &str, end: ConsentEnd) {
+    match state.finish_consent(req_id, end) {
+        Ok(pending) => {
+            if end.grants() {
+                state.save();
+            }
+            deliver_pending(app, pending, end.grants());
+        }
+        Err(_) => {
+            if let Some(win) = app.get_webview_window(&format!("consent-{req_id}")) {
+                let _ = win.close();
+            }
+        }
     }
-    let pending = state
-        .pending
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .remove(&req_id);
-    if consent_outcome(answer.ok().and_then(|r| r.ok())) {
-        state.grant(&plugin_id, &capabilities);
-        return Ok(true);
+}
+
+fn deliver_pending(app: &AppHandle, pending: PendingConsent, granted: bool) {
+    // 单个 waiter 已离开不影响其余等待方；全部离开的情况已在 finish_consent 收口。
+    for sender in pending.waiters {
+        let _ = sender.send(granted);
     }
-    drop(pending);
-    Ok(false)
+    if let Some(win) = app.get_webview_window(&pending.window_label) {
+        let _ = win.close();
+    }
+}
+
+/// 停用/卸载时的取消入口。`clear_denied` 为 true 时同时清掉该插件的旧拒绝锁；
+/// 两者都不写新锁。找不到 pending 时仍可以只清锁（停用路径）。
+pub fn cancel_pending_for_plugin(app: &AppHandle, plugin_id: &str, clear_denied: bool) {
+    let state = app.state::<PermissionState>();
+    let req_id = {
+        let book = state.consent.lock().unwrap_or_else(|p| p.into_inner());
+        book.pending
+            .iter()
+            .find(|(_, pending)| pending.plugin_id == plugin_id)
+            .map(|(id, _)| id.clone())
+    };
+    if let Some(req_id) = req_id {
+        let end = if clear_denied {
+            ConsentEnd::Disabled
+        } else {
+            ConsentEnd::Uninstalled
+        };
+        resolve_consent(app, state.inner(), &req_id, end);
+    } else if clear_denied {
+        state.clear_denied(plugin_id);
+    }
 }
 
 /// 同意框开窗失败映射单列成函数：单测里构造不出 AppHandle，只有它能直连这条路径钉码
@@ -368,6 +669,8 @@ fn consent_window_error(e: tauri::Error) -> HostError {
 }
 
 /// 同意框的答复只有「明确答了是」才算授权：超时、通道断开、窗口被直接关掉一律按拒绝收口。
+/// 生产路径已按 ConsentEnd 收口；保留这层判定供既有语义单测。
+#[cfg(test)]
 fn consent_outcome(answered: Option<bool>) -> bool {
     matches!(answered, Some(true))
 }
@@ -388,9 +691,10 @@ fn assert_consent_caller(label: &str, req_id: &str) -> Result<(), HostError> {
 /// 拉取挂起同意请求的详情（ADR-0005：判定内核与开窗分开，单测直连这条路径钉码）
 fn pending_details(state: &PermissionState, req_id: &str) -> Result<ConsentDetails, HostError> {
     state
-        .pending
+        .consent
         .lock()
         .unwrap_or_else(|p| p.into_inner())
+        .pending
         .get(req_id)
         .map(|p| ConsentDetails {
             req_id: req_id.to_string(),
@@ -401,20 +705,22 @@ fn pending_details(state: &PermissionState, req_id: &str) -> Result<ConsentDetai
         .ok_or_else(|| HostError::new(NOT_FOUND, "request not found"))
 }
 
-/// 回传用户的决定（send 失败 = 等待方已经走了，不是用户答了什么）
+/// 回传用户的决定：allow 在 consent 锁内写内存授权，锁外落盘，再把 `true` 发给所有等待方；
+/// 全部 sender 已关闭时保持既有 `receiver dropped` 口径，不授权、不写拒绝锁。
 fn answer_pending(state: &PermissionState, req_id: &str, granted: bool) -> Result<(), HostError> {
-    let sender = state
-        .pending
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .remove(req_id)
-        .map(|p| p.sender);
-    match sender {
-        Some(tx) => tx
-            .send(granted)
-            .map_err(|_| HostError::new(INTERNAL, "receiver dropped")),
-        None => Err(HostError::new(NOT_FOUND, "request not found")),
+    let end = if granted {
+        ConsentEnd::Allow
+    } else {
+        ConsentEnd::Deny
+    };
+    let pending = state.finish_consent(req_id, end)?;
+    if granted {
+        state.save();
     }
+    for sender in pending.waiters {
+        let _ = sender.send(granted);
+    }
+    Ok(())
 }
 
 /// 同意框页面拉取详情
@@ -437,7 +743,10 @@ pub fn consent_answer(
     granted: bool,
 ) -> Result<(), HostError> {
     assert_consent_caller(window.label(), &req_id)?;
-    answer_pending(&state, &req_id, granted)
+    let result = answer_pending(&state, &req_id, granted);
+    // 无论答复是否被接受（例如全部等待方已离开），这扇窗都该关掉。
+    let _ = window.close();
+    result
 }
 
 /// 授权表：只认设置窗。插件 JS 就跑在宠物窗里，

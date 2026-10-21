@@ -30,6 +30,85 @@ fn deep_sorted(got: Vec<String>, want: Vec<String>) {
     assert_eq!(a, b, "授予结果（排序后）不符");
 }
 
+fn make_pending(
+    req_id: &str,
+    plugin_id: &str,
+    caps_list: &[&str],
+    waiters: Vec<oneshot::Sender<bool>>,
+) -> PendingConsent {
+    PendingConsent {
+        plugin_id: plugin_id.to_string(),
+        plugin_name: format!("{plugin_id}-name"),
+        caps: caps(caps_list),
+        waiters,
+        window_label: format!("consent-{req_id}"),
+        deadline: Instant::now() + CONSENT_TIMEOUT,
+    }
+}
+
+fn insert_pending(
+    state: &PermissionState,
+    req_id: &str,
+    plugin_id: &str,
+    caps_list: &[&str],
+) -> oneshot::Receiver<bool> {
+    let (tx, rx) = oneshot::channel();
+    state
+        .consent
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .pending
+        .insert(
+            req_id.to_string(),
+            make_pending(req_id, plugin_id, caps_list, vec![tx]),
+        );
+    rx
+}
+
+fn begin_with(
+    state: &PermissionState,
+    plugin_id: &str,
+    caps_list: &[&str],
+    req_id: &str,
+) -> BeginOutcome {
+    state.begin_consent(
+        plugin_id,
+        &format!("{plugin_id}-name"),
+        &caps(caps_list),
+        req_id.to_string(),
+        CONSENT_TIMEOUT,
+    )
+}
+
+fn pending_caps(state: &PermissionState, req_id: &str) -> Vec<String> {
+    state
+        .consent
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .pending
+        .get(req_id)
+        .map(|p| p.caps.clone())
+        .expect("pending 不存在")
+}
+
+fn pending_count(state: &PermissionState) -> usize {
+    state
+        .consent
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .pending
+        .len()
+}
+
+fn denied(state: &PermissionState, plugin_id: &str) -> bool {
+    state
+        .consent
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .denied
+        .contains(plugin_id)
+}
+
 #[test]
 fn check_capability_requires_valid_id_and_grant() {
     let state = PermissionState::new();
@@ -152,62 +231,77 @@ fn retain_known_prunes_orphans_and_persists() {
 }
 
 #[test]
-fn closing_the_consent_dialog_denies_the_waiting_call() {
-    // discard_pending 丢掉 sender 后等待方立刻拿到 Err ——
-    // permission_request 的 `_ => Ok(false)` 分支因此按拒绝返回，不必空等 60 秒超时
+fn closing_the_consent_dialog_denies_every_waiter() {
+    let state = PermissionState::new();
+    let rx = insert_pending(&state, "r-test", "todo", &["storage"]);
+    let pending = state
+        .finish_consent("r-test", ConsentEnd::Closed)
+        .expect("关闭收口应移除 pending");
+    for sender in pending.waiters {
+        let _ = sender.send(false);
+    }
+    assert!(
+        !rx.blocking_recv().unwrap(),
+        "关闭同意框后等待方必须以 false 结束"
+    );
+    assert_eq!(pending_count(&state), 0, "关闭要把挂起项清掉");
+    assert!(denied(&state, "todo"), "用户直接关窗按拒绝写拒绝锁");
+
+    // 不存在的 req_id 不能误伤别的挂起项，也不能写拒绝锁
+    let mut keep_rx = insert_pending(&state, "r-keep", "todo", &["notify"]);
+    assert!(
+        state
+            .finish_consent("r-not-exist", ConsentEnd::Closed)
+            .is_err(),
+        "按 req_id 精确收口"
+    );
+    assert_eq!(pending_count(&state), 1, "别的 pending 不受影响");
+    assert!(
+        matches!(keep_rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+        "被误伤的 waiter 不该提前收到结果"
+    );
+}
+
+#[test]
+fn all_waiters_gone_returns_receiver_dropped_without_grant_or_lock() {
     let state = PermissionState::new();
     let (tx, rx) = oneshot::channel::<bool>();
+    drop(rx);
     state
-        .pending
+        .consent
         .lock()
         .unwrap_or_else(|p| p.into_inner())
+        .pending
         .insert(
-            "r-test".to_string(),
-            PendingConsent {
-                sender: tx,
-                plugin_id: "todo".to_string(),
-                plugin_name: "待办".to_string(),
-                caps: caps(&["storage"]),
-            },
+            "r-gone".to_string(),
+            make_pending("r-gone", "todo", &["storage"], vec![tx]),
         );
-    state.discard_pending("r-test");
-    assert!(
-        rx.blocking_recv().is_err(),
-        "关闭同意框后等待方必须以 Err 结束"
-    );
-    assert!(
-        state
-            .pending
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .is_empty(),
-        "discard 要把挂起项清掉，不然它永远留在表里"
-    );
+    let err = answer_pending(&state, "r-gone", true).unwrap_err();
+    assert_eq!(err.code, INTERNAL, "全部等待方离开仍是 receiver dropped");
+    assert_eq!(err.message, "receiver dropped");
+    assert_eq!(pending_count(&state), 0, "pending 已被移除");
+    assert!(!state.is_granted("todo", "storage"), "不授权");
+    assert!(!denied(&state, "todo"), "不写拒绝锁");
+}
 
-    // 不存在的 req_id 不能误伤别的挂起项
-    let (tx2, _rx2) = oneshot::channel::<bool>();
+#[test]
+fn partial_waiter_gone_does_not_block_the_rest() {
+    let state = PermissionState::new();
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+    drop(rx1);
     state
-        .pending
+        .consent
         .lock()
         .unwrap_or_else(|p| p.into_inner())
+        .pending
         .insert(
-            "r-keep".to_string(),
-            PendingConsent {
-                sender: tx2,
-                plugin_id: "todo".to_string(),
-                plugin_name: "待办".to_string(),
-                caps: caps(&["notify"]),
-            },
+            "r-part".to_string(),
+            make_pending("r-part", "todo", &["storage"], vec![tx1, tx2]),
         );
-    state.discard_pending("r-not-exist");
-    assert!(
-        state
-            .pending
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains_key("r-keep"),
-        "按 req_id 精确丢弃"
-    );
+    answer_pending(&state, "r-part", true).expect("还有活着的 waiter，答复应成功");
+    assert!(rx2.blocking_recv().unwrap(), "活着的 waiter 收到 true");
+    assert!(state.is_granted("todo", "storage"), "授权仍生效");
 }
 
 #[test]
@@ -332,19 +426,14 @@ fn consent_details_missing_request_is_not_found() {
     assert_eq!(err.message, "request not found");
 
     let (tx, _rx) = oneshot::channel::<bool>();
+    let mut pending = make_pending("r-1", "todo", &["storage"], vec![tx]);
+    pending.plugin_name = "待办".to_string();
     state
-        .pending
+        .consent
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert(
-            "r-1".to_string(),
-            PendingConsent {
-                sender: tx,
-                plugin_id: "todo".to_string(),
-                plugin_name: "待办".to_string(),
-                caps: caps(&["storage"]),
-            },
-        );
+        .pending
+        .insert("r-1".to_string(), pending);
     let d = pending_details(&state, "r-1").unwrap();
     assert_eq!(d.req_id, "r-1");
     assert_eq!(d.plugin_id, "todo");
@@ -364,54 +453,348 @@ fn consent_answer_reports_not_found_and_dropped_receiver() {
     let (tx, rx) = oneshot::channel::<bool>();
     drop(rx);
     state
-        .pending
+        .consent
         .lock()
         .unwrap_or_else(|p| p.into_inner())
+        .pending
         .insert(
             "r-2".to_string(),
-            PendingConsent {
-                sender: tx,
-                plugin_id: "todo".to_string(),
-                plugin_name: "待办".to_string(),
-                caps: caps(&["storage"]),
-            },
+            make_pending("r-2", "todo", &["storage"], vec![tx]),
         );
     let dropped = answer_pending(&state, "r-2", true).unwrap_err();
     assert_eq!(dropped.code, INTERNAL, "通道断开是宿主内部时序");
     assert_eq!(dropped.message, "receiver dropped");
+    assert!(!state.is_granted("todo", "storage"), "全部离开不授权");
+    assert!(!denied(&state, "todo"), "全部离开不写拒绝锁");
 }
 
-/// consent_answer：用户的决定要送达等待方，回传即出队（窗口关闭那一路靠 discard_pending）
+/// consent_answer：用户的决定要送达等待方，回传即出队
 #[test]
 fn consent_answer_delivers_the_decision_and_clears_the_pending_item() {
     let state = PermissionState::new();
     let (tx, rx) = oneshot::channel::<bool>();
     state
-        .pending
+        .consent
         .lock()
         .unwrap_or_else(|p| p.into_inner())
+        .pending
         .insert(
             "r-3".to_string(),
-            PendingConsent {
-                sender: tx,
-                plugin_id: "todo".to_string(),
-                plugin_name: "待办".to_string(),
-                caps: caps(&["storage"]),
-            },
+            make_pending("r-3", "todo", &["storage"], vec![tx]),
         );
     assert!(answer_pending(&state, "r-3", true).is_ok());
     assert!(
         rx.blocking_recv().unwrap(),
         "用户按了允许，等待方要收到 true"
     );
+    assert_eq!(pending_count(&state), 0, "回传即出队");
+    assert!(state.is_granted("todo", "storage"));
+}
+
+#[test]
+fn same_plugin_requests_share_one_pending_req_and_union_caps() {
+    let state = PermissionState::new();
+    let rx1 = match begin_with(&state, "todo", &["storage"], "r-1") {
+        BeginOutcome::Created { rx, .. } => rx,
+        _ => panic!("第一次请求应创建 pending"),
+    };
+    let rx2 = match begin_with(&state, "todo", &["notify", "storage"], "r-2") {
+        BeginOutcome::Joined { rx, .. } => rx,
+        _ => panic!("第二次请求应合流到已有 pending"),
+    };
+    assert_eq!(pending_count(&state), 1, "同一插件只能有一个 pending");
+    assert_eq!(
+        pending_caps(&state, "r-1"),
+        caps(&["storage", "notify"]),
+        "能力并集、去重、保序"
+    );
     assert!(
         !state
-            .pending
+            .consent
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .contains_key("r-3"),
-        "回传即出队"
+            .pending
+            .contains_key("r-2"),
+        "第二个 req_id 不得新建 pending"
     );
+    answer_pending(&state, "r-1", true).unwrap();
+    assert!(rx1.blocking_recv().unwrap(), "第一个 waiter 收到 true");
+    assert!(rx2.blocking_recv().unwrap(), "第二个 waiter 收到 true");
+    assert!(state.is_granted("todo", "storage"));
+    assert!(state.is_granted("todo", "notify"));
+    // allow 的内存授权与 pending 移除在同一把 consent 锁里完成；紧接着的新请求不能重新开 pending
+    assert!(matches!(
+        begin_with(&state, "todo", &["storage", "notify"], "r-3"),
+        BeginOutcome::AlreadyGranted
+    ));
+    assert_eq!(pending_count(&state), 0);
+}
+
+#[test]
+fn append_filters_granted_and_dedupes() {
+    let state = PermissionState::new();
+    state.grant("todo", &caps(&["storage"]));
+    let _rx = match begin_with(&state, "todo", &["storage", "storage", "notify"], "r-1") {
+        BeginOutcome::Created { rx, .. } => rx,
+        _ => panic!("未授权的 notify 应创建 pending"),
+    };
+    assert_eq!(
+        pending_caps(&state, "r-1"),
+        caps(&["notify"]),
+        "已授权与重复能力都不进 pending"
+    );
+    let _rx2 = match begin_with(&state, "todo", &["notify", "widget"], "r-2") {
+        BeginOutcome::Joined { rx, .. } => rx,
+        _ => panic!("新能力应追加到同一 pending"),
+    };
+    assert_eq!(
+        pending_caps(&state, "r-1"),
+        caps(&["notify", "widget"]),
+        "追加只补新能力"
+    );
+}
+
+#[test]
+fn already_granted_does_not_create_pending() {
+    let state = PermissionState::new();
+    state.grant("todo", &caps(&["storage"]));
+    assert!(matches!(
+        begin_with(&state, "todo", &["storage"], "r-1"),
+        BeginOutcome::AlreadyGranted
+    ));
+    assert_eq!(pending_count(&state), 0);
+}
+
+#[test]
+fn denial_lock_blocks_new_requests_until_disable_clears_it() {
+    let state = PermissionState::new();
+    let _rx = match begin_with(&state, "todo", &["storage"], "r-1") {
+        BeginOutcome::Created { rx, .. } => rx,
+        _ => panic!("应创建 pending"),
+    };
+    answer_pending(&state, "r-1", false).unwrap();
+    assert!(denied(&state, "todo"));
+    assert!(!state.is_granted("todo", "storage"), "拒绝后新增能力不授权");
+    assert!(matches!(
+        begin_with(&state, "todo", &["notify"], "r-2"),
+        BeginOutcome::Denied
+    ));
+    assert_eq!(pending_count(&state), 0, "拒绝锁命中时不开 pending");
+
+    // 停用无 pending 时只清锁；清完可再次申请
+    state.clear_denied("todo");
+    assert!(!denied(&state, "todo"));
+    assert!(matches!(
+        begin_with(&state, "todo", &["notify"], "r-3"),
+        BeginOutcome::Created { .. }
+    ));
+}
+
+#[test]
+fn disable_cancels_pending_and_clears_denial_lock() {
+    let state = PermissionState::new();
+    let rx = insert_pending(&state, "r-1", "todo", &["storage"]);
+    state
+        .consent
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .denied
+        .insert("todo".to_string());
+    let pending = state
+        .finish_consent("r-1", ConsentEnd::Disabled)
+        .expect("停用应移除 pending");
+    for sender in pending.waiters {
+        let _ = sender.send(false);
+    }
+    assert!(!rx.blocking_recv().unwrap(), "停用等待方收到 false");
+    assert_eq!(pending_count(&state), 0);
+    assert!(!denied(&state, "todo"), "停用清除旧拒绝锁");
+}
+
+#[test]
+fn uninstall_cancels_pending_without_clearing_denial_lock() {
+    let state = PermissionState::new();
+    let rx = insert_pending(&state, "r-1", "todo", &["storage"]);
+    state
+        .consent
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .denied
+        .insert("todo".to_string());
+    let pending = state
+        .finish_consent("r-1", ConsentEnd::Uninstalled)
+        .expect("卸载应移除 pending");
+    for sender in pending.waiters {
+        let _ = sender.send(false);
+    }
+    assert!(!rx.blocking_recv().unwrap(), "卸载等待方收到 false");
+    assert_eq!(pending_count(&state), 0);
+    assert!(denied(&state, "todo"), "卸载不清拒绝锁");
+}
+
+#[test]
+fn timeout_and_close_latch_unless_all_waiters_are_gone() {
+    for end in [ConsentEnd::Timeout, ConsentEnd::Closed] {
+        let state = PermissionState::new();
+        let rx = insert_pending(&state, "r-1", "todo", &["storage"]);
+        let pending = state.finish_consent("r-1", end).expect("超时/关窗应收口");
+        for sender in pending.waiters {
+            let _ = sender.send(false);
+        }
+        assert!(!rx.blocking_recv().unwrap());
+        assert!(denied(&state, "todo"), "有等待方时超时/关窗写拒绝锁");
+    }
+
+    let state = PermissionState::new();
+    let (tx, rx) = oneshot::channel::<bool>();
+    drop(rx);
+    state
+        .consent
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .pending
+        .insert(
+            "r-2".to_string(),
+            make_pending("r-2", "todo", &["storage"], vec![tx]),
+        );
+    let err = state
+        .finish_consent("r-2", ConsentEnd::Timeout)
+        .err()
+        .expect("全部等待方离开应返回 receiver dropped");
+    assert_eq!(err.code, INTERNAL);
+    assert!(!denied(&state, "todo"), "全部等待方离开时不写拒绝锁");
+}
+
+#[test]
+fn late_old_end_does_not_touch_new_pending_or_denial_lock() {
+    let state = PermissionState::new();
+    let _old_rx = match begin_with(&state, "todo", &["storage"], "r-old") {
+        BeginOutcome::Created { rx, .. } => rx,
+        _ => panic!("旧请求应创建 pending"),
+    };
+    answer_pending(&state, "r-old", true).unwrap();
+    let _new_rx = match begin_with(&state, "todo", &["notify"], "r-new") {
+        BeginOutcome::Created { rx, .. } => rx,
+        _ => panic!("新请求应创建 pending"),
+    };
+    for end in [ConsentEnd::Timeout, ConsentEnd::Closed] {
+        assert!(
+            state.finish_consent("r-old", end).is_err(),
+            "迟到的旧 {:?} 只能 no-op",
+            end
+        );
+    }
+    assert_eq!(pending_count(&state), 1, "新 pending 必须还在");
+    assert!(!denied(&state, "todo"), "迟到旧事件不能写拒绝锁");
+    assert!(state
+        .consent
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .pending
+        .contains_key("r-new"));
+}
+
+#[test]
+fn window_failure_cleans_pending_without_latch() {
+    let state = PermissionState::new();
+    let rx = insert_pending(&state, "r-1", "todo", &["storage"]);
+    let pending = state
+        .finish_consent("r-1", ConsentEnd::WindowFailed)
+        .expect("开窗失败也要移除 pending");
+    for sender in pending.waiters {
+        let _ = sender.send(false);
+    }
+    assert!(!rx.blocking_recv().unwrap());
+    assert_eq!(pending_count(&state), 0);
+    assert!(!denied(&state, "todo"), "开窗失败不写拒绝锁");
+    assert!(!state.is_granted("todo", "storage"));
+}
+
+#[test]
+fn answer_again_is_not_found() {
+    let state = PermissionState::new();
+    let _rx = match begin_with(&state, "todo", &["storage"], "r-1") {
+        BeginOutcome::Created { rx, .. } => rx,
+        _ => panic!("应创建 pending"),
+    };
+    answer_pending(&state, "r-1", true).unwrap();
+    let err = answer_pending(&state, "r-1", true).unwrap_err();
+    assert_eq!(err.code, NOT_FOUND);
+    assert_eq!(err.message, "request not found");
+}
+
+#[test]
+fn different_plugins_never_merge() {
+    let state = PermissionState::new();
+    let a = matches!(
+        begin_with(&state, "zz.status", &["pet:say"], "r-a"),
+        BeginOutcome::Created { .. }
+    );
+    let b = matches!(
+        begin_with(&state, "zz.status2", &["pet:say"], "r-b"),
+        BeginOutcome::Created { .. }
+    );
+    assert!(a && b, "不同插件即使能力相同也各自创建 pending");
+    assert_eq!(pending_count(&state), 2);
+}
+
+#[test]
+fn enabled_gate_requires_plugin_in_list() {
+    assert!(
+        !plugin_enabled_for_consent(None, "todo"),
+        "清单缺失按未启用处理"
+    );
+    assert!(
+        !plugin_enabled_for_consent(Some(&[]), "todo"),
+        "空清单 = 全部停用"
+    );
+    assert!(
+        !plugin_enabled_for_consent(Some(&["zz.other".to_string()]), "todo"),
+        "别的插件启用不代表自己启用"
+    );
+    assert!(plugin_enabled_for_consent(
+        Some(&["todo".to_string()]),
+        "todo"
+    ));
+}
+
+#[test]
+fn request_and_window_paths_keep_the_gate_and_post_build_check() {
+    // 变异 M5「启用门禁恒真」与「开窗后不复核 pending」都必须至少被文本钉住一处；
+    // 行为判据在 enabled_gate_requires_plugin_in_list 与 cancelled_before_window_opens_leaves_no_pending。
+    let source = include_str!("permission.rs");
+    assert!(source.contains("plugin_enabled_for_consent("));
+    assert!(source.contains("crate::services::enabled::list_ids(&app)"));
+    assert!(source.contains("if !state.pending_exists(&req_id)"));
+}
+
+#[test]
+fn orphan_pending_ids_only_returns_uninstalled() {
+    let pending = vec!["zz.a".to_string(), "zz.b".to_string(), "zz.a".to_string()];
+    let known: HashSet<String> = ["zz.a".to_string()].into_iter().collect();
+    assert_eq!(
+        orphan_pending_ids(&pending, &known),
+        vec!["zz.b".to_string()]
+    );
+    assert!(orphan_pending_ids(&[], &known).is_empty());
+}
+
+#[test]
+fn cancelled_before_window_opens_leaves_no_pending() {
+    let state = PermissionState::new();
+    let rx = match begin_with(&state, "todo", &["storage"], "r-1") {
+        BeginOutcome::Created { rx, .. } => rx,
+        _ => panic!("应创建 pending"),
+    };
+    let pending = state
+        .finish_consent("r-1", ConsentEnd::Disabled)
+        .expect("开窗前取消应移除 pending");
+    for sender in pending.waiters {
+        let _ = sender.send(false);
+    }
+    assert!(!rx.blocking_recv().unwrap());
+    assert!(!state.pending_exists("r-1"), "开窗后复核应为 false");
+    assert_eq!(pending_count(&state), 0);
 }
 
 /// permission_list：体内没有错误产生点，唯一失败链是 gate（真实窗口单测构造不出来），
