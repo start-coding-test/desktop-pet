@@ -180,6 +180,11 @@ const PRESEED_STATUS_MANIFEST = (id) => ({
   description: "验证气泡常驻行的显示、仲裁与回收（B3）。",
 });
 
+/** C2：只剔除清单里的 zz.*，保留其它插件启停状态；纯函数，供 dev-debug 与干跑共用。 */
+export function prunePreseedEnabledIds(ids) {
+  return ids.filter((id) => !String(id).startsWith("zz."));
+}
+
 export const PRESEED_PLUGIN_IDS = [
   PRESEED_PROBE_ID,
   PRESEED_NET_ID,

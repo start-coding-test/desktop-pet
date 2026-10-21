@@ -4,7 +4,12 @@ import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { argv, env, platform } from "node:process";
-import { clearPreseedFixtures, removePreseedFixtures, writePreseedFixtures } from "../tests/e2e/harness/fixtures.mjs";
+import {
+  clearPreseedFixtures,
+  prunePreseedEnabledIds,
+  removePreseedFixtures,
+  writePreseedFixtures,
+} from "../tests/e2e/harness/fixtures.mjs";
 
 const port = env.CDP_PORT ?? argv.find((a) => a.startsWith("--port="))?.split("=")[1] ?? "9223";
 const GATE = env.GITHUB_ACTIONS === "true" || env.PET_E2E_PRESEED === "1";
@@ -20,7 +25,7 @@ function prunePreseedEnabled() {
   if (!existsSync(file)) return;
   const parsed = JSON.parse(readFileSync(file, "utf8"));
   if (!Array.isArray(parsed?.ids)) throw new Error("plugins-enabled.json 缺 ids 数组");
-  const kept = parsed.ids.filter((id) => !String(id).startsWith("zz."));
+  const kept = prunePreseedEnabledIds(parsed.ids);
   if (kept.length === parsed.ids.length) return;
   const tmp = `${file}.d07.tmp`;
   writeFileSync(tmp, JSON.stringify({ ...parsed, ids: kept }, null, 2));
