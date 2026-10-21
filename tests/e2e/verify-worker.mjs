@@ -17,6 +17,7 @@ import {
   listPages,
   openSettingsInvoker,
   readEnabledIds,
+  reconcilePetWindow,
   reloadAndWait,
   waitUntil,
   writeEnabledIds,
@@ -119,6 +120,8 @@ try {
   await sleep(1200);
   const enabled = [...new Set([...safeOrigEnabled, PROBE])];
   await writeEnabledIds(settings.invoke, enabled);
+  // 先把上一套件可能仍在活着的 HR/status 探针真正下线，再 reload；只改清单不会停 JS。
+  await reconcilePetWindow(c);
   await reloadAndWait(c);
   r.check(
     "探针在 Worker 里 activate 成功",
