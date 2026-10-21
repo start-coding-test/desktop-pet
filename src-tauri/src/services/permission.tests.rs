@@ -766,6 +766,33 @@ fn request_and_window_paths_keep_the_gate_and_post_build_check() {
     assert!(source.contains("plugin_enabled_for_consent("));
     assert!(source.contains("crate::services::enabled::list_ids(&app)"));
     assert!(source.contains("if !state.pending_exists(&req_id)"));
+    // D08：旧 contains 会被定义行/另一处调用点满足，删一个调用点仍绿。
+    // 先过滤以 // 开头的注释行（注释掉的调用块不计数），再按 `if !` 前缀精确计数；
+    // 定义行 `fn plugin_enabled_for_consent` 不带 `if !`，不会被计入。
+    let production = source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let count = |needle: &str| production.matches(needle).count();
+    assert_eq!(
+        count("if !plugin_enabled_for_consent("),
+        2,
+        "启用门禁调用点应恰 2 处（定义行不计），实际 {}",
+        count("if !plugin_enabled_for_consent(")
+    );
+    assert_eq!(
+        count("crate::services::enabled::list_ids(&app)"),
+        2,
+        "启用清单调用点应恰 2 处，实际 {}",
+        count("crate::services::enabled::list_ids(&app)")
+    );
+    assert_eq!(
+        count("if !state.pending_exists(&req_id)"),
+        1,
+        "开窗后 pending 复核应恰 1 处，实际 {}",
+        count("if !state.pending_exists(&req_id)")
+    );
 }
 
 #[test]
