@@ -84,6 +84,16 @@
 - Agent watcher 的偏移只在**真的消费掉整行**之后才前进（`complete_line_prefix` 有单测）：以前先写偏移再读，hook 写一半时那批事件永久丢
 
 - **插件样式注入契约暂不收紧**：打包版 CSP 的 `style-src` 保留 `'unsafe-inline'` —— 三个示例插件都用「运行时往自己的 Shadow Root 注入样式表」的写法，且 `tests/e2e/verify-release.mjs` 里有一条断言在替第三方插件作者钉这个契约；真要收紧必须先做 Web Worker 宿主并逐条实测 U-1…U-7。另一类（markup 里的内联 `style=` 属性）已由 M2a 清零，所以这条豁免只覆盖「style 元素」。取舍全文见 [ADR-0004](docs/adr/0004-style-src-unsafe-inline-kept.md)
+### 从 AGENTS.md 搬入：安全边界共识、Rust 侧已覆盖范围、CSP 生效面（A17，2026-10-22）
+
+下面三段正文自 `AGENTS.md` 原样搬入，一字未改（只改实测数字这条也遵守：本节没有数字需要改）；搬出原因是 R-F 给 `AGENTS.md` 的预算只有 6000 字节，而它每次会话整份进上下文。出处按搬运前的行号记：`AGENTS.md` 原第 25 / 27 / 29 行。
+
+**安全边界共识**：进程内 JS 插件不是硬安全边界，v1 以「manifest 权限声明 + 能力校验 + 首次授权弹窗」做策略层；桥接 API 面向未来设计，后续可平滑切换到 Web Worker 宿主实现真隔离。为此插件不得直接操作 DOM/画布，widget 一律运行在各自的 Shadow DOM 容器内。
+
+已落到 Rust 侧、有回归断言覆盖的部分：请求的能力必须等于 manifest 声明（`http:<host>` 视为被 `http` 覆盖）、同意框只能由它自己的窗口应答且插件名只认磁盘 manifest、插件目录名必须等于 manifest.id、`bus_publish` 的 origin 由宿主按调用窗口判定、存储按 id 隔离且原子写、订阅侧只认公开 topic。**仍然拦不住的**：同 realm 的插件自己 `import { invoke }` 绕过 JS 桥（多插件共用宠物窗，宿主无法从窗口身份区分是哪个插件）—— 这条要等 Web Worker 宿主才能收口，改动时不要假装它已解决；`settings` 区点名落宿主 realm 那条已收口（S3）：一律进 Worker，例外只对 badge / overlay 生效。
+
+**CSP 只在打包产物生效**：`tauri dev` 的文档由 Vite 直出，Tauri 没有注入点，`devCsp` 同样无效；打包版则以 `content-security-policy` **响应头**下发（文档里没有 meta）。判 CSP 是否强制不能用 CDP/DevTools 发起的求值（不受 CSP 约束），要看页面自身代码的副作用。
+
 
 ## 其余约定
 
