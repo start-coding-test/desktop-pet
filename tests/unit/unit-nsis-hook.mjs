@@ -37,6 +37,26 @@ const hook = hookExists ? read(hookRel) : "";
 const cargoName = read("src-tauri/Cargo.toml").match(/^\[package\][^[]*?^\s*name\s*=\s*"([^"]+)"/m)?.[1];
 check("Cargo.toml 里读得到二进制名", typeof cargoName === "string" && cargoName !== "", String(cargoName));
 
+// A13 删掉的 MAINBINARYNAME 兜底必须永远回不来：installer.nsi 先 include 钩子文件（line 32），
+// 之后才无条件 !define MAINBINARYNAME（line 48）；钩子里再定义一次就是 makensis 的致命重定义错误，
+// L5.2 的 `npm run tauri build` 两次都红在这里。
+// 只扫非注释行：文件头那段说明注释里就有 "!define" 与 "MAINBINARYNAME" 两个词，全文正则会自己判红。
+const defineHits = hook
+  .split(/\r?\n/)
+  .map((text, i) => ({ no: i + 1, text }))
+  .filter(({ text }) => {
+    const head = text.replace(/^\s+/, "");
+    return head !== "" && !head.startsWith(";") && !head.startsWith("#");
+  })
+  .filter(({ text }) => /^\s*!define\s+MAINBINARYNAME\b/i.test(text));
+check(
+  "钩子文件不得定义 MAINBINARYNAME（模板会无条件 !define，撞名致 makensis 失败）",
+  defineHits.length === 0,
+  defineHits.length
+    ? defineHits.map((h) => `命中 ${h.no}: ${h.text}`).join(" | ")
+    : "非注释行里没有 MAINBINARYNAME 定义",
+);
+
 group("NSIS_HOOK_PREUNINSTALL 宏");
 check("定义了 NSIS_HOOK_PREUNINSTALL", hook.includes("!macro NSIS_HOOK_PREUNINSTALL"));
 // 空文件会让「两边都是 0」成立，所以先要求至少有一个宏 —— 否则这条判据是空转的
