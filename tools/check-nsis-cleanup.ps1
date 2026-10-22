@@ -183,7 +183,10 @@ function Invoke-Uninstaller([string] $dir) {
   $p = Start-Process -FilePath $un -ArgumentList "/S" -Wait -PassThru
   return $p.ExitCode
 }
-function Ok-Exit($rc) { return (($null -eq $rc) -or ($rc -eq 0)) }
+# A GUI-subsystem child that PowerShell never waited for hands back a $null ExitCode.
+# Reading that as OK was the false green this fix removes: an unavailable exit code is
+# a hard failure, and the N1-N3 checks next to each consumer name it in the FAIL line.
+function Ok-Exit($rc) { return ($null -ne $rc -and $rc -eq 0) }
 function Clean-Dir([string] $dir) {
   if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
   New-Item -ItemType Directory -Force -Path $dir | Out-Null
@@ -194,6 +197,7 @@ $rootA = if ($InstallRoot) { $InstallRoot } else { Join-Path $env:TEMP ("pet-nsi
 Step "case A: silent install -> seed -> real uninstall through NSIS"
 Clean-Dir $rootA
 $rc = Invoke-Installer @("/S", "/D=$rootA")
+Check ($null -ne $rc) "silent install ExitCode captured" "exit code unavailable from the installer"
 Check (Ok-Exit $rc) ("silent install exit " + $rc) ("silent install failed with exit " + $rc)
 $exePath = Join-Path $rootA ($exeName + ".exe")
 Check (Test-Path $exePath) ("installed binary present: " + $exePath) ("installed binary missing: " + $exePath)
@@ -207,17 +211,39 @@ Check ($foreignSeeded -ge 3) ("fixture keeps " + $foreignSeeded + " user/unrelat
 
 # run the CLI branch on its own first: a red Case A can then be told apart from
 Step "case A.1: the --pet-hook-cleanup branch on its own"
-$cliOut = (& $exePath --pet-hook-cleanup 2>&1) | Out-String
-$cliRc = $LASTEXITCODE
+# desktop-pet.exe is a GUI-subsystem binary, so `& $exe ... 2>&1 | Out-String` neither
+# waited for it nor handed it a stdout handle: the old measurement got a $null exit
+# code (which Ok-Exit used to read as OK), an empty stdout, and it counted the entries
+# while the cleaner was still running. Start-Process -Wait only returns once the
+# process is gone, -PassThru gives the real ExitCode, -NoNewWindow with
+# -RedirectStandardOutput gives the child a handle it can actually write into.
+# run_cleanup_cli puts failure detail on stderr, so that gets a file too -- it is
+# printed only as a diagnostic when the result line is missing; no judgment reads it.
+$cliOutFile = Join-Path $env:TEMP ("pet-nsis-cleanup-stdout-" + $PID + ".txt")
+$cliErrFile = Join-Path $env:TEMP ("pet-nsis-cleanup-stderr-" + $PID + ".txt")
+$cli = Start-Process -FilePath $exePath -ArgumentList "--pet-hook-cleanup" -Wait -PassThru -NoNewWindow -RedirectStandardOutput $cliOutFile -RedirectStandardError $cliErrFile
+$cliRc = $cli.ExitCode
+# read AFTER the process exited; a missing or unreadable file normalises to "" so the
+# judgment line below cannot throw and swallow the checks that follow -- "" still FAILs
+$cliOut = Read-Text $cliOutFile
+if ($null -eq $cliOut) { $cliOut = "" }
+$cliErr = Read-Text $cliErrFile
+if ($null -eq $cliErr) { $cliErr = "" }
+Check ($null -ne $cliRc) "--pet-hook-cleanup ExitCode captured" "exit code unavailable from --pet-hook-cleanup"
 Check (Ok-Exit $cliRc) "--pet-hook-cleanup exit code 0" ("--pet-hook-cleanup exit code " + $cliRc)
 Check ($cliOut -match "result=done") ("stdout: " + $cliOut.Trim()) "stdout had no result=done line"
+if ($cliOut -notmatch "result=done" -and $cliErr.Trim() -ne "") {
+  Note ("cleanup stderr (diagnostic only): " + $cliErr.Trim())
+}
 Check ((Count-Ours) -eq 0) "CLI branch stripped every managed entry" ("CLI branch left " + (Count-Ours) + " entries")
 Check ((Count-Foreign) -eq $foreignSeeded) "CLI branch kept user entries and other keys" "CLI branch changed the foreign/unrelated keys"
+Remove-Item -Force -ErrorAction SilentlyContinue $cliOutFile, $cliErrFile
 
 Step "case A.2: uninstall through NSIS (this is what the hook must do)"
 Seed-Config $exePath
 Check ((Count-Ours) -gt 0) "re-seeded before the uninstaller run" "re-seeding produced nothing"
 $rc = Invoke-Uninstaller $rootA
+Check ($null -ne $rc) "uninstaller ExitCode captured" "exit code unavailable from the uninstaller"
 Check (Ok-Exit $rc) ("uninstaller exit " + $rc) ("uninstaller exit " + $rc)
 Check ((Count-Ours) -eq 0) "NSIS uninstall stripped our entries (hook fired)" ("our entries survived the uninstall: " + (Count-Ours))
 Check ((Count-Foreign) -eq $foreignSeeded) "uninstall kept user entries and other keys" "uninstall changed the foreign/unrelated keys"
