@@ -26,11 +26,8 @@
 ;   The ExecWait exit code is printed and never branched on. A failed cleanup must not
 ;   block the uninstall -- that is the whole point of doing it here.
 
-; The template defines MAINBINARYNAME from the cargo binary name. Keep a fallback so
-; this file also compiles if it ever gets included before that define.
-!ifndef MAINBINARYNAME
-  !define MAINBINARYNAME "desktop-pet"
-!endif
+; Never define MAINBINARYNAME in this file: installer.nsi includes it (line 32) BEFORE its own
+; unconditional define (line 48), so a fallback here collides -- ${MAINBINARYNAME} expands at !insertmacro time.
 
 !macro NSIS_HOOK_PREUNINSTALL
   ${If} $UpdateMode <> 1
