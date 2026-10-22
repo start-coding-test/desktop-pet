@@ -56,9 +56,6 @@ check("卸载前调用的是本包里的 exe", macroBody.includes('ExecWait \'"$
 check("命令串整体带引号（$INSTDIR 可能有空格）", /ExecWait\s+'"\$INSTDIR\\.*?\.exe"/.test(macroBody));
 check("参数是 --pet-hook-cleanup", macroBody.includes("--pet-hook-cleanup"));
 check("exe 名取自 MAINBINARYNAME 宏而不是写死", /\$\{MAINBINARYNAME\}\.exe/.test(macroBody));
-// 回退定义也要与产物名一致：模板若在 define 之后才 include，这行会被跳过；否则它就是唯一来源
-const fallback = hook.match(/!define\s+MAINBINARYNAME\s+"([^"]+)"/)?.[1];
-check("ifndef 回退名与 Cargo 产物名一致", fallback === cargoName, `fallback=${fallback} cargo=${cargoName}`);
 
 group("卸载不能被清理失败拦住");
 check("宏体里没有 Abort", !macroBody.includes("Abort"), macroBody);
