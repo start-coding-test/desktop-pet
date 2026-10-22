@@ -250,10 +250,15 @@ Check ((Count-Foreign) -eq $foreignSeeded) "uninstall kept user entries and othe
 Check (-not (Test-Path $exePath)) "installed binary removed by the uninstaller" "the exe is still there after uninstall"
 
 # --- Case B: silent overwrite must NOT strip ----------------------------------
+# B and C used to drop the exit code of every installer/uninstaller call: when an install
+# failed the managed-entry count simply stayed put, and that stayed read as "the hooks
+# survived". Same convention as case A -- keep the code, then fail hard when it is missing.
 $rootB = Join-Path $env:TEMP ("pet-nsis-B-" + $PID)
 Step "case B: silent overwrite install (the upgrade path)"
 Clean-Dir $rootB
-$null = Invoke-Installer @("/S", "/D=$rootB")
+$rcB1 = Invoke-Installer @("/S", "/D=$rootB")
+Check ($null -ne $rcB1) "case B: first install ExitCode captured" "case B: exit code unavailable from the first installer"
+Check (Ok-Exit $rcB1) ("case B: first silent install exit " + $rcB1) ("case B: first silent install failed with exit " + $rcB1)
 $exeB = Join-Path $rootB ($exeName + ".exe")
 if (-not (Test-Path $exeB)) {
   Fail "case B: install produced no binary"
@@ -261,10 +266,14 @@ if (-not (Test-Path $exeB)) {
   Seed-Config $exeB
   $beforeB = Count-Ours
   Check ($beforeB -gt 0) "seeded before the overwrite" "seeding produced nothing"
-  $null = Invoke-Installer @("/S", "/D=$rootB")
+  $rcBov = Invoke-Installer @("/S", "/D=$rootB")
+  Check ($null -ne $rcBov) "case B: overwrite ExitCode captured" "case B: exit code unavailable from the overwrite installer"
+  Check (Ok-Exit $rcBov) ("case B: silent overwrite exit " + $rcBov) ("case B: silent overwrite failed with exit " + $rcBov)
   $afterB = Count-Ours
   Check ($afterB -eq $beforeB) "silent overwrite kept the hooks in place" ("SILENT OVERWRITE STRIPPED THE HOOKS: " + $beforeB + " -> " + $afterB)
-  $null = Invoke-Uninstaller $rootB
+  $rcBu = Invoke-Uninstaller $rootB
+  Check ($null -ne $rcBu) "case B: uninstaller ExitCode captured" "case B: exit code unavailable from the uninstaller"
+  Check (Ok-Exit $rcBu) ("case B: uninstaller exit " + $rcBu) ("case B: uninstaller failed with exit " + $rcBu)
 }
 
 # --- Case C: passive overwrite, the known hole --------------------------------
@@ -275,14 +284,18 @@ Note "PageLeaveReinstall directly, and that path only appends /UPDATE when the"
 Note "installer itself was started with /UPDATE. So /P is the mode that may"
 Note "legitimately strip the hooks -- this case measures it, it does not assume."
 Clean-Dir $rootC
-$null = Invoke-Installer @("/S", "/D=$rootC")
+$rcC1 = Invoke-Installer @("/S", "/D=$rootC")
+Check ($null -ne $rcC1) "case C: first install ExitCode captured" "case C: exit code unavailable from the first installer"
+Check (Ok-Exit $rcC1) ("case C: first silent install exit " + $rcC1) ("case C: first silent install failed with exit " + $rcC1)
 $exeC = Join-Path $rootC ($exeName + ".exe")
 if (-not (Test-Path $exeC)) {
   Fail "case C: install produced no binary"
 } else {
   Seed-Config $exeC
   $beforeC = Count-Ours
-  $null = Invoke-Installer @("/P", "/D=$rootC")
+  $rcCp = Invoke-Installer @("/P", "/D=$rootC")
+  Check ($null -ne $rcCp) "case C: passive overwrite ExitCode captured" "case C: exit code unavailable from the passive overwrite"
+  Check (Ok-Exit $rcCp) ("case C: passive overwrite exit " + $rcCp) ("case C: passive overwrite failed with exit " + $rcCp)
   $afterC = Count-Ours
   if ($afterC -eq $beforeC) {
     Pass "passive overwrite kept the hooks"
@@ -292,9 +305,13 @@ if (-not (Test-Path $exeC)) {
     Note "from a genuine uninstall without reading the _?= parameter, which needs a"
     Note "Var of its own in the hook file. See the PR description for the follow-up."
     # install again so the exit assertion about leftovers still means something
-    $null = Invoke-Installer @("/S", "/D=$rootC")
+    $rcCr = Invoke-Installer @("/S", "/D=$rootC")
+    Check ($null -ne $rcCr) "case C: reinstall ExitCode captured" "case C: exit code unavailable from the reinstall"
+    Check (Ok-Exit $rcCr) ("case C: reinstall after strip exit " + $rcCr) ("case C: reinstall after strip failed with exit " + $rcCr)
   }
-  $null = Invoke-Uninstaller $rootC
+  $rcCu = Invoke-Uninstaller $rootC
+  Check ($null -ne $rcCu) "case C: uninstaller ExitCode captured" "case C: exit code unavailable from the uninstaller"
+  Check (Ok-Exit $rcCu) ("case C: uninstaller exit " + $rcCu) ("case C: uninstaller failed with exit " + $rcCu)
 }
 
 Step "final state"
