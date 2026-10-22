@@ -1,6 +1,6 @@
 [package]
 name = "desktop-pet"
-version = "0.2.0"
+version = "0.2.1"
 description = "Plugin-driven Windows desktop pet"
 # 与仓库归属一致公开身份（GitHub 账号），原先的 "DesktopPet" 是占位串，
 # 会原样进二进制的元数据
