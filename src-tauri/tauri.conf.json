@@ -33,7 +33,7 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "resources": ["../plugins/**/*"],
+    "resources": { "../plugins": "plugins/" },
     "windows": {
       "nsis": {
         "installerHooks": "windows/installer-hooks.nsi"

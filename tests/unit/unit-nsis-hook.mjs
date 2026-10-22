@@ -108,3 +108,31 @@ check("分流后调用的是 linkage 的清理实体", lib.includes("linkage::ru
 const cleanupAt = lib.indexOf("--pet-hook-cleanup");
 const builderAt = lib.indexOf("tauri::Builder::default()");
 check("分流排在建窗之前", cleanupAt >= 0 && cleanupAt < builderAt, `cleanup=${cleanupAt} builder=${builderAt}`);
+
+group("bundle.resources 真的投递到 plugins/<插件ID>/");
+// 两种写法都会静默丢插件，且都不出包就看不出来：
+// 数组形式里 `..` 被 tauri 渲染成字面目录 `_up_`，资源根下没有 plugins/；
+// 对象映射的源一旦含通配符就走 glob 分支，目标只取文件名 —— 五个插件的 manifest.json 同名互相覆盖。
+const judgeResources = (value) => {
+  const out = { object: false, mapped: false, noWildcard: false };
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return out;
+  out.object = true;
+  const entries = Object.entries(value);
+  out.mapped = entries.length > 0 && entries.every(([, to]) => typeof to === "string" && to.startsWith("plugins/"));
+  out.noWildcard = entries.length > 0 && entries.every(([from]) => !from.includes("*"));
+  return out;
+};
+const resources = conf?.bundle?.resources;
+const judged = judgeResources(resources);
+const dump = JSON.stringify(resources);
+check("bundle.resources 是对象映射而不是数组", judged.object, dump);
+check("每个源都有以 plugins/ 开头的目标（空串与缺失都判红）", judged.mapped, dump);
+check("bundle.resources 的源不含通配符（含则层级被拍平）", judged.noWildcard, dump);
+// 反向对照：同一组判定喂给两个历史反例，必须各自判假，防「怎么改都绿」的空判
+const arrayShape = judgeResources(["../plugins/**/*"]);
+const globShape = judgeResources({ "../plugins/**/*": "plugins/" });
+check(
+  "反向对照：数组形式被 object/mapped 拦下，glob 键只被 noWildcard 拦下",
+  !arrayShape.object && !arrayShape.mapped && globShape.object && globShape.mapped && !globShape.noWildcard,
+  JSON.stringify({ arrayShape, globShape }),
+);
