@@ -687,6 +687,64 @@ fn cancel_plan_disable_without_pending_clears_the_lock_so_a_new_request_can_open
     );
 }
 
+/// A22：现场形状的状态层复现 —— 风险能力被拒写了拒绝锁，用户去设置页关→开，
+/// 而那一次读不到旧启停清单（`previous = None`）。回退到宿主记得的锁集合后必须能重新开窗。
+/// 依赖 `enabled.rs` 的清锁决策，`latch_cleanup_targets` 是它抽出来的纯函数（同 `cancel_plan` 的理由）。
+#[test]
+fn unreadable_enabled_list_still_clears_the_latch_so_consent_can_open_again() {
+    use crate::services::enabled::latch_cleanup_targets;
+    let state = PermissionState::new();
+    let _rx = match begin_with(&state, "com.pet.goat-gauge", &["storage"], "r-1") {
+        BeginOutcome::Created { rx, .. } => rx,
+        _ => panic!("首次申请应开一扇窗"),
+    };
+    answer_pending(&state, "r-1", false).unwrap();
+    assert!(denied(&state, "com.pet.goat-gauge"), "拒绝要写拒绝锁");
+    assert!(
+        matches!(
+            begin_with(&state, "com.pet.goat-gauge", &["notify"], "r-2"),
+            BeginOutcome::Denied
+        ),
+        "同一启用周期内被拒后不重复骚扰"
+    );
+
+    // 关→开那一次：启停清单读不到（None），新清单里没有这个插件 = 它已被停用
+    let targets = latch_cleanup_targets(None, &[], &state.latched_plugin_ids());
+    for id in &targets {
+        state.clear_denied(id);
+    }
+    assert!(
+        !denied(&state, "com.pet.goat-gauge"),
+        "停用那一次即使读不到旧清单也必须清锁，否则同进程内永不再弹"
+    );
+    assert!(
+        matches!(
+            begin_with(&state, "com.pet.goat-gauge", &["notify"], "r-3"),
+            BeginOutcome::Created { .. }
+        ),
+        "清锁后同一能力必须重新开窗"
+    );
+}
+
+/// 文本钉（A22-D2 第 4 项）：停用清锁必须真的经纯函数路由，否则 `latch_cleanup_targets` 悬空，
+/// 上面那条测就只是在测一个没人调用的函数。
+#[test]
+fn disable_path_routes_latch_cleanup_through_the_pure_function() {
+    let source = include_str!("enabled.rs");
+    assert!(
+        source.contains("latch_cleanup_targets(previous, cleaned, &latched)"),
+        "停用清锁的决策必须在 latch_cleanup_targets 里做"
+    );
+    assert!(
+        source.contains("crate::services::permission::latched_plugin_ids(app)"),
+        "读不到旧清单时要拿宿主记得的锁集合当事实源"
+    );
+    assert!(
+        !source.contains("let Some(previous) = previous else"),
+        "旧的 None 早退必须消失 —— 留着它就是「读不到清单 → 整段不清锁」"
+    );
+}
+
 /// 卸载（`clear_denied = false`）：有 pending 也要收口，但收口类型必须是**不清锁**的 Uninstalled。
 #[test]
 fn cancel_plan_uninstall_resolves_as_uninstalled_and_keeps_the_lock() {

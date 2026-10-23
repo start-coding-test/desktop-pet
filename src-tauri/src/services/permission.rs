@@ -352,6 +352,15 @@ impl PermissionState {
             .remove(plugin_id);
     }
 
+    /// 当前持拒绝锁的插件 id（排序后返回，判据与日志才稳）。
+    /// 停用路径读不到旧启停清单时，这是「该清谁的锁」的唯一事实源。
+    fn latched_plugin_ids(&self) -> Vec<String> {
+        let book = self.consent.lock().unwrap_or_else(|p| p.into_inner());
+        let mut ids: Vec<String> = book.denied.iter().cloned().collect();
+        ids.sort();
+        ids
+    }
+
     pub fn list(&self) -> HashMap<String, Vec<String>> {
         self.granted
             .lock()
@@ -680,6 +689,11 @@ pub fn cancel_pending_for_plugin(app: &AppHandle, plugin_id: &str, clear_denied:
         CancelPlan::ClearDenied => state.clear_denied(plugin_id),
         CancelPlan::Nothing => {}
     }
+}
+
+/// 当前持拒绝锁的插件 id 列表，给启停编排用：读不到旧清单时它才是「该清谁的锁」的事实源。
+pub fn latched_plugin_ids(app: &AppHandle) -> Vec<String> {
+    app.state::<PermissionState>().latched_plugin_ids()
 }
 
 /// 同意框开窗失败映射单列成函数：单测里构造不出 AppHandle，只有它能直连这条路径钉码
