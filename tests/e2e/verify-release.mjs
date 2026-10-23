@@ -2,18 +2,120 @@
 // 自己拉起/回收 release exe —— 单实例按 identifier 抢占，跑之前必须先停掉 dev 实例。
 //   npm run verify:release              先 tauri build --no-bundle（约 3~4 分钟）
 //   npm run verify:release -- --skip-build
-import { spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { spawn, spawnSync } from "node:child_process";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { argv, env } from "node:process";
 
 import { attach, createReport, hostInvoke, listPages, openSettingsInvoker, readEnabledIds, reloadAndWait, waitUntil, writeEnabledIds } from "./harness/cdp.mjs";
 import { NET_ID, PROBE_ID, removeFixtures, writeFixtures } from "./harness/fixtures.mjs";
 import { WIDGET_HOST_REALM_FLAG, waitWidgetRealm } from "./harness/widget-realm.mjs";
 
+// ==== A20-PURE-BEGIN ====
+// 这一段只依赖入参与 node:path，不碰 fs、不读 process.env ——
+// temp/a20-pure-preview.mjs 按这对标记从**本文件的真实源码**里截取后执行（A20-D1 的 C4：不得手抄函数），
+// 所以 M1/M2/M3 改的就是这里，预演杀的就是改过的那一份。
+const AGENT_DIR_NAMES = [".qoder", ".qoder-cn", ".zcode", ".codex", ".workbuddy", ".codebuddy"];
+const AGENT_ENV_NAMES = ["PET_AGENT_CONFIG_FILES", "PET_AGENT_HOME", "PET_AGENT_INBOX"];
+
+/** 归一成「正斜杠 + 小写 + 无尾分隔符」的绝对路径；Windows 大小写不敏感，POSIX 上这样比更保守（宁可多判危险）。 */
+function normPath(p) {
+  return resolve(p)
+    .replace(/[\\/]+/g, "/")
+    .replace(/\/+$/, "")
+    .toLowerCase();
+}
+
+/** 验收标准 3：exe 位置尊重外部 `CARGO_TARGET_DIR`（空串按未设），次级来源 `CARGO_BUILD_TARGET_DIR`。
+ * 相对值不猜 cargo 的基准（是 cwd 还是 `src-tauri` 不确定），直接判错。 */
+function resolveReleaseExe(primary, secondary, repoRoot) {
+  const raw = [primary, secondary].find((v) => typeof v === "string" && v.trim() !== "");
+  if (raw === undefined) {
+    return {
+      absolute: true,
+      exe: join(repoRoot, "src-tauri", "target", "release", "desktop-pet.exe"),
+      source: "默认（仓库内 src-tauri/target）",
+    };
+  }
+  const value = raw.trim();
+  if (!isAbsolute(value)) return { absolute: false, exe: null, source: value, reason: "须为绝对路径" };
+  return { absolute: true, exe: join(resolve(value), "release", "desktop-pet.exe"), source: value };
+}
+
+/** 验收标准 4：`missing` / `stale` / `unknown` / `ok` —— 拿不到 mtime 或 git 时间时不默认放行。 */
+function exeFreshness(mtimeMs, commitMs) {
+  if (typeof mtimeMs !== "number") return "missing";
+  if (typeof commitMs !== "number") return "unknown";
+  return mtimeMs >= commitMs ? "ok" : "stale";
+}
+
+/** 验收标准 6：取值格式与 `tools/check-nsis-cleanup.ps1:41` 一致 —— CONFIG_FILES 是 `;` 连接的 json **文件**路径，
+ * HOME 与 INBOX 是隔离根下互不重叠的子目录。 */
+function agentPaths(isoRoot) {
+  return {
+    PET_AGENT_CONFIG_FILES: [join(isoRoot, "cfg-a.json"), join(isoRoot, "cfg-b.json")].join(";"),
+    PET_AGENT_HOME: join(isoRoot, "home"),
+    PET_AGENT_INBOX: join(isoRoot, "inbox"),
+  };
+}
+
+/** 要建的目录：隔离根 + HOME + INBOX（两个 cfg 文件直接落根下，父目录就是根） */
+function agentDirs(isoRoot) {
+  return [isoRoot, join(isoRoot, "home"), join(isoRoot, "inbox")];
+}
+
+/** 验收标准 7：外部同名变量解析后落在真实 home 的 agent 目录里 = 危险。
+ * 判据是「等于 `<home>/<名>`」或「以 `<home>/<名>/` 为前缀」—— 所以 `.qoder-cn2` 不算命中（M3 去掉那个 `/` 就会被杀）；
+ * `CONFIG_FILES` 先按 `;` 拆开逐个判；`PET_AGENT_HOME` 等于真实 home 本身也算（四家 agent 目录都建在它下面，见 claude_style.rs:182-184）。 */
+function agentEnvHazard(inputEnv, home) {
+  const hits = [];
+  if (typeof home !== "string" || home.trim() === "") return hits;
+  const homeNorm = normPath(home);
+  for (const name of AGENT_ENV_NAMES) {
+    const raw = inputEnv[name];
+    if (typeof raw !== "string" || raw.trim() === "") continue;
+    for (const part of raw.split(";")) {
+      const value = part.trim();
+      if (value === "") continue;
+      const target = normPath(value);
+      const isHomeRoot = name === "PET_AGENT_HOME" && target === homeNorm;
+      const inside = AGENT_DIR_NAMES.some((dir) => {
+        const base = normPath(join(homeNorm, dir));
+        return target === base || target.startsWith(`${base}/`);
+      });
+      if (isHomeRoot || inside) hits.push(`${name}=${value}`);
+    }
+  }
+  return hits;
+}
+
+/** 真实 spawn 的唯一 env 入口（C3）：`...iso` 排在 `...baseEnv` 之后 ⇒ 我们的值一定覆盖外部同名值。
+ * 「尊重外部值」不体现在这里，而体现在 hazard：外部值被检测、命中就在 build 之前中止（A20-D2 Q4）。 */
+function buildSpawnEnv(baseEnv, iso, port) {
+  return {
+    ...baseEnv,
+    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port}`,
+    ...iso,
+  };
+}
+// ==== A20-PURE-END ====
+
+/** HEAD 的提交时间（`%ct`，非作者时间）；git 取不到返回 null ⇒ 判 `unknown` 红，不默认放行。 */
+function headCommitMs(cwd) {
+  const res = spawnSync("git", ["log", "-1", "--format=%ct", "HEAD"], { cwd, encoding: "utf8" });
+  if (res.status !== 0) return null;
+  const seconds = Number(String(res.stdout).trim());
+  return Number.isFinite(seconds) ? seconds * 1000 : null;
+}
+
 const skipBuild = argv.includes("--skip-build");
 const PORT = Number(env.CDP_PORT ?? 9224);
-const EXE = resolve(import.meta.dirname, "../../src-tauri/target/release/desktop-pet.exe");
+const REPO_ROOT = resolve(import.meta.dirname, "../..");
+/** exe 位置由外部 `CARGO_TARGET_DIR` 决定（A20：共用 runner 上产物就在仓库外，写死仓库内会验到陈旧二进制） */
+const exePlan = resolveReleaseExe(env.CARGO_TARGET_DIR, env.CARGO_BUILD_TARGET_DIR, REPO_ROOT);
+// 相对值时 exePlan.exe 是 null，这里给个占位路径：预检 B 会在任何 fs 操作与 spawn 之前退出
+const EXE = exePlan.exe ?? join(REPO_ROOT, "src-tauri", "target", "release", "desktop-pet.exe");
 const PLUGINS_DIR = join(dirname(EXE), "plugins");
 /** L1 原型（ADR-0006）的取证插件：仓库里那份夹具装进打包版的插件目录，跑完删 */
 const L1_ID = "zz.l1-probe";
@@ -22,6 +124,20 @@ const L1_DIR = join(PLUGINS_DIR, L1_ID);
 /** 留在宿主 realm 的例外名单（默认空 = 全部走 Worker） */
 const REALM_FLAG = "host:realm-plugin-host";
 const r = createReport("CSP 与插件加载（release）");
+
+/**
+ * 预检 A（A20-D2 Q4/C5）：外部 `PET_AGENT_*` 已指向真实 homedir 的 agent 目录时**在 build 之前就中止**。
+ * 那种环境下 hook 路线会写到用户正在用的配置里，安全优先于下面 32 条读数。
+ */
+r.group("预检 A：外部 PET_AGENT_* 没有指向真实 homedir 的 agent 目录");
+const hazards = agentEnvHazard(env, homedir());
+r.check("外部 PET_AGENT_* 没有指向真实 homedir 的 agent 目录", true, hazards.length === 0);
+if (hazards.length > 0) {
+  r.info("命中的外部变量原值", hazards.join(" ; "));
+  r.info("处置", "不构建、不起应用（外部值指向真实 agent 目录，读数没有意义）");
+  r.summary();
+  process.exit(1);
+}
 
 if (!skipBuild) {
   console.log("构建 release（tauri build --no-bundle）…");
@@ -33,15 +149,42 @@ if (!skipBuild) {
     process.exit(2);
   }
 }
-if (!existsSync(EXE)) {
-  console.error(`找不到 ${EXE}`);
-  process.exit(2);
+/**
+ * 预检 B（A20-D1 C5）：exe 的存在性与新鲜度放在 build 之后、spawn 之前。
+ * 陈旧或不存在都具名红并非零退出、**不启动应用** —— 拿上一轮的 exe 验这一轮的代码，32 条全绿也是无效读数。
+ * 已知副作用（预期行为）：只改测试的提交之后用 `--skip-build` 复用旧 exe，会正确判红。
+ */
+r.group("预检 B：release exe 的定位与新鲜度");
+const exeExists = exePlan.absolute && existsSync(EXE);
+r.check("CARGO_TARGET_DIR 是绝对路径（相对值不猜 cargo 的基准）", true, exePlan.absolute);
+r.check("release exe 在解析出的 target 目录下存在", true, exeExists);
+const commitMs = headCommitMs(REPO_ROOT);
+const mtimeMs = exeExists ? statSync(EXE).mtimeMs : null;
+const verdict = exeFreshness(mtimeMs, commitMs);
+r.check("release exe 不比 HEAD 提交更旧（陈旧即上一轮的二进制）", "ok", verdict);
+r.info("exe 查找", `source=${exePlan.source}${exePlan.reason ? ` reason=${exePlan.reason}` : ""} verdict=${verdict} exe=${EXE}`);
+r.info("时间基准", `mtime=${mtimeMs ?? "-"} headCommit=${commitMs ?? "-"}`);
+if (verdict !== "ok" || !exePlan.absolute) {
+  r.summary();
+  process.exit(1);
 }
+
+/** 预检全过才建隔离根：早退路径不留临时目录（C5） */
+const ISO_ROOT = mkdtempSync(join(tmpdir(), "pet-release-iso-"));
+for (const dir of agentDirs(ISO_ROOT)) mkdirSync(dir, { recursive: true });
+const ISO = agentPaths(ISO_ROOT);
+const isoAllUnderRoot = [...ISO.PET_AGENT_CONFIG_FILES.split(";"), ISO.PET_AGENT_HOME, ISO.PET_AGENT_INBOX].every(
+  (p) => normPath(p).startsWith(`${normPath(ISO_ROOT)}/`),
+);
+r.group("预检 C：本次 spawn 自带的 PET_AGENT_* 隔离");
+r.check("三个 PET_AGENT_* 都落在本次新建的临时隔离根下", true, isoAllUnderRoot);
+r.check("隔离根建在 os.tmpdir() 之下", true, normPath(ISO_ROOT).startsWith(normPath(tmpdir())));
+r.info("隔离取值", JSON.stringify(ISO));
 
 mkdirSync(PLUGINS_DIR, { recursive: true });
 const app = spawn(EXE, [], {
   stdio: "ignore",
-  env: { ...env, WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${PORT}` },
+  env: buildSpawnEnv(env, ISO, PORT),
 });
 
 let exitCode = 1;
@@ -257,6 +400,13 @@ try {
   }
   removeFixtures(PLUGINS_DIR);
   rmSync(L1_DIR, { recursive: true, force: true });
+  // C7：Windows 上 app 刚被 kill，隔离根里的文件可能还被占用。这里放最后、包 try/catch（带 maxRetries）：
+  // 抛错既不能跳过上面的收口，也不能改变退出码 —— 收不掉就只留一个临时目录，比弄脏判定便宜。
+  try {
+    rmSync(ISO_ROOT, { recursive: true, force: true, maxRetries: 3, retryDelay: 120 });
+  } catch (err) {
+    console.log(`  · 隔离临时目录未删净（不影响退出码）：${ISO_ROOT} — ${String(err?.message ?? err).slice(0, 80)}`);
+  }
 }
 
 process.exit(exitCode);
