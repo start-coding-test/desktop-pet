@@ -134,7 +134,12 @@ pub fn agent_hooks_install(
     // 「安装」装的是当前选中的那一家（四选一由 agent_linkage_set 负责改这个选择）
     let adapter = linkage::current_adapter(&app);
     let files = required_hook_configs(adapter, &home_dir(&app)?)?;
-    let reports = agent_hooks::install_files(adapter, &files, &exe_path()?);
+    let reports = agent_hooks::install_files(
+        adapter,
+        &files,
+        &exe_path()?,
+        agent_hooks::ledger_dir(&app).as_deref(),
+    );
     // 只有真装上才算用户的选择；全失败不写，见 linkage::note_installed
     linkage::note_installed(&app, adapter.id(), &reports);
     Ok(json!({ "files": reports, "hint": adapter.post_install_hint() }))
@@ -205,7 +210,14 @@ mod tests {
         std::fs::write(&path, sample).unwrap();
 
         let exe = std::path::Path::new(r"C:\app\desktop-pet.exe");
-        let reports = agent_hooks::install_files(&QODER, std::slice::from_ref(&path), exe);
+        // A23：账本目录走临时目录（与 UI 路径同一个签名，只是不写真实 %APPDATA%）
+        let ledger = path.parent().expect("配置有父目录").join("ledger");
+        let reports = agent_hooks::install_files(
+            &QODER,
+            std::slice::from_ref(&path),
+            exe,
+            Some(ledger.as_path()),
+        );
         assert!(reports[0].error.is_none(), "{:?}", reports[0].error);
         assert_eq!(reports[0].managed, HOOK_PHASES.len());
 

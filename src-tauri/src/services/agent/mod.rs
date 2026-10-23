@@ -9,6 +9,7 @@
 //! 于是从编译期内嵌的 tauri.conf.json 读，保持单一来源。
 
 pub mod adapters;
+pub mod backups;
 pub mod inbox;
 pub mod linkage;
 pub mod phases;
