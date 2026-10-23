@@ -18,7 +18,7 @@ export function mountOnboarding(ctx, state) {
   const clearBtn = button(dom, "清除 Key", "g-btn");
   const demoBtn = button(dom, "演示数据", "g-btn");
   const masked = text(dom, "未配置 Key", "g-muted");
-  const note = hint(dom, "凭据保存在本机插件隔离存储（明文 JSON）；完整 Key 不会回传到界面。");
+  const note = hint(dom, "凭据保存在本机插件隔离存储（secrets.json，Windows DPAPI 按当前用户加密）；完整 Key 不会回传到界面。");
 
   const keyRow = row(dom, key, testBtn, saveBtn);
   const actionRow = row(dom, masked, clearBtn, demoBtn);
@@ -73,7 +73,7 @@ export function mountOnboarding(ctx, state) {
       note.textContent = "演示模式不出网，数据是固定种子。";
     } else {
       note.className = "g-muted";
-      note.textContent = "凭据保存在本机插件隔离存储（明文 JSON）；完整 Key 不会回传到界面。";
+      note.textContent = "凭据保存在本机插件隔离存储（secrets.json，Windows DPAPI 按当前用户加密）；完整 Key 不会回传到界面。";
     }
   }
 

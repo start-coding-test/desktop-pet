@@ -15,7 +15,7 @@ Command Code GOAT 的额度与 token 用量看板，移植自
 
 - 只访问 `https://api.commandcode.ai/alpha/{whoami,billing/credits,billing/subscriptions,usage/summary}`，
   用 `Authorization: Bearer <key>`。首次访问会弹一次 `http:api.commandcode.ai` 同意框。
-- 凭据保存在本机插件隔离存储（明文 JSON）；完整 Key 不回传到界面，也不进 `:widget` / 日志。
+- 凭据保存在本机插件隔离存储（secrets.json，Windows DPAPI 按当前用户加密）；完整 Key 不回传到界面，也不进 `:widget` / 日志。
 - 出网收在 `index.js::out()`：串行闸门、400ms 最小间隔、20 次/分钟、429 冷却阶梯、
   传输层失败重试一次。宿主 `ctx.http.request` 不返回响应头，因此 `Retry-After` 不可用。
 - 额度单位是 credits，不随币种换算；只有 cost 字段按 USD→CNY 汇率换算。
