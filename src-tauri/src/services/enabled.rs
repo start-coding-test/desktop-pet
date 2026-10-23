@@ -120,14 +120,33 @@ pub fn plugin_enabled_set(
 /// 停用某个插件时取消它挂起的同意请求，并清掉旧拒绝锁（不写新锁）。
 /// 抽成函数是为了让 `plugin_enabled_set` 的命令体保持薄层。
 fn cancel_pending_for_removed(app: &AppHandle, previous: Option<&[String]>, cleaned: &[String]) {
-    let Some(previous) = previous else {
-        return;
-    };
-    for id in previous {
-        if !cleaned.contains(id) {
-            crate::services::permission::cancel_pending_for_plugin(app, id, true);
-        }
+    let latched = crate::services::permission::latched_plugin_ids(app);
+    let targets = latch_cleanup_targets(previous, cleaned, &latched);
+    for id in &targets {
+        crate::services::permission::cancel_pending_for_plugin(app, id, true);
     }
+}
+
+/// 「这次停用要清谁的拒绝锁」的决策。抽成纯函数：`cancel_pending_for_removed` 往下要真
+/// `AppHandle`，单测造不出它（同 `cancel_plan` 的抽取理由，见 D10）。
+///
+/// 读得到旧清单时按 `previous − cleaned`；**读不到时不能整段跳过** —— 拒绝锁活在内存里，
+/// 跳过就是「关→开永不再弹，直到重启」。那时唯一的事实源是宿主自己记得的锁集合。
+/// 两种情况下仍在 `cleaned` 里的插件都不清，保住「同一启用周期内被拒后不重复骚扰」。
+pub(crate) fn latch_cleanup_targets(
+    previous: Option<&[String]>,
+    cleaned: &[String],
+    latched: &[String],
+) -> Vec<String> {
+    let candidates: &[String] = match previous {
+        Some(prev) => prev,
+        None => latched,
+    };
+    candidates
+        .iter()
+        .filter(|id| !cleaned.contains(*id))
+        .cloned()
+        .collect()
 }
 
 /// 写盘前把旧清单读出来。读失败不拦这次写入，只降级成「说不出」（None）。
@@ -184,6 +203,38 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("建临时目录");
         dir
+    }
+
+    /// A22：停用那一次读不到旧启停清单（`previous = None`）时，清锁不能整段跳过 ——
+    /// 现场形状是「风险能力被拒 → 关 → 开，同进程内再也不弹，重启才弹」。
+    #[test]
+    fn unreadable_old_list_must_still_clear_latched_plugins() {
+        let latched = vec!["com.pet.goat-gauge".to_string()];
+        let targets = latch_cleanup_targets(None, &[], &latched);
+        assert_eq!(
+            targets, latched,
+            "读不到旧清单时必须退回宿主记得的锁集合 —— 返回空就是「停用不清锁」那个缺陷的形状"
+        );
+        assert!(
+            latch_cleanup_targets(None, &latched, &latched).is_empty(),
+            "仍在启用清单里的插件不该被清，同周期不重复骚扰的口径不变"
+        );
+    }
+
+    /// 正向对照：`previous` 读得到时，判定必须与旧实现逐字一致（防止回退改动顺手改了主路径）
+    #[test]
+    fn readable_old_list_keeps_the_previous_minus_cleaned_rule() {
+        let previous = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let cleaned = vec!["a".to_string(), "c".to_string()];
+        assert_eq!(
+            latch_cleanup_targets(Some(&previous), &cleaned, &["b".to_string()]),
+            vec!["b".to_string()],
+            "读得到旧清单时按 previous − cleaned，与锁集合无关"
+        );
+        assert!(
+            latch_cleanup_targets(Some(&previous), &previous, &[]).is_empty(),
+            "没停用任何插件时不该清任何锁"
+        );
     }
 
     /// 文件层的读写与形状判定（命令层要 AppHandle，这里把同一份逻辑对着临时目录测）
