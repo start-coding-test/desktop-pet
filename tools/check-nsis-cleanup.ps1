@@ -35,7 +35,10 @@
   so prefer a space-free path for the routine run.
 
 .PARAMETER SkipBuild
-  Reuse whatever bundle is already in src-tauri/target/release/bundle/nsis.
+  Reuse the installer already present in the resolved bundle directory instead of
+  building one. The directory comes from CARGO_TARGET_DIR (or CARGO_BUILD_TARGET_DIR)
+  when set, and from src-tauri/target otherwise; either way a bundle older than the
+  HEAD commit is refused.
 
 .EXAMPLE
   $env:PET_AGENT_CONFIG_FILES = "F:\tmp\nsis\cfg-a.json;F:\tmp\nsis\cfg-b.json"
@@ -70,6 +73,63 @@ function Write-Json([string] $path, [string] $text) {
 function Read-Text([string] $path) {
   if (-not (Test-Path $path)) { return "" }
   return [System.IO.File]::ReadAllText($path)
+}
+
+# A24: where the NSIS bundle actually lives. Hardcoding src-tauri\target is wrong on a
+# machine that builds with CARGO_TARGET_DIR outside the repo -- and worse, the junction
+# at src-tauri\target on the release box still holds superseded installers, so the old
+# path made this script certify a stale package as green. Kept as a standalone function
+# so the resolution can be exercised in a throwaway copy without running the installer.
+function Resolve-BundleDir {
+  param(
+    [string] $Repo,
+    [string] $Primary,
+    [string] $Secondary
+  )
+  $chosen = ""
+  $chosenName = ""
+  if (-not [string]::IsNullOrWhiteSpace($Primary)) {
+    $chosen = $Primary; $chosenName = 'CARGO_TARGET_DIR'
+  } elseif (-not [string]::IsNullOrWhiteSpace($Secondary)) {
+    $chosen = $Secondary; $chosenName = 'CARGO_BUILD_TARGET_DIR'
+  }
+  if ($chosen -eq "") {
+    # Nothing external set: byte-for-byte the historical default.
+    return [pscustomobject]@{ Ok = $true; Name = ''; Value = ''; Path = (Join-Path $Repo 'src-tauri\target\release\bundle\nsis') }
+  }
+  $trimmed = $chosen.Trim()
+  if (-not [System.IO.Path]::IsPathRooted($trimmed)) {
+    # cargo resolves a relative target dir against the cwd it was started from, which this
+    # script cannot know -- refuse instead of guessing.
+    return [pscustomobject]@{ Ok = $false; Name = $chosenName; Value = $trimmed; Path = '' }
+  }
+  return [pscustomobject]@{ Ok = $true; Name = $chosenName; Value = $trimmed; Path = (Join-Path ([System.IO.Path]::GetFullPath($trimmed)) 'release\bundle\nsis') }
+}
+
+# A24: an installer older than HEAD is a leftover from a previous build, and every hook
+# reading below would then describe a binary that no longer matches the tree. Strict -lt:
+# equal timestamps count as fresh, and no git => refuse (a skipped check is worse than a
+# refused run).
+function Get-HeadCommitUtc {
+  param([string] $Repo)
+  $headUnix = [long]0
+  $ok = $false
+  try {
+    $raw = (& git -C $Repo log -1 --format=%ct HEAD) 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0) { $ok = [long]::TryParse($raw.Trim(), [ref]$headUnix) }
+  } catch { $ok = $false }
+  if (-not $ok -or $headUnix -le 0) { return $null }
+  return [DateTimeOffset]::FromUnixTimeSeconds($headUnix).UtcDateTime
+}
+
+# The verdict itself, so the rule can be exercised (and mutated) in a throwaway copy.
+# 'missing' and 'nogit' both refuse: a skipped freshness check is worse than a refused run.
+function Get-StaleVerdict {
+  param([object] $InstallerUtc, [object] $HeadUtc)
+  if (-not $HeadUtc) { return 'nogit' }
+  if (-not $InstallerUtc) { return 'missing' }
+  if ($InstallerUtc -lt $HeadUtc) { return 'stale' }
+  return 'fresh'
 }
 
 # --- 0. Guard rails -----------------------------------------------------------
@@ -116,7 +176,14 @@ if ($SkipBuild) {
     if ($LASTEXITCODE -ne 0) { throw ("tauri build exit " + $LASTEXITCODE) }
   } finally { Pop-Location }
 }
-$bundleDir = Join-Path $Repo "src-tauri\target\release\bundle\nsis"
+$bundlePlan = Resolve-BundleDir -Repo $Repo -Primary $env:CARGO_TARGET_DIR -Secondary $env:CARGO_BUILD_TARGET_DIR
+if (-not $bundlePlan.Ok) {
+  Write-Host ("REFUSED: " + $bundlePlan.Name + " must be an absolute path, got: " + $bundlePlan.Value) -ForegroundColor Red
+  Write-Host "cargo resolves a relative target dir against its own cwd, which this script cannot know."
+  exit 2
+}
+$bundleDir = $bundlePlan.Path
+Note ("bundle dir source: " + $(if ($bundlePlan.Name -eq "") { "default (no CARGO_TARGET_DIR set)" } else { $bundlePlan.Name }))
 $installer = Get-ChildItem -Path $bundleDir -Filter "*.exe" -ErrorAction SilentlyContinue |
   Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if (-not $installer) {
@@ -124,6 +191,21 @@ if (-not $installer) {
   exit 2
 }
 Pass ("installer: " + $installer.FullName)
+
+$headUtc = Get-HeadCommitUtc -Repo $Repo
+$installerUtc = $installer.LastWriteTimeUtc
+$stale = Get-StaleVerdict -InstallerUtc $installerUtc -HeadUtc $headUtc
+if ($stale -eq 'nogit') {
+  Write-Host "REFUSED: cannot read HEAD commit time from git, so this script cannot tell a stale installer from a fresh one." -ForegroundColor Red
+  exit 2
+}
+if ($stale -eq 'stale') {
+  Write-Host ("REFUSED: installer is older than HEAD commit: " + $installer.FullName) -ForegroundColor Red
+  Write-Host ("  installer LastWriteTimeUtc = " + $installerUtc.ToString('o'))
+  Write-Host ("  HEAD commit time (UTC)     = " + $headUtc.ToString('o'))
+  exit 2
+}
+Pass ("installer is not older than HEAD commit (installer " + $installerUtc.ToString('o') + " >= head " + $headUtc.ToString('o') + ")")
 
 # exe name comes from [package] name in Cargo.toml -- never hardcoded here
 $cargo = Read-Text (Join-Path $Repo "src-tauri\Cargo.toml")
