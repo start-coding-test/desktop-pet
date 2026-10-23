@@ -14,8 +14,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde_json::{json, Value};
+use tauri::{AppHandle, Manager};
 
 use crate::services::agent::adapters::{self, AgentAdapter};
+use crate::services::agent::backups;
 use crate::services::agent::phases::AGENT_FLAG;
 
 /// 自家条目的识别标记。它同时是 hook 分支的 CLI 参数，两边共用这一个常量
@@ -69,14 +71,50 @@ impl FileReport {
     }
 }
 
-fn backup_once(path: &Path) -> std::io::Result<()> {
-    let mut name = path.as_os_str().to_os_string();
-    name.push(".pre-pet-backup");
-    let bak = PathBuf::from(name);
+/// 备份文件名：`<path>.pre-pet-backup`。生成侧与清理侧共用 `backups::backup_path` 这一处定义。
+pub fn backup_path(path: &Path) -> PathBuf {
+    backups::backup_path(path)
+}
+
+/// 账本目录 = 宿主自己的数据目录（`%APPDATA%\<identifier>`）。安装路径用它记账；清理路径在
+/// `linkage::app_data_standalone` 里按同一 Windows 约定推导出同一个目录 —— 只有这一种口径。
+pub fn ledger_dir(app: &AppHandle) -> Option<PathBuf> {
+    match app.path().app_data_dir() {
+        Ok(dir) => Some(dir),
+        Err(e) => {
+            log::warn!("拿不到宿主数据目录，本次无法记录备份账本: {e}");
+            None
+        }
+    }
+}
+
+/// 写回前先备份，并**记一条账**证明这份备份是我们写的。已存在的备份不是我们的：直接跳过、
+/// 也不记账（清理侧靠账本判定，所以它永远不会被删）。记账失败就删掉刚抄的那份并报错 ——
+/// 宁可装不上，也不留无法证明归属的备份。
+fn backup_once(path: &Path, ledger_dir: Option<&Path>) -> Result<(), String> {
+    let bak = backup_path(path);
     if bak.exists() {
         return Ok(());
     }
-    fs::copy(path, &bak).map(|_| ())
+    fs::copy(path, &bak).map_err(|e| format!("复制备份失败: {e}"))?;
+    // 安装路径一定带账本目录（`install_files` 先拦住了 None）；只有卸载路径在「备份已丢、
+    // 用户配置还在」的退化情形下会走到这里，那时不记账、也不拦卸载 —— 这份无主备份在清理
+    // 阶段会被跳过（宁可留一份垃圾，也不能让卸载装不回去）。
+    let Some(dir) = ledger_dir else {
+        return Ok(());
+    };
+    let bytes = match fs::read(&bak) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let _ = fs::remove_file(&bak);
+            return Err(format!("读回备份失败: {e}"));
+        }
+    };
+    if let Err(e) = backups::record(dir, &bak, &bytes) {
+        let _ = fs::remove_file(&bak);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// 原子写：先落同目录临时文件再 rename，避免写一半被打断留下坏配置。
@@ -146,16 +184,24 @@ pub fn status_reports(adapter: &dyn AgentAdapter, files: &[PathBuf]) -> Vec<File
 }
 
 /// 写回前先备份。备份失败就不改 —— 宁可装不上，也不能把用户配置弄成不可恢复
-fn apply_text(path: &Path, text: &str) -> Result<(), String> {
+fn apply_text(path: &Path, text: &str, ledger_dir: Option<&Path>) -> Result<(), String> {
     if path.exists() {
-        backup_once(path).map_err(|_| "备份失败，未改动配置".to_string())?;
+        backup_once(path, ledger_dir).map_err(|_| "备份失败，未改动配置".to_string())?;
     }
     write_atomic(path, text)
 }
 
 /// 整趟「读 → 改 → 落盘」在**同一把锁**里（PR-1 评审遗留项：上一版只串行了 IO 原语，
 /// 读与写之间仍有窗口）。适配器只做纯文本变换，所以锁罩得住整趟。
-pub fn install_files(adapter: &dyn AgentAdapter, files: &[PathBuf], exe: &Path) -> Vec<FileReport> {
+///
+/// `ledger_dir` 是备份账本目录（宿主数据目录）：**新建备份必然会写账本**，拿不到目录就算
+/// 备份失败；已存在的备份不是我们写的，不需要记账。
+pub fn install_files(
+    adapter: &dyn AgentAdapter,
+    files: &[PathBuf],
+    exe: &Path,
+    ledger_dir: Option<&Path>,
+) -> Vec<FileReport> {
     let _io = lock_hook_io();
     let command_for = hook_command(adapter, exe);
     files
@@ -166,7 +212,12 @@ pub fn install_files(adapter: &dyn AgentAdapter, files: &[PathBuf], exe: &Path) 
                 Err(e) => return FileReport::failed(path, e.to_string()),
             };
             match adapter.install_in_text(&raw, &command_for) {
-                Ok(text) => match apply_text(path, &text) {
+                // A23-D1 规则 4：账本目录拿不到就不许**新建**备份 —— 备份必须可证明归属，
+                // 否则清理阶段永远删不掉它。宁可装不上，也不留无主备份。
+                Ok(_) if path.exists() && !backup_path(path).exists() && ledger_dir.is_none() => {
+                    FileReport::failed(path, "备份失败，未改动配置".to_string())
+                }
+                Ok(text) => match apply_text(path, &text, ledger_dir) {
                     Ok(()) => FileReport {
                         path: path.display().to_string(),
                         // 条数取「这份新文本里实际有几条自家条目」，不取追加计数：
@@ -218,7 +269,7 @@ pub fn uninstall_files(
                     error: None,
                     switch_before: None,
                 },
-                Ok(Some((text, removed))) => match apply_text(path, &text) {
+                Ok(Some((text, removed))) => match apply_text(path, &text, None) {
                     Ok(()) => FileReport {
                         path: path.display().to_string(),
                         managed: removed,
@@ -375,7 +426,12 @@ mod tests {
         fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
         let exe = Path::new(r"C:\Program Files\pet\desktop-pet.exe");
 
-        let reports = install_files(&QODER, std::slice::from_ref(&path), exe);
+        let reports = install_files(
+            &QODER,
+            std::slice::from_ref(&path),
+            exe,
+            Some(dir.as_path()),
+        );
         assert!(reports[0].error.is_none(), "{:?}", reports[0].error);
         assert_eq!(reports[0].managed, HOOK_PHASES.len());
 
@@ -443,7 +499,8 @@ mod tests {
         assert!(any_installed(&install_files(
             &QODER,
             &QODER.targets(&dir),
-            exe
+            exe,
+            Some(dir.join("ledger").as_path())
         )));
 
         let cleaned = uninstall_everywhere(&dir, &json!({}));
@@ -478,7 +535,12 @@ mod tests {
         std::env::set_var("PET_AGENT_HOME", &dir);
         let exe = Path::new(r"C:\app\desktop-pet.exe");
 
-        let reports = install_files(&ZCODE, &ZCODE.targets(&dir), exe);
+        let reports = install_files(
+            &ZCODE,
+            &ZCODE.targets(&dir),
+            exe,
+            Some(dir.join("ledger").as_path()),
+        );
         assert!(any_installed(&reports), "{:?}", reports[0].error);
         assert_eq!(
             reports[0].switch_before,

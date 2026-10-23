@@ -375,7 +375,7 @@ pub fn switch_agent(
             // 「这家有没有可查的日志」由适配器自己答（`log_watch`），不在这里按 id 分派：
             // 接线第三家时那种 `if id == zcode` 会静默沿用 ZCode 的日志路径。
             let mark = agent_hooks::mark_log(adapter, home);
-            let reports = agent_hooks::install_files(adapter, &targets, &exe);
+            let reports = agent_hooks::install_files(adapter, &targets, &exe, Some(&data));
             let self_check = agent_hooks::log_self_check(
                 adapter,
                 mark.as_ref(),
@@ -532,7 +532,11 @@ fn adapter_for(agent: Option<&str>) -> &'static dyn AgentAdapter {
         .unwrap_or(&claude_style::QODER)
 }
 
-fn install(adapter: &dyn AgentAdapter, files: &[PathBuf]) -> Vec<FileReport> {
+fn install(
+    adapter: &dyn AgentAdapter,
+    files: &[PathBuf],
+    ledger_dir: Option<&Path>,
+) -> Vec<FileReport> {
     if files.is_empty() {
         log::info!("没有 {} 的配置目录，跳过安装", adapter.display_name());
         return Vec::new();
@@ -548,7 +552,7 @@ fn install(adapter: &dyn AgentAdapter, files: &[PathBuf]) -> Vec<FileReport> {
             }]
         }
     };
-    agent_hooks::install_files(adapter, files, &exe)
+    agent_hooks::install_files(adapter, files, &exe, ledger_dir)
 }
 
 fn uninstall(adapter: &dyn AgentAdapter, files: &[PathBuf], switches: &Value) -> Vec<FileReport> {
@@ -584,7 +588,7 @@ fn apply(app: &AppHandle, prev_on: Option<bool>, now_on: bool, ids: &[String]) {
     let files = targets(app, adapter);
     let reports = match action {
         Action::Install => {
-            let reports = install(adapter, &files);
+            let reports = install(adapter, &files, Some(data.as_path()));
             // 拨过的总开关要立刻记下来：这条路径是「停用→再启用」自动装的，没有设置页
             // 帮忙记，漏记就等于卸载时把用户的开关留在开着的状态
             record_switches(&data, &reports);
@@ -710,19 +714,33 @@ pub fn run_cleanup_cli() {
         eprintln!("desktop-pet: hook cleanup result=skipped reason=no-home");
         return;
     };
-    let switches = app_data_standalone()
-        .map(|dir| recorded_switches(&dir))
+    let app_data = app_data_standalone();
+    let switches = app_data
+        .as_ref()
+        .map(|dir| recorded_switches(dir))
         .unwrap_or_else(|| json!({}));
     let reports = agent_hooks::uninstall_everywhere(&home, &switches);
-    if reports.is_empty() {
-        println!("desktop-pet: hook cleanup result=nothing-to-do files=0 stripped=0");
-        return;
-    }
+    // 备份要在这里收：账本证明是我们写的才删，没账本（含 0.2.1 之前生成的旧备份）一律跳过。
+    // 这一步只在**清理路径**（卸载前那一次）执行；停用/切换 agent 不走这里，备份要留着给
+    // 下次启用当「用户原文件」用（`backup_once` 是首写为准，删掉就再也恢复不到原样了）。
+    let backups =
+        crate::services::agent::backups::remove_backups_everywhere(&home, app_data.as_deref());
     let stripped: usize = reports.iter().map(|r| r.managed).sum();
     let failed = reports.iter().filter(|r| r.error.is_some()).count();
+    // 只剩备份也要继续往下走：上一版在 reports 为空时提前 return，会把「hook 已摘干净、
+    // 只剩我们抄的备份」这种最常见的情形整段跳过。
+    if reports.is_empty() && backups.removed == 0 && backups.failed == 0 && backups.skipped == 0 {
+        println!(
+            "desktop-pet: hook cleanup result=nothing-to-do files=0 stripped=0 backups=0 backups_failed=0 backups_skipped=0"
+        );
+        return;
+    }
     println!(
-        "desktop-pet: hook cleanup result=done files={} stripped={stripped} failed={failed}",
-        reports.len()
+        "desktop-pet: hook cleanup result=done files={} stripped={stripped} failed={failed} backups={} backups_failed={} backups_skipped={}",
+        reports.len(),
+        backups.removed,
+        backups.failed,
+        backups.skipped
     );
     // 失败明细走 stderr：stdout 只留那行可解析的汇总
     for r in reports.iter().filter_map(|r| r.error.as_ref()) {
@@ -1153,9 +1171,12 @@ mod tests {
         let agent_cmd = include_str!("../../commands/agent.rs");
 
         let install = function_body(agent_cmd, "pub fn agent_hooks_install(");
-        let written = install
-            .find("install_files(adapter, &files, &exe_path()?)")
-            .expect("找不到安装调用点");
+        // 不钉整串：rustfmt 会把多参数调用折行。钉「调用点在」+「账本目录确实传进去了」。
+        let written = install.find("install_files(").expect("找不到安装调用点");
+        assert!(
+            install.contains("agent_hooks::ledger_dir(&app).as_deref()"),
+            "安装路径必须把账本目录传进去（A23：备份要可证明归属）"
+        );
         let noted = install
             .find("linkage::note_installed(&app, adapter.id(), &reports)")
             .expect("安装成功后没记录用户的选择");
@@ -1378,5 +1399,27 @@ mod tests {
             }
         }
         &rest[..end]
+    }
+
+    /// A23 ②：清理路径收备份，**停用/切换 agent 不得收** —— 后者若删了，`backup_once` 是
+    /// 「首写为准」，下次启用会把已经被我们改过的配置当成用户原文件抄成新备份，永久丢原配置。
+    #[test]
+    fn only_the_cleanup_path_removes_backups() {
+        let src = include_str!("linkage.rs");
+        let cleanup = function_body(src, "pub fn run_cleanup_cli(");
+        assert!(
+            cleanup.contains("remove_backups_everywhere(&home, app_data.as_deref())"),
+            "清理路径必须收掉我们自己的备份"
+        );
+        let switch = function_body(src, "pub fn switch_agent(");
+        assert!(
+            !switch.contains("remove_backups_everywhere"),
+            "停用/切换 agent 不得删备份"
+        );
+        let reconcile = function_body(src, "pub fn reconcile(");
+        assert!(
+            !reconcile.contains("remove_backups_everywhere"),
+            "停用插件触发的 reconcile 也不得删备份"
+        );
     }
 }
