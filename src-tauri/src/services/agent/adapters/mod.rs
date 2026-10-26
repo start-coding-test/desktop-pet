@@ -153,7 +153,13 @@ pub fn is_wired(id: &str) -> bool {
 }
 
 /// 设置页的一个槽位
+///
+/// 序列化键名必须与前端一致：`widget.js` 的 `paintPicker` 读的是 `opt.displayName`。
+/// 少了 `rename_all`，字段会按 snake_case 输出成 `display_name` —— 界面上就是四个
+/// 字面 `undefined` 的按钮（T01 取证）。顶层 `displayName` 是 `commands/agent.rs`
+/// 手写的 camelCase，所以状态行一直是好的，只有这里的选项清单坏了。
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Choice {
     pub id: &'static str,
     pub display_name: &'static str,
@@ -211,6 +217,101 @@ pub(crate) fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A27：选项清单的序列化键名必须与前端一致。`widget.js` 读 `opt.displayName`，
+    /// 少了 `rename_all` 就是四个字面 `undefined` 的按钮（T01 现场）—— 这条钉键集合，
+    /// 不只是钉某一个字段。
+    #[test]
+    fn choices_serialize_with_camel_case_keys() {
+        let value = serde_json::to_value(choices()).expect("choices 必须可序列化");
+        let items = value.as_array().expect("choices 是数组");
+        assert_eq!(
+            items.len(),
+            crate::services::agent::phases::AGENT_IDS.len(),
+            "选项清单必须列全白名单里的每个槽位"
+        );
+        assert_eq!(
+            items.len(),
+            wired().len(),
+            "四家都接线之后，槽位数与已注册适配器数应当相同"
+        );
+        for item in items {
+            let object = item.as_object().expect("每项是对象");
+            let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                vec!["displayName", "hint", "id", "wired"],
+                "键集合必须是 camelCase 的 {{id, displayName, wired, hint}}"
+            );
+            assert!(
+                !object.contains_key("display_name"),
+                "snake_case 的 display_name 会让前端读到 undefined"
+            );
+            let name = object
+                .get("displayName")
+                .and_then(|v| v.as_str())
+                .expect("displayName 必须是非空字符串");
+            assert!(!name.is_empty(), "displayName 不能为空");
+            assert!(
+                object.get("wired").is_some_and(|v| v.is_boolean()),
+                "wired 必须是布尔"
+            );
+        }
+    }
+
+    /// 每个槽位给人的名字必须来自适配器本身，不能是占位串。
+    #[test]
+    fn choice_display_name_matches_adapter() {
+        for choice in choices() {
+            let adapter = by_id(choice.id).expect("choices 里的 id 必须已注册");
+            let value = serde_json::to_value(&choice).expect("可序列化");
+            assert_eq!(
+                value.get("displayName").and_then(|v| v.as_str()),
+                Some(adapter.display_name()),
+                "{} 的 displayName 必须与适配器一致",
+                choice.id
+            );
+        }
+    }
+
+    /// `hint` 是 Option：要么 null，要么就是适配器给的那句提示。
+    #[test]
+    fn choice_hint_is_null_or_matches_adapter() {
+        for choice in choices() {
+            let adapter = by_id(choice.id).expect("choices 里的 id 必须已注册");
+            let value = serde_json::to_value(&choice).expect("可序列化");
+            match value.get("hint") {
+                Some(serde_json::Value::Null) => assert!(
+                    adapter.post_install_hint().is_none(),
+                    "{} 没有提示时必须是 null",
+                    choice.id
+                ),
+                Some(serde_json::Value::String(text)) => assert_eq!(
+                    Some(text.as_str()),
+                    adapter.post_install_hint(),
+                    "{} 的 hint 必须与适配器一致",
+                    choice.id
+                ),
+                other => panic!("hint 只能是 null 或字符串，实得 {other:?}"),
+            }
+        }
+    }
+
+    /// 跨语言契约（只读，不改前端）：页面读的字段名与这里序列化出来的必须是同一个。
+    /// 任何一边单独改名，这条会先红。
+    #[test]
+    fn widget_reads_the_camel_case_field() {
+        let widget = include_str!("../../../../../plugins/com.pet.agent-bridge/widget.js");
+        assert!(
+            widget.contains("opt.displayName"),
+            "widget.js 必须读 displayName（camelCase）"
+        );
+        assert!(
+            !widget.contains("opt.display_name"),
+            "widget.js 不该读 snake_case 的 display_name"
+        );
+    }
 
     /// id 唯一且与 `--agent` 白名单对得上：白名单里有、注册表里没有 = 接线在后续 PR，
     /// 那是**已知但未接线**，不是拼写错误。这个区别 `decide` 依赖，所以钉住。
