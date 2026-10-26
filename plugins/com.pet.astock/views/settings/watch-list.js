@@ -13,6 +13,11 @@ const numCell = (dom, value, placeholder) => {
   const box = input(dom, "text", "num");
   box.placeholder = placeholder;
   box.value = typeof value === "number" ? String(value) : "";
+  // Worker 里 value 只随 input/change 快照回推（widget-renderer.ts:236-249 的 listen 判定 + :88-96 的 snapshotOf），
+  // click 的快照不带 value —— 不订阅 input，「存」读到的就永远是上面那次回显的初值。
+  box.on("input", () => {
+    // 无副作用：不复制 value、不写状态，需要的只是这条订阅本身（宿主由此才会把快照写回虚拟节点）。
+  });
   return box;
 };
 
