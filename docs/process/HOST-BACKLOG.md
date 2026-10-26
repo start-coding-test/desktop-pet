@@ -51,6 +51,7 @@ MVP 范围：<这一轮只做什么>
 | U08 | 收尾两笔欠账：本体压 overlay 的第二重放点了结 + 同意框应答泵的偶发红（**PM 自留，无执行卡**） | 本体窗口 + 回归脚本 | **已完成**（#69 三态实验：V0 两处都在／V1 只掐 `apply_visibility` 逐扇重放／V2 只掐 `pet.rs` 整体重放，各 **278 passed / 0 failed**、`win-zorder.ps1` 每态三次采样一致 pet-top → 第二重放点无法被证明独立必要，连同唯一调用它的 `raise_above_pet_all` 一起删掉，结论记在 [adr/0010](../adr/0010-badge-visibility-overlay-position-and-window-layering.md)「修订」；新增真窗断言一组 5 条（`r.check` 唯一标题 252→257、消失 0 条），并把 `win-zorder.ps1` 的结论补成纯 ASCII 机器行 `ZORDER samples=… verdict=…`。#70 根因：pump 把「窗口出现在 CDP 列表」当成「已渲出内容」，抢在 `consent_details` 回来之前读+点，于是「探针首次调用弹出的同意框列出了 agent:hooks」三轮红一次；改为轮询到 `#cap-list li` 出现再读点（最多 4 秒，超时仍应答）+ 新增硬失败「pump 应答过的每一扇同意框都渲出过内容」（75→76、消失 0 条），两轮冷启动各 **80/0**。变异 `mutate-check` 2 点 **killed=2 survived=0**（M-A1 让 pump 不等渲出 → 新那条与探针那条一起红；M-B1 让 `raise_above_pet` 首行早退 → **全套件唯一红的就是新加的那条**，实得 `verdict=overlay-covers-pet`）。复跑门禁：cargo 189/0、clippy `-D warnings` 与 fmt 退出码 0、`unit` 1236/0、`check:shape` 48 全 0、`check:docs` rules=8 failing=0、tsc／biome 全 0） | — | `bfa3112`（窗口层）+ `40cc843`（应答泵）+ `aca1563`（文档） | — |
 
 | E02 | debug 默认热键覆盖（`PET_HOTKEY_DEFAULT`）：E2E 机器占键时仍验证默认值路径 | 工程/回归 | **已放行**（2026-10-27；debug-only 覆盖，release 不读；`hotkey_status.default` 驱动判据，产品默认仍 `CommandOrControl+Alt+P`；详见 [adr/0015](../adr/0015-debug-only-default-hotkey-override.md)） | — | 本次提交 | — |
+| E03 | 「测试占用」对未注册的当前键必须真试（0.2.2 真机验收发现） | 工程/回归 | **已放行**（2026-10-27；当前键只有 `is_registered` 为真才直接判 true；启动时被占的默认键现在会如实报「注册失败」，与状态行一致；Rust 源码层判据 + 真机复演） | — | 本次提交 | — |
 
 **两处调度纠正（2026-10-10 规划方复核）**：
 
