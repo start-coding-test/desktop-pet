@@ -112,6 +112,7 @@
 - 能力名见 docs/plugin-dev/PLUGIN_SDK.md 第 3 节；新增能力时要同时更新桥、Rust 校验与那份表格
 - 共享资源（BLE 会话、BLE 扫描）按插件持有者计数，释放只对真正的持有者生效；overlay 悬浮窗**按插件各开一扇**（标签 `overlay-<id>`，页面按标签认归属），摆放/尺寸/显隐互不影响 —— 早先共用一扇窗导致「后打开的卡片显示不出来」，改成按插件分开后两扇可同时存在
 - 插件存储位置：`%APPDATA%/com.desktoppet.pet/plugins/<id>`（插件间隔离，撤销授权会连带清目录）
+- **热键设置目录隔离（A31，2026-10-26）**：debug 构建可被 `PET_SETTINGS_DIR` 重定向（仅绝对路径；release 由 `cfg!(debug_assertions)` 编译期裁掉，安装版不读）。CI 的 job env 与 `dev-debug` GATE 都指 `<仓库>\temp\settings-e2e`；`verify-isolation` 只读隔离副本的内容，真实 `%APPDATA%\com.desktoppet.pet\settings.json` 只比 sha256/是否存在、不读内容。`%APPDATA%` 本身改不了 `app_data_dir()`（Windows Known Folder API），别拿它当隔离开关。
 - 首批插件目录：`plugins/com.pet.hr-ble`（已做）、`plugins/com.pet.agent-bridge`（已做：订阅宿主 `agent:state` 把编码 Agent 的会话状态转成宠物反应）、`plugins/com.pet.todo`（已做：目录名与 id 一致，标准 topic `com.pet.todo:changed` 落在它自己的命名空间里）、`plugins/com.pet.astock`（已做：A股盯盘，出网走宿主 http 代理按域名授权，数据源东方财富公开接口；自选+提醒+badge/overlay，插件页另有分时/K线/五档面板。**2026-10-09 K线与分时已加腾讯后端**：`market.js` 的 `MARKET_SOURCES` 源注册表，每个源一套自己的列序映射（腾讯是「开收高低」，与东财同序不同实现），先试上一次成功的源、一个源内部再主入口→两个后备入口；快照与五档仍只有东财一条，等阶段二。**2026-10-10 阶段二落地**：四个 kind 都有多源，快照/五档为「东财 → 腾讯 `qt.gtimg.cn` → 新浪 `hq.sinajs.cn`」，新浪只兜价格、不供五档与涨跌停）、`plugins/llm-token-usage`（暂缓）
 - 面板（分时/K线/五档）只在设置页活着时刷：`PANEL_TTL_MS` 90 秒，由设置页 widget 每 60 秒发一次 `sync` 续期（`watchView(ctx, render, { beatMs })`），badge/overlay 不续期 —— 人走了额外出网要自己停。
 - `ctx.bus.subscribe` 这个 API **本身**就要在 manifest 声明 `bus:subscribe`，不声明会在激活时被拒（`com.pet.todo 未在 manifest 声明这些能力: bus:subscribe`）；ACL 放宽的只是「自己前缀不需要额外授权」，别把两者混为一谈
