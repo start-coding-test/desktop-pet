@@ -53,8 +53,14 @@ export function wireHotkey(): void {
     }
     void saveHotkey(value);
   });
-  $<HTMLElement>("hotkey-reset")?.addEventListener("click", () => {
-    void saveHotkey("CommandOrControl+Alt+P");
+  $<HTMLElement>("hotkey-reset")?.addEventListener("click", async () => {
+    try {
+      const info = await hostCall<HotkeyStatus>("hotkey_status");
+      await saveHotkey(info.default);
+    } catch (e) {
+      const el2 = hotkeyStatus();
+      if (el2) el2.textContent = `恢复默认失败：${hostErrorMessage(e)}`;
+    }
   });
   $<HTMLElement>("hotkey-test")?.addEventListener("click", async () => {
     const el2 = hotkeyStatus();
