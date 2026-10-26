@@ -81,6 +81,9 @@ jobs:
       # A31：热键 settings.json 只允许 debug 构建用 PET_SETTINGS_DIR 重定向；实例与套件读同一个目录。
       # release 不读这个变量（hotkeys.rs 里由 cfg!(debug_assertions) 编译期裁掉）。
       PET_SETTINGS_DIR: ${{ github.workspace }}\temp\settings-e2e
+      # E02：E2E 机器的默认键 Ctrl+Alt+P 被占且无法释放；debug 构建改用空闲的默认键，
+      # 让「默认值本身必须能设」「改回默认值」两条判据真正跑起来。release 不读这个变量。
+      PET_HOTKEY_DEFAULT: "CommandOrControl+Alt+Q"
 
     steps:
       - uses: actions/checkout@v4

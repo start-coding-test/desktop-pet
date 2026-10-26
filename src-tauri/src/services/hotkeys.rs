@@ -19,6 +19,10 @@ pub const DEFAULT_ACCEL: &str = "CommandOrControl+Alt+P";
 /// A31：仅 debug 构建可用的设置目录覆盖；release 里 `cfg!(debug_assertions)` 会把分支裁掉。
 const SETTINGS_DIR_ENV: &str = "PET_SETTINGS_DIR";
 
+/// E02：仅 debug 构建可用的默认热键覆盖，让 E2E 在默认键被占的机器上仍能验证默认值路径。
+/// release 里由 `cfg!(debug_assertions)` 编译期裁掉，产品默认值始终是 `DEFAULT_ACCEL`。
+const DEFAULT_ACCEL_ENV: &str = "PET_HOTKEY_DEFAULT";
+
 const MODIFIERS: &[(&str, &str)] = &[
     ("ctrl", "Ctrl"),
     ("control", "Ctrl"),
@@ -188,6 +192,23 @@ fn settings_file(app: &AppHandle) -> Result<PathBuf, HostError> {
     Ok(dir.join("settings.json"))
 }
 
+/// E02：合法覆盖优先、其余一律回退产品默认值。只看显式开关，不在这里读环境，
+/// 便于单测覆盖 release 门禁。
+fn default_accel(raw_override: Option<OsString>, allow_override: bool) -> String {
+    if allow_override {
+        if let Some(raw) = raw_override {
+            if let Ok(accel) = normalize_accel(&raw.to_string_lossy()) {
+                return accel;
+            }
+        }
+    }
+    DEFAULT_ACCEL.to_string()
+}
+
+fn current_default_accel() -> String {
+    default_accel(std::env::var_os(DEFAULT_ACCEL_ENV), cfg!(debug_assertions))
+}
+
 fn read_saved(app: &AppHandle) -> Option<String> {
     let path = settings_file(app).ok()?;
     let raw = std::fs::read_to_string(path).ok()?;
@@ -232,15 +253,16 @@ fn unregister(app: &AppHandle, accel: &str) {
 
 #[tauri::command]
 pub fn hotkey_status(app: AppHandle) -> Result<Value, HostError> {
-    let accelerator = read_saved(&app).unwrap_or_else(|| DEFAULT_ACCEL.to_string());
+    let default = current_default_accel();
+    let accelerator = read_saved(&app).unwrap_or_else(|| default.clone());
     let registered = app.global_shortcut().is_registered(accelerator.as_str());
-    Ok(status_payload(accelerator, registered))
+    Ok(status_payload(accelerator, registered, default))
 }
 
-fn status_payload(accelerator: String, registered: bool) -> Value {
+fn status_payload(accelerator: String, registered: bool, default: String) -> Value {
     json!({
         "accelerator": accelerator,
-        "default": DEFAULT_ACCEL,
+        "default": default,
         "registered": registered,
     })
 }
@@ -254,7 +276,7 @@ pub fn hotkey_set(
 ) -> Result<String, HostError> {
     crate::gate::settings(&window, "改动快捷键")?;
     let next = normalize_accel(&accelerator)?;
-    let current = read_saved(&app).unwrap_or_else(|| DEFAULT_ACCEL.to_string());
+    let current = read_saved(&app).unwrap_or_else(current_default_accel);
     if current == next {
         return Ok(next);
     }
@@ -276,7 +298,7 @@ pub fn hotkey_test(
     let probe = normalize_accel(&accelerator)?;
     // 试的就是当前生效的那个键：注册必然报「已占用」，那不是冲突。
     // 比较对象必须是「当前生效」的键，而不是「已落盘」的 —— 没落盘时生效的是默认值
-    let current = read_saved(&app).unwrap_or_else(|| DEFAULT_ACCEL.to_string());
+    let current = read_saved(&app).unwrap_or_else(current_default_accel);
     if current == probe {
         return Ok(true);
     }
@@ -291,13 +313,14 @@ pub fn hotkey_test(
 
 /// 启动时恢复用户上次选的键；没注册成功就退回默认值，别让设置窗再也叫不出来
 pub fn restore(app: &AppHandle) {
-    let saved = read_saved(app).unwrap_or_else(|| DEFAULT_ACCEL.to_string());
-    if apply(app, &saved).is_err() && saved != DEFAULT_ACCEL {
-        if let Err(err) = apply(app, DEFAULT_ACCEL) {
+    let default = current_default_accel();
+    let saved = read_saved(app).unwrap_or_else(|| default.clone());
+    if apply(app, &saved).is_err() && saved != default {
+        if let Err(err) = apply(app, &default) {
             log::warn!("[hotkey] 默认加速键也注册失败: {err}");
             return;
         }
-        let _ = write_saved(app, DEFAULT_ACCEL);
+        let _ = write_saved(app, &default);
     }
 }
 
@@ -427,7 +450,7 @@ mod tests {
 
     #[test]
     fn status_payload_has_exact_camel_case_keys() {
-        let value = status_payload("Ctrl+Alt+P".to_string(), false);
+        let value = status_payload("Ctrl+Alt+P".to_string(), false, DEFAULT_ACCEL.to_string());
         let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
         keys.sort();
         assert_eq!(
@@ -444,7 +467,12 @@ mod tests {
             Some(false)
         );
         assert_eq!(
-            status_payload("Ctrl+Alt+P".to_string(), true)
+            value.get("default").and_then(Value::as_str),
+            Some(DEFAULT_ACCEL),
+            "status.default 必须是本次生效的默认值"
+        );
+        assert_eq!(
+            status_payload("Ctrl+Alt+P".to_string(), true, DEFAULT_ACCEL.to_string())
                 .get("registered")
                 .and_then(Value::as_bool),
             Some(true)
@@ -525,6 +553,62 @@ mod tests {
                 "debug_assertions), )"
             )),
             "settings_file 必须走 settings_dir 并传 cfg!(debug_assertions)"
+        );
+    }
+
+    /* ============ E02：debug-only 默认热键覆盖（PET_HOTKEY_DEFAULT） ============ */
+
+    #[test]
+    fn default_accel_uses_normalized_override_when_allowed() {
+        assert_eq!(
+            default_accel(Some(OsString::from("ctrl+alt+q")), true),
+            "Ctrl+Alt+Q",
+            "覆盖值必须走与用户输入相同的归一化"
+        );
+        assert_eq!(
+            default_accel(Some(OsString::from("CommandOrControl+Alt+Q")), true),
+            "CommandOrControl+Alt+Q",
+            "跨平台 token 必须原样保留"
+        );
+    }
+
+    #[test]
+    fn default_accel_falls_back_on_invalid_or_empty_override() {
+        for raw in [
+            OsString::new(),
+            OsString::from("P"),
+            OsString::from("Ctrl+MouseLeft"),
+            OsString::from("Ctrl+Alt"),
+        ] {
+            assert_eq!(
+                default_accel(Some(raw), true),
+                DEFAULT_ACCEL,
+                "非法/空覆盖必须回到产品默认值"
+            );
+        }
+    }
+
+    #[test]
+    fn default_accel_override_is_release_gated() {
+        assert_eq!(
+            default_accel(Some(OsString::from("Ctrl+Alt+Q")), false),
+            DEFAULT_ACCEL,
+            "allow_override=false（release）时不许读 PET_HOTKEY_DEFAULT"
+        );
+    }
+
+    #[test]
+    fn default_accel_uses_debug_gated_env_resolver() {
+        let flat = include_str!("hotkeys.rs")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains(concat!(
+                "default_accel(std::env::var_os(DEFAULT_ACCEL_ENV), cfg!(",
+                "debug_assertions))"
+            )),
+            "current_default_accel 必须走 default_accel 并传 cfg!(debug_assertions)"
         );
     }
 }

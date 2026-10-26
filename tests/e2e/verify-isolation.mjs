@@ -2901,11 +2901,30 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
 
     // A31：热键组前后只比真实 settings 的 sha256/存在性；内容只看 PET_SETTINGS_DIR 下的副本。
     const realSettingsBefore = fileSha256OrNull(REAL_SETTINGS);
+    // E02：debug 构建可用 PET_HOTKEY_DEFAULT 覆盖默认键（机器B 的 Ctrl+Alt+P 被占）。
+    // 判据跟着宿主返回的 default 走，不再把某一台机器的占键状态写死；产品默认仍由 Rust 单测钉住。
+    const hotkeyInfo = (await sCall("hotkey_status")).v ?? {};
+    const defaultAccel =
+      typeof hotkeyInfo.default === "string" && hotkeyInfo.default
+        ? hotkeyInfo.default
+        : "CommandOrControl+Alt+P";
+    r.check("hotkey_status 返回可用的默认加速键", true, typeof hotkeyInfo.default === "string" && !!hotkeyInfo.default);
+    r.check(
+      "默认加速键保留 Tauri 跨平台 token",
+      true,
+      defaultAccel.split("+").includes("CommandOrControl"),
+    );
+    const envDefault = process.env.PET_HOTKEY_DEFAULT;
+    if (envDefault) {
+      r.check("PET_HOTKEY_DEFAULT 生效：status.default 与 env 逐字一致", envDefault, defaultAccel);
+    } else {
+      r.info("未设 PET_HOTKEY_DEFAULT：默认键按产品常量判定", "");
+    }
     const noMod = await sCall("hotkey_set", { accelerator: "P" });
     r.check("不带修饰键的组合被拒", true, !noMod.ok && /修饰键/.test(String(noMod.e)));
     const twoKeys = await sCall("hotkey_set", { accelerator: "Ctrl+A+B" });
     r.check("两个主键的组合被拒", true, !twoKeys.ok && /主键/.test(String(twoKeys.e)));
-    const asDefault = await sCall("hotkey_set", { accelerator: "CommandOrControl+Alt+P" });
+    const asDefault = await sCall("hotkey_set", { accelerator: defaultAccel });
     r.check("Tauri 跨平台 token 被接受（默认值本身必须能设）", true, asDefault.ok);
     const moved = await sCall("hotkey_set", { accelerator: "ctrl+alt+f9" });
     r.check("改键成功并归一化", "Ctrl+Alt+F9", moved.v);
@@ -2918,7 +2937,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     // 这条判据原来只印 `.v`：hostInvoke 的 reject 分支形状是 `{ok:false,e,code}`、根本没有 `v`，
     // 于是 run#153 只剩一句「实得 undefined」，宿主真正的拒绝文案被丢掉（L09）。
     // 读回本身也可能超时，所以它的异常只折进诊断行，绝不要把下面的 r.check 一起带走。
-    const backToDefault = await sCall("hotkey_set", { accelerator: "CommandOrControl+Alt+P" });
+    const backToDefault = await sCall("hotkey_set", { accelerator: defaultAccel });
     if (!backToDefault.ok) {
       let liveNow = null;
       try {
@@ -2928,9 +2947,9 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
       }
       r.info("「改回默认值」拒绝现场", JSON.stringify({ e: backToDefault.e ?? null, code: backToDefault.code ?? null, status: liveNow }));
     }
-    r.check("改回默认值", "CommandOrControl+Alt+P", backToDefault.v);
+    r.check("改回默认值", defaultAccel, backToDefault.v);
     if (E2E_SETTINGS) {
-      r.check("改回默认值也写进隔离文件", "CommandOrControl+Alt+P", readE2eHotkey());
+      r.check("改回默认值也写进隔离文件", defaultAccel, readE2eHotkey());
     }
     const realSettingsAfter = fileSha256OrNull(REAL_SETTINGS);
     r.check(

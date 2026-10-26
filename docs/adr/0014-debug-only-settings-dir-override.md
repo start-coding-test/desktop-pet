@@ -51,3 +51,8 @@ A31 卡落地。E2E 的「改键成功」用例会调用 `hotkey_set`，原先�
   temp 下。
 - 真实 settings 的 sha256 前后比对假设运行期间没有第二个实例改它；若有，会误红而不是放宽。
 - release 不读该变量，因此没有 release 级热键 E2E 覆盖；`verify:release` 本就不测热键。
+
+## 后续（E02，2026-10-27）
+
+本决策只解决「热键值写到哪」；默认键本身被 E2E 机器占用的另一半由
+[0015](0015-debug-only-default-hotkey-override.md) 的 `PET_HOTKEY_DEFAULT` 处理。
