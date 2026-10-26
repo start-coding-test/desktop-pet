@@ -640,3 +640,109 @@ describe("A28 添加自选：真实 input→click 快照", () => {
     assert.deepEqual(h.published.at(-1)?.payload, { action: "add", input: "600519" });
   });
 });
+
+describe("A29 阈值输入框：契约回放下的 input→click 快照", () => {
+  /**
+   * 与上面 A28 那组的区别：这里**不直接**调 `handleEvent`，而是先看节点订阅过什么事件。
+   * 出处 `src/runtime/widget-renderer.ts:236-249`：宿主只对「插件订阅过的事件」挂真监听并回推，
+   * 而 `:88-96` 的 `snapshotOf` 只有 `change`/`input` 的快照带 `value`。
+   * 所以「少订阅一条 input」这种缺陷，只有按订阅关系回放才杀得掉 —— 直接调 handleEvent 的话
+   * `widget-node.ts:84` 会无条件把 value 写进节点，测试就变成恒绿装饰。
+   */
+  async function mountWatchHarness() {
+    const sent = [];
+    const session = new WidgetRenderSession((msg) => sent.push(msg));
+    const real = createDomFacade(session);
+    const inputs = [];
+    const buttons = [];
+    const dom = {
+      createElement(tagName) {
+        const node = real.createElement(tagName);
+        if (tagName === "input") inputs.push(node);
+        if (tagName === "button") buttons.push(node);
+        return node;
+      },
+      createElementNS(ns, tagName) {
+        return real.createElementNS(ns, tagName);
+      },
+    };
+    const published = [];
+    const ctx = { dom, bus: { publish: (topic, payload) => published.push({ topic, payload }) } };
+    const state = { lastPanel: null, autoPicked: false, section: (title, ...nodes) => ({ title, nodes }) };
+    const ops = () => sent.flatMap((m) => m.ops);
+    const listens = (node, event) =>
+      ops().filter((o) => o.k === "listen" && o.id === node.nodeId && o.event === event).length;
+    const type = (node, value) => {
+      if (listens(node, "input") > 0) session.handleEvent(node.nodeId, "input", { value });
+    };
+    const click = (node) => {
+      if (listens(node, "click") > 0) session.handleEvent(node.nodeId, "click", {});
+    };
+    const { mountWatchList } = await import("../../plugins/com.pet.astock/views/settings/watch-list.js");
+    const watch = [{ secid: "1.600519", code: "600519", name: "贵州茅台", upper: 58.8, lower: null, pct: null, limit: true }];
+    const view = mountWatchList(ctx, state);
+    view.render({ watch, quotes: {} });
+    session.flush();
+    const nums = inputs.filter((n) => n.type === "text" && n.classList.contains("num"));
+    const save = buttons.find((b) => b.textContent === "存");
+    return { session, sent, ops, listens, type, click, inputs, buttons, published, nums, save };
+  }
+
+  it("三只阈值框各订阅一条 input；「停」那列的 checkbox 维持 change 不动", async () => {
+    const h = await mountWatchHarness();
+    assert.equal(h.nums.length, 3, "upper / lower / pct 三只文本框");
+    assert.equal(
+      h.inputs.filter((n) => n.type === "checkbox").length,
+      1,
+      "每行只有一只「停」checkbox",
+    );
+    assert.ok(h.save, "「存」按钮在");
+    for (const box of h.nums) {
+      assert.equal(h.listens(box, "input"), 1, `节点 ${box.nodeId} 必须订阅 input，否则宿主不回推 value`);
+    }
+    const limit = h.inputs.find((n) => n.type === "checkbox");
+    assert.equal(h.listens(limit, "change"), 1, "checkbox 的 change 订阅保持原样（本卡不该动它）");
+    assert.equal(h.listens(limit, "input"), 0, "顺手给 checkbox 加 input 不在本卡范围内");
+  });
+
+  it("负对照：不注入 input 快照时，点「存」发的就是回显值（这就是缺陷的可观测面）", async () => {
+    const h = await mountWatchHarness();
+    assert.equal(h.nums[0].value, "58.8", "已设阈值回显成字符串");
+    assert.equal(h.nums[1].value, "", "未设（null）回显成空串，不是 \"null\"");
+    assert.equal(h.nums[2].value, "");
+    h.click(h.save);
+    assert.deepEqual(h.published.at(-1)?.payload, {
+      action: "update",
+      secid: "1.600519",
+      upper: "58.8",
+      lower: "",
+      pct: "",
+    });
+  });
+
+  it("三框各自注入快照后点「存」发的都是注入值；空串在 clampNum 收口里落 null（清除）", async () => {
+    const h = await mountWatchHarness();
+    const C = await import("../../plugins/com.pet.astock/core.js");
+    h.type(h.nums[0], "66.6");
+    h.type(h.nums[1], "50");
+    h.type(h.nums[2], "5");
+    h.click(h.save);
+    // 三框各钉一条：少任何一只的订阅，对应的字段就回落到回显值（M1a 实测红的就是 pct 那条）
+    assert.equal(h.published.at(-1)?.payload.upper, "66.6", "upper 发的必须是注入值");
+    assert.equal(h.published.at(-1)?.payload.lower, "50", "lower 发的必须是注入值");
+    assert.equal(h.published.at(-1)?.payload.pct, "5", "pct 发的必须是注入值");
+    assert.deepEqual(h.published.at(-1)?.payload, {
+      action: "update",
+      secid: "1.600519",
+      upper: "66.6",
+      lower: "50",
+      pct: "5",
+    });
+    // 清除路径：把「涨到」清空再点存 —— 发的是空串，收口 clampNum 把它落成 null
+    h.type(h.nums[0], "");
+    h.click(h.save);
+    assert.equal(h.published.at(-1)?.payload.upper, "");
+    assert.equal(C.clampNum(""), null, "空串=清除阈值");
+    assert.equal(C.clampNum("66.6"), 66.6, "正向对照：clampNum 没坏，上面那个 null 不是假的");
+  });
+});
