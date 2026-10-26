@@ -50,7 +50,7 @@ const {
   setDatasetIfChanged,
   setTextIfChanged,
 } = await import(new URL("../../plugins/com.pet.goat-gauge/views/write.js", import.meta.url));
-const { DEMO_SCENARIOS, demoSnapshot } = await import(
+const { DEMO_SCENARIOS, demoSnapshot, demoViewData, pickUsageView } = await import(
   new URL("../../plugins/com.pet.goat-gauge/demo.js", import.meta.url)
 );
 const {
@@ -1533,4 +1533,86 @@ group("C07 明细看板");
   );
   eq("panel cookieState 非法值回落 none", "none", buildPanelPayload({ cookieState: "bogus" }).cookieState);
   eq("panel 允许的 cookieState 枚举", true, COOKIE_STATES.includes("unavailable") && COOKIE_STATES.includes("expired"));
+}
+
+/* ============================ C11 演示缓存 KPI ============================ */
+group("C11 演示缓存 KPI");
+
+{
+  const now = Date.UTC(2026, 0, 10, 12, 0, 0);
+  const snap = demoSnapshot(now, "normal");
+  const data = demoViewData(now, "normal", "UTC", Number(snap.plan.current_period_start));
+  const view = { ...snap, daily: data.daily, charts: data.charts_by_day };
+  const cache = billingPeriodCache(view, { now, timeZone: "UTC" });
+  const numerator = data.daily.reduce((sum, day) => sum + (Number(day.tokens_in) || 0), 0);
+  const denominator = Object.values(data.charts_by_day)
+    .flat()
+    .reduce((sum, bucket) => sum + (Number(bucket.cache_read_tokens) || 0), 0);
+  eq("演示 daily tokens_in 分母", 3000, numerator);
+  eq("演示 charts cache_read_tokens 分子", 1500, denominator);
+  eq("演示缓存命中率 1500/(1500+3000)", 1 / 3, cache.rate);
+  eq("演示缓存 KPI 文本（fmtPct 四舍五入）", "33%", cache.text);
+
+  const localData = demoViewData(now, "normal", undefined, Number(snap.plan.current_period_start));
+  const localView = { ...snap, daily: localData.daily, charts: localData.charts_by_day };
+  eq("默认时区同样 33%", "33%", billingPeriodCache(localView, { now }).text);
+}
+
+{
+  const start = Date.UTC(2026, 0, 10);
+  for (const offset of [0, 86_400_000]) {
+    const now = start + offset;
+    const data = demoViewData(now, "normal", "UTC", start);
+    const view = {
+      plan: { current_period_start: start, current_period_end: start + 30 * 86_400_000 },
+      usage: { period_basis: "billing-period" },
+      daily: data.daily,
+      charts: data.charts_by_day,
+    };
+    eq(`周期首日/次日 now=${offset / 86_400_000}d 命中率`, 1 / 3, billingPeriodCache(view, { now, timeZone: "UTC" }).rate);
+  }
+}
+
+{
+  const data = demoViewData(Date.UTC(2026, 0, 10, 12), "normal", "UTC", Date.UTC(2026, 0, 1));
+  const realDaily = [{ tokens_in: 7 }];
+  const realCharts = { "2026-01-01": [{ cache_read_tokens: 3 }] };
+  const demo = pickUsageView({ demo: true, demoData: data, daily: realDaily, chartsByDay: realCharts });
+  check("演示模式选择 demo daily", demo.daily === data.daily);
+  check("演示模式选择 demo charts", demo.charts_by_day === data.charts_by_day);
+  const real = pickUsageView({ demo: false, demoData: data, daily: realDaily, chartsByDay: realCharts });
+  check("退出演示回真实 daily", real.daily === realDaily);
+  check("退出演示回真实 charts", real.charts_by_day === realCharts);
+  const empty = pickUsageView({ demo: true, demoData: null, daily: realDaily, chartsByDay: realCharts });
+  deep("演示缺数据不回退真实", empty.daily, []);
+  deep("演示缺数据 charts 为空", empty.charts_by_day, {});
+  eq("真实 daily 未被改写", 1, realDaily.length);
+  eq("真实 charts 未被改写", 1, realCharts["2026-01-01"].length);
+}
+
+{
+  const mainSrc = readFileSync(
+    new URL("../../plugins/com.pet.goat-gauge/main.js", import.meta.url),
+    "utf8",
+  );
+  const refreshAt = mainSrc.indexOf("async function refreshSnapshot");
+  const demoAt = mainSrc.indexOf("if (config.demo) {", refreshAt);
+  const elseAt = mainSrc.indexOf("} else {", demoAt);
+  const demoBlock = demoAt >= 0 && elseAt > demoAt ? mainSrc.slice(demoAt, elseAt) : "";
+  check("demo 分支注入 demoViewData", demoBlock.includes("demoData = demoViewData("));
+  check("真实分支/saveConfig 清空 demoData", mainSrc.includes("demoData = null;"));
+  check(
+    "view 用 pickUsageView 选数据源",
+    mainSrc.includes("pickUsageView({ demo: config.demo, demoData, daily, chartsByDay })"),
+  );
+  check(
+    "demo 分支不写真实 daily/chartsByDay",
+    demoBlock.length > 0 && !/daily\s*=/.test(demoBlock) && !/chartsByDay\s*=/.test(demoBlock),
+  );
+  const persistAt = mainSrc.indexOf("async function persist");
+  const restoreAt = mainSrc.indexOf("async function restore");
+  check(
+    "persist 函数体不含 demoData",
+    persistAt >= 0 && restoreAt > persistAt && !mainSrc.slice(persistAt, restoreAt).includes("demoData"),
+  );
 }
