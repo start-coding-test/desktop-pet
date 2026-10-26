@@ -1874,11 +1874,13 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   r.group("渲染几何与帧切片（单份图集 + 每帧源矩形）");
   const geo = await c.ev(`(async () => {
     const s = await import('/src/pet/sprites.ts');
-    const set = await s.loadSpriteSet(''); // 没有皮肤时的兜底路径
+    const loaded = await s.loadSpriteSet(''); // 没有皮肤时的兜底路径
+    const set = loaded.sprites;
     const style = getComputedStyle(document.documentElement);
     const num = (v) => parseInt(style.getPropertyValue(v) || '0', 10);
     const f = set.idle?.[0];
     return {
+      timing: loaded.timing,
       dpr: window.devicePixelRatio || 1,
       // 帧必须是「源矩形 + 单位化目标矩形」，不是一张烘焙画布：
       // 57 帧 × (360×dpr)² 的画布在 dpr=2 时约 118 MB，而图集本身才 12 MB
@@ -1897,6 +1899,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   r.check("每帧带源矩形与单位化目标矩形", true, geo.hasRect);
   r.check("目标矩形落在立绘单位方块内", true, geo.unitRect);
   r.check("兜底只提供 idle，不再伪造其余状态", ["idle"], geo.fallbackKeys);
+  r.check("兜底不带 v3 timing（状态机按 PET_STATES 现算）", undefined, geo.timing);
   r.check("立绘尺寸由 JS 写入 CSS 变量", true, geo.petSize > 0);
   r.check("徽标位置跟随立绘几何而非各自硬编", true, geo.badgeBottom > 0 && geo.badgeBottom < geo.innerH);
   r.check("气泡位置同理", true, geo.bubbleBottom > 0 && geo.bubbleBottom <= geo.innerH);
@@ -2021,6 +2024,162 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   r.check("v2 的行高按 11 行算（idle 仍在第 0 行）", 0, slice.v2Idle8Row);
   r.check("画廊里的 preview.webp（单行 1152×208）不算图集", null, slice.preview);
   r.check("列边界不是整数的图不认", null, slice.odd);
+
+  r.group("v3 清单：16 列跨行切片与 timing（D01）");
+  const v3 = await c.ev(`(async () => {
+    const s = await import('/src/pet/sprites.ts');
+    const m = await import('/src/pet/skin-manifest.ts');
+    const { detectSpriteAtlas } = await import('/src/pet/petdex-states.ts');
+    const { PetStateMachine } = await import('/src/pet/state-machine.ts');
+    const mk = (w, h) => { const cv = document.createElement('canvas'); cv.width = w; cv.height = h; return cv; };
+    // §5.1 示例：3072×2704 = 16 列 × 13 行，单元格 192×208；每格一种唯一颜色
+    const atlas = mk(3072, 2704);
+    const g = atlas.getContext('2d');
+    for (let row = 0; row < 13; row++) for (let col = 0; col < 16; col++) {
+      g.fillStyle = 'rgb(' + row + ',' + (col * 16) + ',0)';
+      g.fillRect(col * 192, row * 208, 192, 208);
+    }
+    const image = { width: 3072, height: 2704 };
+    const raw = { desktopPet: { version: 3, grid: { columns: 16, rows: 13 }, states: {
+      idle: { row: 0, frames: 48, durationMs: 2000 },
+      'running-right': { row: 3, frames: 16, durationMs: 800 },
+      'running-left': { row: 4, frames: 16, durationMs: 800 },
+      waving: { row: 5, frames: 12, durationMs: 600 },
+      jumping: { row: 6, frames: 14, durationMs: 700 },
+      failed: { row: 7, frames: 20, durationMs: 1200 },
+      waiting: { row: 9, frames: 32, durationMs: 2400 },
+      running: { row: 11, frames: 12, durationMs: 600 },
+      review: { row: 12, frames: 16, durationMs: 1100 },
+    } } };
+    const parsed = m.parseDesktopPetManifest(raw, image);
+    if (parsed.kind !== 'v3') return { kind: parsed.kind, reason: parsed.reason };
+    const sliced = s.sliceAtlasV3(atlas, parsed.manifest);
+    const set = sliced.sprites;
+    const at = (f) => ({ col: Math.round(f.sx / 192), row: Math.round(f.sy / 208) });
+    const sample = (f) => {
+      const c = mk(1, 1);
+      const g2 = c.getContext('2d');
+      g2.imageSmoothingEnabled = false;
+      g2.drawImage(atlas, f.sx, f.sy, f.sw, f.sh, 0, 0, 1, 1);
+      const d = g2.getImageData(0, 0, 1, 1).data;
+      return { r: d[0], g: d[1], b: d[2] };
+    };
+    const sm = new PetStateMachine(set, sliced.timing);
+    sm.request('waving');
+    sm.update(0.55);
+    const beforeDwell = sm.action;
+    sm.update(0.06);
+    const afterDwell = sm.action;
+    const smFrame = new PetStateMachine(set, sliced.timing);
+    smFrame.request('waving');
+    const f0 = smFrame.frame.sx;
+    smFrame.update(0.04);
+    const f04 = smFrame.frame.sx;
+    smFrame.update(0.02);
+    const f06 = smFrame.frame.sx;
+    return {
+      kind: parsed.kind,
+      warnings: parsed.warnings,
+      keys: Object.keys(set),
+      counts: Object.fromEntries(Object.entries(set).map(([k, frames]) => [k, frames.length])),
+      idle47: at(set.idle[47]),
+      waiting16: at(set.waiting[16]),
+      failed19: at(set.failed[19]),
+      pixelIdle47: sample(set.idle[47]),
+      pixelWaiting16: sample(set.waiting[16]),
+      pixelFailed19: sample(set.failed[19]),
+      shared: Object.values(set).flat().every((f) => f.source === atlas),
+      fits: Object.values(set).flat().every((f) =>
+        f.nx >= 0 && f.ny >= 0 && f.nw > 0 && f.nh > 0 && f.nx + f.nw <= 1.0001 && f.ny + f.nh <= 1.0001),
+      timingWaving: sliced.timing.waving,
+      beforeDwell, afterDwell,
+      f0, f04, f06,
+      detect18: detectSpriteAtlas(3072, 3744),
+      noManifest18: m.parseDesktopPetJson(null, { width: 3072, height: 3744 }).kind,
+    };
+  })()`);
+  r.check("合法 v3 清单被识别", "v3", v3.kind);
+  r.check("九个状态都按清单切出帧", 9, v3.keys.length);
+  r.check("每个状态切出的帧数与清单一致", JSON.stringify({
+    idle: 48, "running-right": 16, "running-left": 16, waving: 12, jumping: 14,
+    failed: 20, waiting: 32, running: 12, review: 16,
+  }), JSON.stringify(v3.counts));
+  r.check("idle[47] 取自第 2 行第 15 列", JSON.stringify({ col: 15, row: 2 }), JSON.stringify(v3.idle47));
+  r.check("waiting[16] 取自第 10 行第 0 列", JSON.stringify({ col: 0, row: 10 }), JSON.stringify(v3.waiting16));
+  r.check("failed[19] 取自第 8 行第 3 列", JSON.stringify({ col: 3, row: 8 }), JSON.stringify(v3.failed19));
+  r.check("像素反查：idle[47] 的颜色属于 row2/col15", JSON.stringify({ r: 2, g: 240, b: 0 }), JSON.stringify(v3.pixelIdle47));
+  r.check("像素反查：waiting[16] 的颜色属于 row10/col0", JSON.stringify({ r: 10, g: 0, b: 0 }), JSON.stringify(v3.pixelWaiting16));
+  r.check("像素反查：failed[19] 的颜色属于 row8/col3", JSON.stringify({ r: 8, g: 48, b: 0 }), JSON.stringify(v3.pixelFailed19));
+  r.check("所有帧共用同一份源图", true, v3.shared);
+  r.check("目标矩形都落在立绘单位方块内", true, v3.fits);
+  r.check("waving 的 timing 来自清单", JSON.stringify({ frameSec: 0.05, cycleSec: 0.6 }), JSON.stringify(v3.timingWaving));
+  r.check("手势 dwell 用清单的 cycleSec（550ms 仍在）", "waving", v3.beforeDwell);
+  r.check("手势 dwell 用清单的 cycleSec（610ms 回落）", "idle", v3.afterDwell);
+  r.check("帧间隔用清单的 frameSec（40ms 不换帧）", 0, v3.f04);
+  r.check("帧间隔用清单的 frameSec（60ms 换到下一帧）", 192, v3.f06);
+  r.check("帧序从第 1 帧开始", 0, v3.f0);
+  r.check("16×18 尺寸（宽高比同 v1）无清单时仍被识别为 v1", JSON.stringify({ version: 1, rows: 9 }), JSON.stringify({ version: v3.detect18?.version, rows: v3.detect18?.rows }));
+  r.check("16×18 尺寸无清单时解析结果是没有清单", "none", v3.noManifest18);
+
+  const fallback = await c.ev(`(async () => {
+    const s = await import('/src/pet/sprites.ts');
+    let iconPath = '/assets/app-icon.png';
+    try {
+      const iconMod = await import('/assets/app-icon.png?url');
+      if (typeof iconMod.default === 'string') iconPath = iconMod.default;
+    } catch {
+      // dev 资产插件不可用时直接走根路径静态服务
+    }
+    const iconUrl = new URL(iconPath, location.origin).href;
+    const originalFetch = window.fetch;
+    const realFetch = originalFetch.bind(window);
+    const realWarn = console.warn;
+    const warns = [];
+    console.warn = (...args) => { warns.push(args.map((a) => String(a)).join(' ')); };
+    const out = [];
+    try {
+      const bad = [
+        { name: 'columns', body: { desktopPet: { version: 3, grid: { columns: 8, rows: 8 }, states: { idle: { row: 0, frames: 1, durationMs: 32 } } } }, expect: 'columns' },
+        { name: 'frames', body: { desktopPet: { version: 3, grid: { columns: 16, rows: 8 }, states: { idle: { row: 0, frames: 65, durationMs: 2000 } } } }, expect: 'frames' },
+        { name: 'overlap', body: { desktopPet: { version: 3, grid: { columns: 16, rows: 8 }, states: { idle: { row: 0, frames: 1, durationMs: 32 }, waving: { row: 0, frames: 1, durationMs: 32 } } } }, expect: '相交' },
+      ];
+      for (const c of bad) {
+        warns.length = 0;
+        window.fetch = async (url, init) => String(url).endsWith('/pet.json')
+          ? new Response(JSON.stringify(c.body), { status: 200 })
+          : realFetch(url, init);
+        const loaded = await s.loadSpriteSet(iconUrl);
+        out.push({ name: c.name, keys: Object.keys(loaded.sprites).sort(), timing: loaded.timing === undefined, warn: warns.join(' | '), expect: c.expect });
+      }
+      const none = [
+        { name: '404', response: () => new Response('', { status: 404 }) },
+        { name: 'version2', response: () => new Response(JSON.stringify({ desktopPet: { version: 2 } }), { status: 200 }) },
+        { name: 'badjson', response: () => new Response('not json', { status: 200 }) },
+      ];
+      for (const c of none) {
+        warns.length = 0;
+        window.fetch = async (url, init) => String(url).endsWith('/pet.json') ? c.response() : realFetch(url, init);
+        const loaded = await s.loadSpriteSet(iconUrl);
+        out.push({ name: c.name, keys: Object.keys(loaded.sprites).sort(), timing: loaded.timing === undefined, warn: warns.join(' | ') });
+      }
+      return { cases: out };
+    } finally {
+      window.fetch = originalFetch;
+      console.warn = realWarn;
+    }
+  })()`);
+  for (const item of fallback.cases.slice(0, 3)) {
+    r.check(`无效 v3 清单（${item.name}）回退占位帧`, JSON.stringify(["idle"]), JSON.stringify(item.keys));
+    r.check(`无效 v3 清单（${item.name}）不带 timing`, true, item.timing);
+    r.check(`无效 v3 清单（${item.name}）warn 带具体原因`, true,
+      String(item.warn).includes("v3 清单无效") && String(item.warn).includes(item.expect));
+  }
+  for (const item of fallback.cases.slice(3)) {
+    r.check(`无清单（${item.name}）不走 v3 无效分支`, false, String(item.warn).includes("v3 清单无效"));
+    r.check(`无清单（${item.name}）不带 v3 timing`, true, item.timing);
+    r.check(`无清单（${item.name}）走原 v1/v2 路径（图不是图集时报原错误）`, true,
+      String(item.warn).includes("不是受支持的 petdex 图集"));
+  }
 
   r.group("状态机优先级与排队上限（#19，词表 = petdex 九状态）");
   const sm = await c.ev(`(async () => {

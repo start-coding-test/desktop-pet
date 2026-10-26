@@ -65,7 +65,7 @@ try {
     const { loadSpriteSet, decodedAtlases } = await import('/src/pet/sprites.ts');
     const { PET_STATES } = await import('/src/pet/petdex-states.ts');
     const skin = await activeSkin();
-    const set = await loadSpriteSet(skin.url);
+    const { sprites: set } = await loadSpriteSet(skin.url);
     const counts = {};
     for (const st of PET_STATES) counts[st.id] = set[st.id]?.length ?? 0;
     return {

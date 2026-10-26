@@ -15,7 +15,14 @@ import {
   SPRITE_FRAME_WIDTH,
   detectSpriteAtlas,
 } from "./petdex-states";
-import type { PetStateId } from "./petdex-states";
+import type { PetStateId, SpriteTiming } from "./petdex-states";
+import {
+  V3_COLUMNS,
+  frameCell,
+  manifestTiming,
+  parseDesktopPetJson,
+  type DesktopPetManifest,
+} from "./skin-manifest";
 
 export type { PetStateId };
 /** 状态词表完全等同 petdex：原来的 12 个自造状态（walk/greet/sleep/react/…）已取消 */
@@ -55,21 +62,85 @@ export function deviceScale(): number {
 const MAX_ATLASES = 2;
 const atlasCache = new Map<string, HTMLImageElement>();
 
+/** pet.json 与图集同目录；超时按“没有清单”处理，不能让旧皮肤的 v1/v2 被读清单拖住。 */
+export const PET_JSON_TIMEOUT_MS = 2000;
+
+export interface LoadedSpriteSet {
+  sprites: SpriteSet;
+  /** v3 清单给出的逐状态节奏；v1/v2/兜底不传，状态机按 PET_STATES 现算 */
+  timing?: SpriteTiming;
+}
+
 /**
  * 从图集 URL 装载九个状态的帧序列。
  * URL 由宿主 petskin 协议给出（`http://petskin.localhost/<slug>/sprite.webp`）。
  * url 为空（还没有任何皮肤）或图集不被识别时，退回程序生成的 idle 帧。
+ *
+ * v3 只由同目录 pet.json 的 desktopPet.version === 3 触发：
+ * - 无清单 / JSON 非法 / version ≠ 3：走原来的 v1/v2 尺寸识别，行为不变
+ * - version 3 但校验失败：占位帧 + console.warn 具体原因（不再猜 v1/v2）
  */
-export async function loadSpriteSet(url: string): Promise<SpriteSet> {
-  if (!url) return buildProceduralSpriteSet();
+export async function loadSpriteSet(url: string): Promise<LoadedSpriteSet> {
+  if (!url) return { sprites: buildProceduralSpriteSet() };
+  let img: HTMLImageElement;
+  let manifestText: string | null;
   try {
-    const img = await loadAtlas(url);
-    const set = sliceAtlas(img);
-    if (!set) throw new Error(`不是受支持的 petdex 图集: ${img.naturalWidth}x${img.naturalHeight}`);
-    return set;
+    [img, manifestText] = await Promise.all([loadAtlas(url), readDesktopPetJson(url)]);
   } catch (err) {
     console.warn("[pet] 图集加载失败，退回程序生成占位帧", err);
-    return buildProceduralSpriteSet();
+    return { sprites: buildProceduralSpriteSet() };
+  }
+
+  const parsed = parseDesktopPetJson(manifestText, {
+    width: img.naturalWidth,
+    height: img.naturalHeight,
+  });
+  if (parsed.kind === "invalid") {
+    console.warn(`[pet] v3 清单无效，退回程序生成占位帧: ${parsed.reason}`);
+    return { sprites: buildProceduralSpriteSet() };
+  }
+  if (parsed.kind === "v3") {
+    warnManifestWarnings(parsed.warnings);
+    return sliceAtlasV3(img, parsed.manifest);
+  }
+
+  try {
+    const set = sliceAtlas(img);
+    if (!set) throw new Error(`不是受支持的 petdex 图集: ${img.naturalWidth}x${img.naturalHeight}`);
+    return { sprites: set };
+  } catch (err) {
+    console.warn("[pet] 图集加载失败，退回程序生成占位帧", err);
+    return { sprites: buildProceduralSpriteSet() };
+  }
+}
+
+/** 未知状态 id 只提醒一次（换回同一皮肤时不重复刷屏） */
+const warnedManifestStates = new Set<string>();
+
+function warnManifestWarnings(warnings: string[]): void {
+  for (const warning of warnings) {
+    if (warnedManifestStates.has(warning)) continue;
+    warnedManifestStates.add(warning);
+    console.warn(`[pet] v3 清单: ${warning}`);
+  }
+}
+
+/** 同目录 pet.json：默认 2 秒超时、任何失败都按“没有清单”返回 null */
+export async function readDesktopPetJson(
+  atlasUrl: string,
+  timeoutMs = PET_JSON_TIMEOUT_MS,
+): Promise<string | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const petUrl = new URL("pet.json", new URL(atlasUrl, document.baseURI)).href;
+    const res = await fetch(petUrl, { signal: controller.signal });
+    if (!res.ok) return null;
+    return await res.text();
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -116,6 +187,48 @@ export function sliceAtlas(img: AtlasSource): SpriteSet | null {
     set[state.id] = frames;
   }
   return set;
+}
+
+/**
+ * v3 图集：16 列、行数由清单给定，状态帧按 row + floor(k/16) 跨行排列。
+ * 单元格几何沿用 v1/v2 的 contain 逻辑，目标矩形仍是单位化正方形。
+ */
+export function sliceAtlasV3(
+  img: AtlasSource,
+  manifest: DesktopPetManifest,
+): LoadedSpriteSet {
+  const { width: sw, height: sh } = sourceSize(img);
+  const cellW = sw / V3_COLUMNS;
+  const cellH = sh / manifest.grid.rows;
+  const scale = FRAME_SIZE / Math.max(cellW, cellH);
+  const nw = (cellW * scale) / FRAME_SIZE;
+  const nh = (cellH * scale) / FRAME_SIZE;
+  const nx = (1 - nw) / 2;
+  const ny = (1 - nh) / 2;
+
+  const sprites: SpriteSet = {};
+  for (const state of PET_STATES) {
+    const spec = manifest.states[state.id];
+    if (!spec) continue;
+    const frames: SpriteFrame[] = [];
+    for (let k = 0; k < spec.frames; k++) {
+      const cell = frameCell(manifest, state.id, k);
+      if (!cell) break;
+      frames.push({
+        source: img,
+        sx: cell.col * cellW,
+        sy: cell.row * cellH,
+        sw: cellW,
+        sh: cellH,
+        nx,
+        ny,
+        nw,
+        nh,
+      });
+    }
+    sprites[state.id] = frames;
+  }
+  return { sprites, timing: manifestTiming(manifest) };
 }
 
 export function loadAtlas(url: string): Promise<HTMLImageElement> {
