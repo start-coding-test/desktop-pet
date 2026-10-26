@@ -1,19 +1,60 @@
 // 概览：账户/套餐、三环、KPI、告警、刷新与网络状态。
 import { fmtCredits, fmtDateTime, fmtMoney, fmtPct, fmtTokens } from "../../format.js";
+import { localDayKey } from "../../history.js";
 import { TOPIC_CMD } from "../../topics.js";
 import { button, card, hint, row, tag, text } from "../dom.js";
 import { createRing } from "../rings.js";
+import { cacheHitRate } from "./details.js";
 
-const KPI_DEFS = [
+export const KPI_DEFS = [
   ["monthly", "月剩余"],
-  ["purchased", "购买"],
-  ["free", "赠送"],
+  ["cache", "缓存命中率"],
   ["requests", "请求数"],
   ["cost", "总成本"],
   ["avg", "平均成本"],
   ["success", "成功率"],
   ["tokens", "Tokens (入/出)"],
 ];
+
+/**
+ * 概览缓存命中率：本计费周期（start..min(now,end)）按本地日历日过滤，
+ * 分子取 charts_by_day 的 cache_read_tokens，分母取 daily.tokens_in；
+ * 缺账期或 period_basis 不是 billing-period 时退回全部可用数据。
+ * 复用 C07 的 cacheHitRate；结果夹在 0–100%，NaN/Infinity 记 null。
+ */
+export function billingPeriodCache(
+  view = {},
+  { now = Number(view.fetchedAt) || Date.now(), timeZone = undefined, inputIncludesCache = false } = {},
+) {
+  const start = Number(view.plan?.current_period_start) || 0;
+  const end = Number(view.plan?.current_period_end) || 0;
+  const usePeriod = String(view.usage?.period_basis ?? "") === "billing-period" && start > 0;
+  const startKey = usePeriod ? localDayKey(start, timeZone) : "";
+  const endKey = usePeriod ? localDayKey(end > 0 ? Math.min(now, end) : now, timeZone) : "";
+  const inWindow = (dayKey) => {
+    if (!usePeriod) return true;
+    return !!dayKey && dayKey >= startKey && dayKey <= endKey;
+  };
+  let cacheReadTokens = 0;
+  for (const [day, buckets] of Object.entries(view.charts ?? {})) {
+    if (!inWindow(day)) continue;
+    for (const bucket of Array.isArray(buckets) ? buckets : []) {
+      cacheReadTokens += Number(bucket?.cache_read_tokens) || 0;
+    }
+  }
+  let tokensIn = 0;
+  for (const day of Array.isArray(view.daily) ? view.daily : []) {
+    if (!inWindow(localDayKey(Number(day?.at_ms), timeZone))) continue;
+    tokensIn += Number(day?.tokens_in) || 0;
+  }
+  const raw = cacheHitRate({ cacheReadTokens, tokensIn, inputIncludesCache });
+  const rate = typeof raw === "number" && !Number.isNaN(raw) ? Math.min(1, Math.max(0, raw)) : null;
+  return {
+    rate,
+    text: fmtPct(rate === null ? null : rate * 100),
+    scope: usePeriod ? "period" : "all",
+  };
+}
 
 const STATUS_TEXT = { active: "有效", trialing: "试用", past_due: "逾期" };
 const BASIS_TEXT = { "billing-period": "本计费周期" };
@@ -43,13 +84,18 @@ export function mountDashboard(ctx, cleanups) {
 
   const kpis = tag(dom, "div", "g-kpis");
   const kpiValues = {};
+  const kpiLabels = {};
+  const kpiCells = {};
   for (const [key, label] of KPI_DEFS) {
-    const cell = tag(dom, "div", "g-kpi");
+    const cell = tag(dom, "div", key === "cache" ? "g-kpi g-kpi-wide" : "g-kpi");
     const value = tag(dom, "b");
     value.textContent = "—";
-    cell.append(value, text(dom, label));
+    const labelNode = text(dom, label);
+    cell.append(value, labelNode);
     kpis.append(cell);
     kpiValues[key] = value;
+    kpiLabels[key] = labelNode;
+    kpiCells[key] = cell;
   }
 
   const alerts = tag(dom, "div", "g-alerts");
@@ -97,9 +143,11 @@ export function mountDashboard(ctx, cleanups) {
     const credits = d.credits ?? {};
     const usage = d.usage ?? {};
     const money = { currency: d.config?.currency, usdToCny: d.config?.usdToCny };
+    const cache = billingPeriodCache(d, { now: Number(d.fetchedAt) || Date.now() });
     kpiValues.monthly.textContent = fmtCredits(credits.monthly_remaining);
-    kpiValues.purchased.textContent = fmtCredits(credits.purchased);
-    kpiValues.free.textContent = fmtCredits(credits.free);
+    kpiValues.cache.textContent = cache.text;
+    kpiLabels.cache.textContent = `缓存命中率（${cache.scope === "period" ? "账期" : "全部"}）`;
+    kpiCells.cache.title = cache.scope === "period" ? "本计费周期" : "全部可用数据（缺账期）";
     kpiValues.requests.textContent = String(usage.total_count ?? 0);
     kpiValues.cost.textContent = fmtMoney(usage.total_cost, money);
     kpiValues.avg.textContent = fmtMoney(usage.average_cost, money);

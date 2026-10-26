@@ -32,6 +32,7 @@ export const SETTINGS_CSS = `
   .g-kpi { background: #f9fafb; border: 1px solid #eaecf0; border-radius: 8px; padding: 8px; }
   .g-kpi b { display: block; font-size: 15px; color: #1d2939; }
   .g-kpi span { font-size: 11px; color: #667085; }
+  .g-kpi.g-kpi-wide { grid-column: span 2; }
   .g-quota { background: #11131a; border-color: #1f2430; color: #eef2f6; }
   .g-quota .g-card-t { color: #cfd6e0; }
   .g-alerts { display: flex; flex-direction: column; gap: 4px; }
