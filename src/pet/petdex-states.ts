@@ -17,6 +17,11 @@ export type PetStateId =
   | "running"
   | "review";
 
+/** v3 清单算出的逐状态节奏；v1/v2 不传，状态机按 PET_STATES 现算。 */
+export type SpriteTiming = Partial<
+  Record<PetStateId, { frameSec: number; cycleSec: number }>
+>;
+
 export interface PetStateDef {
   id: PetStateId;
   label: string;

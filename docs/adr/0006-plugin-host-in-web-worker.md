@@ -82,6 +82,8 @@ dev 用 `npm run dev:debug`（无 CSP），打包版用 `tauri build --no-bundle
    相对引用（referrer 是 Worker 脚本），不是插件模块的相对引用，两者不能混。
 3. **宿主也别想用 fetch 代取插件源码**（F 被 connect-src 拦）。要么把 petplugin 加进 connect-src（那要再过一次 ADR），
    要么引导脚本用 import 而不是 fetch —— H 已证明 import 这条路通，所以**本波不必改 CSP**。
+   D01 例外（2026-10-26，用户选 A）：v3 皮肤清单要 `fetch` 同目录 `pet.json`，打包版 `connect-src`
+   追加 `http://petskin.localhost` 一个来源；与本 ADR 的 Worker 路线无关。
 4. **Worker 里没有 window/document/localStorage**（B/H 实测 undefined）：真隔离成立，
    `bridge.ts:121` 那个自报 id 的伪造面随之消失；「迁移前的旧副本」那条退路也彻底没了。
 5. **OffscreenCanvas 在 Worker 里可用**（function），主文档侧 canvas 元素确有 `transferControlToOffscreen`；

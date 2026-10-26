@@ -209,8 +209,8 @@ async function applySkin(url: string | null): Promise<void> {
   skinUrl = url;
   const next = await loadSpriteSet(url ?? "");
   if (seq !== skinSeq) return;
-  sprites = next;
-  pet?.setSprites(sprites);
+  sprites = next.sprites;
+  pet?.setSprites(sprites, next.timing);
   fitCanvas();
 }
 
@@ -321,8 +321,9 @@ async function init(): Promise<void> {
   fitCanvas();
   syncLayout();
   skinUrl = await fetchActiveSkin();
-  sprites = await loadSpriteSet(skinUrl ?? "");
-  pet = new PetStateMachine(sprites);
+  const loaded = await loadSpriteSet(skinUrl ?? "");
+  sprites = loaded.sprites;
+  pet = new PetStateMachine(sprites, loaded.timing);
   pet.onSleep = () => sayRandom(pickLine("waiting"));
 
   registerPetController({

@@ -1,5 +1,5 @@
 import { PET_STATES, frameSeconds } from "./petdex-states";
-import type { PetStateId } from "./petdex-states";
+import type { PetStateId, SpriteTiming } from "./petdex-states";
 import type { SpriteFrame, SpriteSet, ActionName } from "./sprites";
 import { FramePlayer } from "./player";
 
@@ -46,19 +46,27 @@ export class PetStateMachine {
   /** 进入 waiting（长时间无交互）时回调（渲染层配台词） */
   onSleep?: () => void;
 
-  constructor(sprites: SpriteSet) {
-    // 每个状态的画面节奏取自 petdex 状态表，行为参数在下面按本项目交互模型给定
+  constructor(sprites: SpriteSet, timing?: SpriteTiming) {
+    this.applySprites(sprites, timing);
+  }
+
+  /** 重建 defs/players：帧间隔与手势 dwell 都以 timing 为准，缺省回落 petdex 状态表 */
+  private applySprites(sprites: SpriteSet, timing?: SpriteTiming): void {
+    this.defs = {};
+    this.players = {};
     const def = (id: PetStateId, partial: StateDef): void => {
       const frames = sprites[id];
       if (!frames || frames.length === 0) return;
       this.defs[id] = partial;
       const state = PET_STATES.find((s) => s.id === id)!;
-      this.players[id] = new FramePlayer(frames, frameSeconds(state));
+      this.players[id] = new FramePlayer(frames, timing?.[id]?.frameSec ?? frameSeconds(state));
     };
 
-    // 手势类的一遍时长直接取表里的 durationMs，与 petdex 桌面端的 dwell 语义对齐
+    // 手势类的一遍时长默认取表里的 durationMs；v3 清单给了 durationMs 就按清单，
+    // 与 petdex 桌面端的 dwell 语义对齐
     const gesture = (id: PetStateId): StateDef => ({
-      dwell: PET_STATES.find((s) => s.id === id)!.durationMs / 1000,
+      dwell:
+        timing?.[id]?.cycleSec ?? PET_STATES.find((s) => s.id === id)!.durationMs / 1000,
       next: "idle",
       priority: 10,
       renewable: false,
@@ -94,17 +102,11 @@ export class PetStateMachine {
     if (this.queue.length > PetStateMachine.MAX_QUEUE) this.queue.shift();
   }
 
-  /** 换上一批重新烘焙的帧（DPI 变化、换皮肤用），保持当前状态 */
-  setSprites(sprites: SpriteSet): void {
+  /** 换一批帧（换皮肤用），保持当前状态；dwell 与帧间隔随新 timing 一起重建 */
+  setSprites(sprites: SpriteSet, timing?: SpriteTiming): void {
     const keep: ActionName = this.players[this.current] ? this.current : "idle";
     const played = this.played;
-    this.players = {};
-    for (const action of Object.keys(this.defs) as ActionName[]) {
-      const frames = sprites[action];
-      if (!frames || frames.length === 0) continue;
-      const state = PET_STATES.find((s) => s.id === action)!;
-      this.players[action] = new FramePlayer(frames, frameSeconds(state));
-    }
+    this.applySprites(sprites, timing);
     this.current = this.players[keep] ? keep : "idle";
     this.played = played;
     this.players[this.current]?.reset();
