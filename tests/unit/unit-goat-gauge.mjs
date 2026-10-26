@@ -21,8 +21,20 @@ const { fmtCountdown, fmtCredits, fmtMoney, fmtPct, fmtTokens } = await import(
 const { AGENT_RUNNING_REFRESH_SEC, nextDelay, scheduleBaseSec } = await import(
   new URL("../../plugins/com.pet.goat-gauge/schedule.js", import.meta.url)
 );
-const { TOPIC_AGENT_STATE } = await import(
+const { TOPIC_AGENT_STATE, TOPIC_WIDGET } = await import(
   new URL("../../plugins/com.pet.goat-gauge/topics.js", import.meta.url)
+);
+const { SETTINGS_CSS } = await import(
+  new URL("../../plugins/com.pet.goat-gauge/views/settings/util.js", import.meta.url)
+);
+const { RING_CSS } = await import(
+  new URL("../../plugins/com.pet.goat-gauge/views/rings.js", import.meta.url)
+);
+const { BADGE_CSS } = await import(
+  new URL("../../plugins/com.pet.goat-gauge/views/badge.js", import.meta.url)
+);
+const { OVERLAY_CSS, OVERLAY_LAYOUT, overlayContentHeight, mountOverlay } = await import(
+  new URL("../../plugins/com.pet.goat-gauge/views/overlay.js", import.meta.url)
 );
 const { appendHistory, bucketToLocalDay, localDayKey, samplePoint } = await import(
   new URL("../../plugins/com.pet.goat-gauge/history.js", import.meta.url)
@@ -1614,5 +1626,285 @@ group("C11 演示缓存 KPI");
   check(
     "persist 函数体不含 demoData",
     persistAt >= 0 && restoreAt > persistAt && !mainSrc.slice(persistAt, restoreAt).includes("demoData"),
+  );
+}
+
+/* ============================ C10 视觉 token 与悬浮卡状态 ============================ */
+group("C10 视觉 token 与悬浮卡状态");
+
+{
+  const cssAll = [SETTINGS_CSS, RING_CSS, OVERLAY_CSS, BADGE_CSS].join("\n");
+  const tokens = {};
+  for (const match of cssAll.matchAll(/--(g-[a-z0-9-]+)\s*:\s*(#[0-9a-fA-F]{6})\b/g)) {
+    tokens[`--${match[1]}`] = match[2];
+  }
+  const pairs = [
+    ["--g-text", "--g-canvas"],
+    ["--g-text", "--g-surface"],
+    ["--g-text", "--g-surface-2"],
+    ["--g-text", "--g-accent-soft"],
+    ["--g-text-2", "--g-surface"],
+    ["--g-text-2", "--g-surface-2"],
+    ["--g-muted", "--g-canvas"],
+    ["--g-muted", "--g-surface"],
+    ["--g-muted", "--g-surface-2"],
+    ["--g-accent", "--g-surface"],
+    ["--g-accent", "--g-accent-soft"],
+    ["--g-on-accent", "--g-accent"],
+    ["--g-success-text", "--g-surface"],
+    ["--g-success-text", "--g-success-soft"],
+    ["--g-warning-text", "--g-surface"],
+    ["--g-warning-text", "--g-warning-soft"],
+    ["--g-danger-text", "--g-surface"],
+    ["--g-danger-text", "--g-danger-soft"],
+    ["--g-info-text", "--g-surface"],
+    ["--g-info-text", "--g-info-soft"],
+    ["--g-dark-text", "--g-dark-bg"],
+    ["--g-dark-text", "--g-dark-surface"],
+    ["--g-dark-muted", "--g-dark-bg"],
+    ["--g-dark-muted", "--g-dark-surface"],
+    ["--g-dark-accent", "--g-dark-bg"],
+    ["--g-dark-accent", "--g-dark-surface"],
+    ["--g-dark-success", "--g-dark-bg"],
+    ["--g-dark-success", "--g-dark-surface"],
+    ["--g-dark-warning", "--g-dark-bg"],
+    ["--g-dark-warning", "--g-dark-surface"],
+    ["--g-dark-danger", "--g-dark-bg"],
+    ["--g-dark-danger", "--g-dark-surface"],
+    ["--g-badge-text", "--g-badge-bg"],
+    ["--g-badge-muted", "--g-badge-bg"],
+    ["--g-ring-reset", "--g-dark-bg"],
+    ["--g-ring-muted", "--g-dark-bg"],
+  ];
+  const channel = (value) => {
+    const c = parseInt(value, 16) / 255;
+    return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  };
+  const luminance = (hex) =>
+    0.2126 * channel(hex.slice(1, 3)) +
+    0.7152 * channel(hex.slice(3, 5)) +
+    0.0722 * channel(hex.slice(5, 7));
+  const contrast = (a, b) => {
+    const l1 = luminance(a);
+    const l2 = luminance(b);
+    return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+  };
+  const missing = pairs.filter(([fg, bg]) => !tokens[fg] || !tokens[bg]);
+  const rows = pairs
+    .filter(([fg, bg]) => tokens[fg] && tokens[bg])
+    .map(([fg, bg]) => ({ fg, bg, ratio: contrast(tokens[fg], tokens[bg]) }));
+  const min = rows.length ? Math.min(...rows.map((row) => row.ratio)) : 0;
+  const fails = rows.filter((row) => row.ratio < 4.5).length;
+  console.log(`contrast: ${rows.length} pairs, min=${min.toFixed(2)}, fail=${fails}`);
+  eq("C10 对比度 token 齐全", 0, missing.length);
+  eq("C10 对比度 fail=0", 0, fails);
+  check("C10 对比度最小 >= 4.5", min >= 4.5);
+
+  for (const [name, css] of [
+    ["SETTINGS_CSS", SETTINGS_CSS],
+    ["RING_CSS", RING_CSS],
+    ["OVERLAY_CSS", OVERLAY_CSS],
+    ["BADGE_CSS", BADGE_CSS],
+  ]) {
+    check(`C10 ${name} 无外部资源`, !/url\s*\(|@import|https?:\/\//i.test(css));
+  }
+  check(
+    "C10 CSS token/KPI 布局存在",
+    ["--g-canvas", "--g-dark-bg", "--g-badge-bg"].every((token) => cssAll.includes(token)) &&
+      SETTINGS_CSS.includes("repeat(4, minmax(0, 1fr))") &&
+      SETTINGS_CSS.includes("g-kpi-wide"),
+  );
+  check(
+    "C10 RING_CSS 保留 good/warn/bad 状态色 class",
+    ["good", "warn", "bad"].every((tone) => RING_CSS.includes(`.g-ring.${tone} .g-ring-progress`)),
+  );
+}
+
+class C10FakeNode {
+  constructor(tag) {
+    this.tagName = tag;
+    this.children = [];
+    this.parentNode = null;
+    this.dataset = {};
+    this.attrs = {};
+    this._text = "";
+    this._class = "";
+  }
+  append(...nodes) {
+    for (const node of nodes) {
+      if (!node) continue;
+      node.parentNode = this;
+      this.children.push(node);
+    }
+  }
+  remove() {
+    if (!this.parentNode) return;
+    const index = this.parentNode.children.indexOf(this);
+    if (index >= 0) this.parentNode.children.splice(index, 1);
+    this.parentNode = null;
+  }
+  setAttribute(name, value) {
+    this.attrs[name] = String(value);
+  }
+  set className(value) {
+    this._class = String(value ?? "");
+  }
+  get className() {
+    return this._class;
+  }
+  set textContent(value) {
+    this._text = String(value ?? "");
+  }
+  get textContent() {
+    return this._text + this.children.map((child) => child.textContent).join("");
+  }
+}
+
+const c10HasClass = (node, cls) =>
+  [node?.className, node?.attrs?.class].some((value) =>
+    String(value ?? "").split(/\s+/).includes(cls),
+  );
+const c10FindAll = (node, cls, out = []) => {
+  if (!node) return out;
+  if (c10HasClass(node, cls)) out.push(node);
+  for (const child of node.children ?? []) c10FindAll(child, cls, out);
+  return out;
+};
+
+function c10MountOverlay() {
+  const root = new C10FakeNode("root");
+  const subscriptions = new Map();
+  const cleanups = [];
+  const ctx = {
+    dom: {
+      createElement: (tag) => new C10FakeNode(tag),
+      createElementNS: (_ns, tag) => new C10FakeNode(tag),
+    },
+    bus: {
+      subscribe: (topic, callback) => {
+        subscriptions.set(topic, callback);
+        return () => {};
+      },
+      publish: () => {},
+    },
+  };
+  mountOverlay(root, ctx, cleanups);
+  return {
+    root,
+    cleanups,
+    emit: (view) => subscriptions.get(TOPIC_WIDGET)?.(view),
+    card: () => c10FindAll(root, "g-card")[0] ?? null,
+  };
+}
+
+{
+  const c10Window = (pct = 63, available = true) => ({
+    available,
+    remaining_pct: pct,
+    reset_at: 0,
+    exceeded: false,
+    note: available ? "" : "不可用",
+  });
+  const c10View = (overrides = {}) => ({
+    account: { name: "演示账户", mode: "key" },
+    windows: {
+      five_hour: c10Window(63),
+      weekly: c10Window(59),
+      monthly: c10Window(42),
+    },
+    usage: { total_cost: 1.23 },
+    plan: { name: "GOAT" },
+    config: { currency: "USD" },
+    fetchedAt: 1000,
+    state: "ok",
+    ...overrides,
+  });
+  const heightOk = overlayContentHeight() <= OVERLAY_LAYOUT.height - OVERLAY_LAYOUT.paddingY * 2;
+
+  const normal = c10MountOverlay();
+  normal.emit(c10View());
+  const normalCard = normal.card();
+  const normalRings = c10FindAll(normalCard, "g-ring");
+  const normalNote = c10FindAll(normalCard, "g-note")[0];
+  const normalCost = c10FindAll(normalCard, "g-cost")[0];
+  check(
+    "C10 overlay 正常状态",
+    !!normalCard &&
+      heightOk &&
+      normalRings.length === 3 &&
+      normalRings.map((ring) => ring.dataset.ring).sort().join(",") === "five_hour,monthly,weekly" &&
+      normalRings.every((ring) => ring.dataset.state === "ok") &&
+      normalRings.map((ring) => ["good", "warn", "bad"].find((tone) => c10HasClass(ring, tone))).join(",") ===
+        "good,good,warn" &&
+      !!normalNote &&
+      normalNote.className === "g-note" &&
+      normalNote.textContent.includes("GOAT") &&
+      !!normalCost &&
+      normalCard.textContent.includes("$1.23"),
+    `card=${!!normalCard} height=${heightOk} rings=${normalRings.length} kinds=${normalRings.map((r) => r.dataset.ring).join(",")} states=${normalRings.map((r) => r.dataset.state).join(",")} tones=${normalRings.map((r) => r.className).join("|")} note=${normalNote?.className}:${normalNote?.textContent} cost=${normalCost?.textContent} text=${normalCard?.textContent}`,
+  );
+  const normalProgress = c10FindAll(normalCard, "g-ring-progress");
+  check(
+    "C10 ring data-role 钩子",
+    normalProgress.length === 3 &&
+      normalProgress.every((node) => node.dataset.role === "ring-progress"),
+  );
+  normal.cleanups.forEach((fn) => { fn(); });
+
+  const stale = c10MountOverlay();
+  stale.emit(c10View({ state: "stale" }));
+  const staleCard = stale.card();
+  const staleNote = c10FindAll(staleCard, "g-note")[0];
+  check(
+    "C10 overlay 数据过期",
+    !!staleCard &&
+      heightOk &&
+      c10FindAll(staleCard, "g-ring").every((ring) => ring.dataset.state === "ok") &&
+      staleNote?.className === "g-note" &&
+      staleNote.textContent.includes("数据过期"),
+  );
+  stale.cleanups.forEach((fn) => { fn(); });
+
+  const auth = c10MountOverlay();
+  auth.emit(c10View({ state: "auth_error" }));
+  const authCard = auth.card();
+  const authNote = c10FindAll(authCard, "g-note")[0];
+  check(
+    "C10 overlay 凭据失效",
+    !!authCard &&
+      heightOk &&
+      c10FindAll(authCard, "g-ring").every((ring) => ring.dataset.state === "ok") &&
+      authNote?.className === "g-note g-error" &&
+      authNote.textContent.includes("凭据失效，暂停更新"),
+  );
+  auth.cleanups.forEach((fn) => { fn(); });
+
+  const unavailable = c10MountOverlay();
+  const unavailableView = c10View();
+  for (const kind of ["five_hour", "weekly", "monthly"]) {
+    unavailableView.windows[kind] = c10Window(0, false);
+  }
+  unavailable.emit(unavailableView);
+  const unavailableCard = unavailable.card();
+  const unavailableRings = c10FindAll(unavailableCard, "g-ring");
+  check(
+    "C10 overlay 窗口不可用",
+    !!unavailableCard &&
+      heightOk &&
+      unavailableRings.length === 3 &&
+      unavailableRings.every(
+        (ring) => ring.dataset.state === "unavailable" && c10HasClass(ring, "unavailable"),
+      ),
+  );
+  unavailable.cleanups.forEach((fn) => { fn(); });
+
+  const empty = c10MountOverlay();
+  empty.emit(null);
+  check("C10 overlay 空数据不挂卡", empty.card() === null && empty.root.children.length === 1);
+  empty.cleanups.forEach((fn) => { fn(); });
+
+  check(
+    "C10 overlay 卡内容高度 <= 168-20",
+    overlayContentHeight() <= OVERLAY_LAYOUT.height - OVERLAY_LAYOUT.paddingY * 2,
   );
 }

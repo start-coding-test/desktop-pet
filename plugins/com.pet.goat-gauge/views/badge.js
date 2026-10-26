@@ -6,15 +6,24 @@ import { TOPIC_CMD, TOPIC_WIDGET } from "../topics.js";
 import { addStyle, tag, text } from "./dom.js";
 import { setClassIfChanged, setTextIfChanged } from "./write.js";
 
-const CSS = `
-  .g-badge { display: inline-flex; align-items: center; gap: 6px; padding: 3px 9px;
-    border-radius: 999px; font: 12px/1.35 "Segoe UI", "Microsoft YaHei", sans-serif;
-    color: #eaf1f8; background: rgba(10,14,20,.72); border: 1px solid rgba(255,255,255,.12);
-    white-space: nowrap; }
-  .g-badge .g-dot { width: 7px; height: 7px; border-radius: 50%; background: #9aa4b2; }
-  .g-badge.good .g-dot { background: #4ade80; }
-  .g-badge.warn .g-dot { background: #f5c518; }
-  .g-badge.bad .g-dot { background: #ff6b6b; }
+export const BADGE_CSS = `
+  .g-badge {
+    --g-badge-bg: #0f141d; --g-badge-surface: #161d29; --g-badge-text: #f2f5f8;
+    --g-badge-muted: #9aa6b6; --g-badge-border: rgba(255,255,255,.12);
+    --g-badge-success: #3ddc97; --g-badge-warning: #f5c451; --g-badge-danger: #ff7b7b;
+    display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+    border-radius: 999px; color: var(--g-badge-text);
+    background: linear-gradient(180deg, var(--g-badge-surface), var(--g-badge-bg));
+    border: 1px solid var(--g-badge-border); box-shadow: 0 2px 6px rgba(0,0,0,.28);
+    font: 600 12px/1.35 "Segoe UI Variable", "Segoe UI", "Microsoft YaHei", sans-serif;
+    white-space: nowrap;
+  }
+  .g-badge .g-badge-text { color: var(--g-badge-text); }
+  .g-badge .g-dot { width: 7px; height: 7px; border-radius: 50%;
+    background: var(--g-badge-muted); }
+  .g-badge.good .g-dot { background: var(--g-badge-success); }
+  .g-badge.warn .g-dot { background: var(--g-badge-warning); }
+  .g-badge.bad .g-dot { background: var(--g-badge-danger); }
 `;
 
 const MODES = {
@@ -25,7 +34,7 @@ const MODES = {
 
 export function mountBadge(root, ctx, cleanups) {
   const dom = ctx.dom;
-  addStyle(dom, root, CSS);
+  addStyle(dom, root, BADGE_CSS);
 
   const badge = tag(dom, "div", "g-badge");
   const dot = tag(dom, "i", "g-dot");

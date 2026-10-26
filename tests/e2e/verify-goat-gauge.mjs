@@ -153,6 +153,25 @@ async function shadowValue(client, hostSelector, innerSelector) {
   return out?.result?.value ?? null;
 }
 
+async function shadowEval(client, hostSelector, body, timeoutMs = 15_000) {
+  const shadow = await shadowRootOf(client, hostSelector);
+  if (!shadow) return null;
+  const resolved = await domResult(client, "DOM.resolveNode", { nodeId: shadow });
+  const objectId = resolved?.object?.objectId;
+  if (!objectId) return null;
+  const out = await client.send(
+    "Runtime.callFunctionOn",
+    {
+      objectId,
+      functionDeclaration: `function(){ ${body} }`,
+      returnByValue: true,
+    },
+    timeoutMs,
+  );
+  if (out?.error) throw new Error(`Runtime.callFunctionOn: ${out.error.message}`);
+  return out?.result?.result?.value ?? null;
+}
+
 async function waitShadowText(client, hostSelector, innerSelector, needle, timeoutMs = 20_000) {
   const until = Date.now() + timeoutMs;
   while (Date.now() < until) {
@@ -365,6 +384,18 @@ try {
       true,
       ["5 小时", "本周", "本月"].every((label) => cardText.includes(label)),
     );
+    const overlayFits = await shadowEval(
+      oc,
+      overlayHost,
+      "const c=this.querySelector('.g-card'); return !!c && c.getBoundingClientRect().bottom <= innerHeight + 1;",
+    );
+    r.check("overlay 卡不溢出窗口", true, overlayFits);
+    const overlayAssets = await shadowEval(
+      oc,
+      overlayHost,
+      "return this.querySelectorAll('img,link,script').length;",
+    );
+    r.check("overlay 卡无外部资源", 0, overlayAssets);
   }
 
   const dpr = Number(await c.ev("window.devicePixelRatio")) || 1;
@@ -412,6 +443,18 @@ try {
     true,
     kpiText.includes("缓存命中率") && (kpiText.includes("账期") || kpiText.includes("全部")),
   );
+  const kpiColumns = await shadowEval(
+    settings.client,
+    settingsHost,
+    "const el=this.querySelector('.g-kpis'); return el ? getComputedStyle(el).gridTemplateColumns.split(/\\s+/).filter(Boolean).length : 0;",
+  );
+  r.check("概览 KPI 仍是 4 列", 4, kpiColumns);
+  const settingsAssets = await shadowEval(
+    settings.client,
+    settingsHost,
+    "return this.querySelectorAll('img,link,script').length;",
+  );
+  r.check("插件页无外部资源", 0, settingsAssets);
   const detailTabs = await shadowText(settings.client, settingsHost, ".g-tabs").catch(() => "");
   r.check("设置页有明细 tab", true, detailTabs.includes("明细"));
   const detailRanges = await shadowText(settings.client, settingsHost, ".g-detail-tabs").catch(() => "");
