@@ -2478,7 +2478,20 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     const moved = await sCall("hotkey_set", { accelerator: "ctrl+alt+f9" });
     r.check("改键成功并归一化", "Ctrl+Alt+F9", moved.v);
     r.check("状态读回的是改后的键", "Ctrl+Alt+F9", (await sCall("hotkey_status")).v?.accelerator);
-    r.check("改回默认值", "CommandOrControl+Alt+P", (await sCall("hotkey_set", { accelerator: "CommandOrControl+Alt+P" })).v);
+    // 这条判据原来只印 `.v`：hostInvoke 的 reject 分支形状是 `{ok:false,e,code}`、根本没有 `v`，
+    // 于是 run#153 只剩一句「实得 undefined」，宿主真正的拒绝文案被丢掉（L09）。
+    // 读回本身也可能超时，所以它的异常只折进诊断行，绝不要把下面的 r.check 一起带走。
+    const backToDefault = await sCall("hotkey_set", { accelerator: "CommandOrControl+Alt+P" });
+    if (!backToDefault.ok) {
+      let liveNow = null;
+      try {
+        liveNow = (await sCall("hotkey_status")).v ?? null;
+      } catch (err) {
+        liveNow = { readbackFailed: String(err?.message ?? err).slice(0, 120) };
+      }
+      r.info("「改回默认值」拒绝现场", JSON.stringify({ e: backToDefault.e ?? null, code: backToDefault.code ?? null, status: liveNow }));
+    }
+    r.check("改回默认值", "CommandOrControl+Alt+P", backToDefault.v);
 
     logConsoleLedger("after agent hooks");
     r.group("hotkey_test：试注册命令的门禁、语法码与不改现状");
