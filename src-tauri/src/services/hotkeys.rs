@@ -4,6 +4,7 @@
 // 直接透传给 global-hotkey 的话，非法串会以库内部错误的面目冒出来，很难归因。
 // 换键的顺序是「先注册新的，成功才注销旧的」：注册失败（多半是被别的应用占了）
 // 时保持原键可用，不会把用户搞得两个键都没了。
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use serde_json::{json, Value};
@@ -14,6 +15,9 @@ use crate::fsutil::write_atomic;
 use crate::host_error::{HostError, INTERNAL, INVALID_ARG};
 
 pub const DEFAULT_ACCEL: &str = "CommandOrControl+Alt+P";
+
+/// A31：仅 debug 构建可用的设置目录覆盖；release 里 `cfg!(debug_assertions)` 会把分支裁掉。
+const SETTINGS_DIR_ENV: &str = "PET_SETTINGS_DIR";
 
 const MODIFIERS: &[(&str, &str)] = &[
     ("ctrl", "Ctrl"),
@@ -151,11 +155,37 @@ pub fn normalize_accel(raw: &str) -> Result<String, HostError> {
     Ok(format!("{}+{main}", mods.join("+")))
 }
 
+fn settings_dir(
+    app_data_dir: PathBuf,
+    raw_override: Option<OsString>,
+    allow_override: bool,
+) -> PathBuf {
+    if allow_override {
+        if let Some(raw) = raw_override {
+            let path = PathBuf::from(raw);
+            if path.is_absolute() {
+                return path;
+            }
+        }
+    }
+    app_data_dir
+}
+
 fn settings_file(app: &AppHandle) -> Result<PathBuf, HostError> {
-    app.path()
+    let app_data_dir = app
+        .path()
         .app_data_dir()
-        .map(|dir| dir.join("settings.json"))
-        .map_err(|e| HostError::new(INTERNAL, e.to_string()))
+        .map_err(|e| HostError::new(INTERNAL, e.to_string()))?;
+    let dir = settings_dir(
+        app_data_dir.clone(),
+        std::env::var_os(SETTINGS_DIR_ENV),
+        cfg!(debug_assertions),
+    );
+    if dir != app_data_dir {
+        // 只记路径，不记热键值
+        log::debug!("[hotkey] 设置目录走 {SETTINGS_DIR_ENV}: {dir:?}");
+    }
+    Ok(dir.join("settings.json"))
 }
 
 fn read_saved(app: &AppHandle) -> Option<String> {
@@ -430,6 +460,71 @@ mod tests {
         assert!(
             flat.contains(concat!("is_", "registered(accelerator.as_str())")),
             "hotkey_status 必须用当前 accelerator 查询真实注册状态"
+        );
+    }
+
+    /* ============ A31：debug-only 设置目录覆盖（PET_SETTINGS_DIR） ============ */
+
+    fn temp_abs(name: &str) -> OsString {
+        std::env::temp_dir().join(name).into_os_string()
+    }
+
+    #[test]
+    fn settings_dir_uses_absolute_override_when_allowed() {
+        let app_data = PathBuf::from(r"C:\appdata\com.desktoppet.pet");
+        let override_dir = temp_abs("pet-a31-settings");
+        assert_eq!(
+            settings_dir(app_data, Some(override_dir.clone()), true),
+            PathBuf::from(override_dir),
+            "debug 构建必须用绝对路径的 PET_SETTINGS_DIR"
+        );
+    }
+
+    #[test]
+    fn settings_dir_falls_back_without_override() {
+        let app_data = PathBuf::from(r"C:\appdata\com.desktoppet.pet");
+        assert_eq!(
+            settings_dir(app_data.clone(), None, true),
+            app_data,
+            "没设 PET_SETTINGS_DIR 时必须回到 app_data_dir"
+        );
+    }
+
+    #[test]
+    fn settings_dir_ignores_empty_or_relative_override() {
+        let app_data = PathBuf::from(r"C:\appdata\com.desktoppet.pet");
+        for raw in [OsString::new(), OsString::from("relative/settings")] {
+            assert_eq!(
+                settings_dir(app_data.clone(), Some(raw), true),
+                app_data,
+                "空串/相对路径不算覆盖，必须回退 app_data_dir"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_dir_override_is_release_gated() {
+        let app_data = PathBuf::from(r"C:\appdata\com.desktoppet.pet");
+        let override_dir = temp_abs("pet-a31-release");
+        assert_eq!(
+            settings_dir(app_data.clone(), Some(override_dir), false),
+            app_data,
+            "allow_override=false（release）时不许读 PET_SETTINGS_DIR"
+        );
+    }
+
+    #[test]
+    fn settings_file_uses_debug_gated_resolver() {
+        let flat = include_str!("hotkeys.rs")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains(concat!(
+                "settings_dir( app_data_dir.clone(), std::env::var_os(SETTINGS_DIR_ENV), cfg!(",
+                "debug_assertions), )"
+            )),
+            "settings_file 必须走 settings_dir 并传 cfg!(debug_assertions)"
         );
     }
 }

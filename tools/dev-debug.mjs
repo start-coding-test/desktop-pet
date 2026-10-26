@@ -1,8 +1,8 @@
 // 带 WebView2 远程调试端口启动 dev，供 tests/e2e/verify-isolation.mjs 连接。
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { argv, env, platform } from "node:process";
 import {
   cleanAgentTempState,
@@ -15,9 +15,35 @@ import {
 const port = env.CDP_PORT ?? argv.find((a) => a.startsWith("--port="))?.split("=")[1] ?? "9223";
 const GATE = env.GITHUB_ACTIONS === "true" || env.PET_E2E_PRESEED === "1";
 const pluginsDir = fileURLToPath(new URL("../plugins", import.meta.url));
+const tempRoot = fileURLToPath(new URL("../temp", import.meta.url));
 const appDataDir = env.APPDATA
   ? join(env.APPDATA, JSON.parse(readFileSync(fileURLToPath(new URL("../src-tauri/tauri.conf.json", import.meta.url)), "utf8")).identifier)
   : null;
+
+/**
+ * A31：GATE 下把热键设置的落盘目录挪进隔离目录。
+ * 真实 app_data 目录绝不允许被清：路径与它重叠（含它是目标的祖先/后代）直接拒绝；
+ * 只有 <仓库>/temp/ 下的目标才递归清空，其他目录只删其中的 settings.json。
+ */
+function prepareSettingsDir() {
+  const target = resolve(env.PET_SETTINGS_DIR || join(tempRoot, "settings-e2e"));
+  const realAppDir = appDataDir ? resolve(appDataDir) : null;
+  const overlapsReal =
+    realAppDir &&
+    (target === realAppDir ||
+      target.startsWith(`${realAppDir}${sep}`) ||
+      realAppDir.startsWith(`${target}${sep}`));
+  if (overlapsReal) {
+    throw new Error(`PET_SETTINGS_DIR 不能与真实 app_data 目录重叠: ${target} vs ${realAppDir}`);
+  }
+  if (target.startsWith(`${resolve(tempRoot)}${sep}`)) {
+    rmSync(target, { recursive: true, force: true });
+  } else {
+    rmSync(join(target, "settings.json"), { force: true });
+  }
+  mkdirSync(target, { recursive: true });
+  return target;
+}
 
 /** 启动前只剔掉清单里的 zz.*，保留用户的其它插件启停状态（C2：不清空、不备份）。 */
 function prunePreseedEnabled() {
@@ -44,7 +70,7 @@ function preseed() {
   // E2E 作业必须带两套 agent 样例；本地不带这个 env 时保持原行为。
   if (configFiles.length) {
     cleanAgentTempState({
-      tempRoot: fileURLToPath(new URL("../temp", import.meta.url)),
+      tempRoot,
       configFiles,
       agentHome: env.PET_AGENT_HOME ?? "",
     });
@@ -53,11 +79,14 @@ function preseed() {
   }
 }
 
+let settingsDir = env.PET_SETTINGS_DIR || null;
+
 if (GATE) {
   try {
+    settingsDir = prepareSettingsDir();
     preseed();
   } catch (err) {
-    console.error("[dev-debug] D07 预置失败，不启动宿主:", err);
+    console.error("[dev-debug] D07/A31 预置失败，不启动宿主:", err);
     process.exit(1);
   }
 }
@@ -65,7 +94,11 @@ if (GATE) {
 const child = spawn("npm", ["run", "tauri", "--", "dev"], {
   stdio: "inherit",
   shell: true,
-  env: { ...env, WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port}` },
+  env: {
+    ...env,
+    ...(settingsDir ? { PET_SETTINGS_DIR: settingsDir } : {}),
+    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: `--remote-debugging-port=${port}`,
+  },
 });
 
 /** 本地 best-effort；CI 的 taskkill /T /F 不会等这里，收尾由 workflow 的 zz.* 清理兜底。 */

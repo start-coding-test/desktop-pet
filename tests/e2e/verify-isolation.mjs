@@ -45,6 +45,26 @@ if (!env.APPDATA) {
 }
 // store.rs 落在 app_data_dir()/plugins/<id>/；Windows 上 app_data_dir = %APPDATA%/<identifier>
 const STORE_DIR = join(env.APPDATA, "com.desktoppet.pet", "plugins", PROBE_ID);
+// A31：热键设置的真实落盘位置与本轮 E2E 的隔离位置。真实文件只取 sha256/是否存在，
+// 绝不读内容；内容检查只针对 PET_SETTINGS_DIR 下的副本。
+const REAL_SETTINGS = join(env.APPDATA, "com.desktoppet.pet", "settings.json");
+const E2E_SETTINGS = env.PET_SETTINGS_DIR ? join(env.PET_SETTINGS_DIR, "settings.json") : null;
+function fileSha256OrNull(path) {
+  try {
+    return createHash("sha256").update(readFileSync(path)).digest("hex");
+  } catch (err) {
+    if (err?.code === "ENOENT") return null;
+    throw err;
+  }
+}
+function readE2eHotkey() {
+  if (!E2E_SETTINGS) return "未设 PET_SETTINGS_DIR";
+  try {
+    return JSON.parse(readFileSync(E2E_SETTINGS, "utf8")).hotkey ?? "缺 hotkey 字段";
+  } catch (err) {
+    return `读不到/坏 JSON: ${String(err?.message ?? err).split("\n")[0].slice(0, 120)}`;
+  }
+}
 const probeManifest = (permissions) =>
   `{ id: ${JSON.stringify(PROBE_ID)}, widget: 'widget.js', permissions: ${JSON.stringify(permissions)} }`;
 const MOUNT_BARE = `window.__wh.mount(${probeManifest([])}, 'badge')`;
@@ -54,6 +74,10 @@ const MOUNT_BARE = `window.__wh.mount(${probeManifest([])}, 'badge')`;
 // 所以换一个仍认例外名单的区；settings 区自己的取证在「agent:hooks 受控能力」那组（Worker 契约）。
 const MOUNT_CAPPED = `window.__wh.mount(${probeManifest(["bus:publish", "bus:subscribe"])}, 'overlay', document.body)`;
 const r = createReport("隔离与安全回归（dev）");
+// A31：CI 必须带 PET_SETTINGS_DIR，否则热键用例会写真实 settings.json（dev-debug GATE 也会兜底设）。
+if (env.GITHUB_ACTIONS === "true") {
+  r.check("CI：PET_SETTINGS_DIR 必须设置（否则热键用例会写真实 settings.json）", true, Boolean(env.PET_SETTINGS_DIR));
+}
 const invoke = (c) => hostInvoke(c);
 
 /**
@@ -2716,6 +2740,8 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     await clickReady(`.nav-item[data-view=pet]`);
     await restoreHookProbe();
 
+    // A31：热键组前后只比真实 settings 的 sha256/存在性；内容只看 PET_SETTINGS_DIR 下的副本。
+    const realSettingsBefore = fileSha256OrNull(REAL_SETTINGS);
     const noMod = await sCall("hotkey_set", { accelerator: "P" });
     r.check("不带修饰键的组合被拒", true, !noMod.ok && /修饰键/.test(String(noMod.e)));
     const twoKeys = await sCall("hotkey_set", { accelerator: "Ctrl+A+B" });
@@ -2725,6 +2751,11 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     const moved = await sCall("hotkey_set", { accelerator: "ctrl+alt+f9" });
     r.check("改键成功并归一化", "Ctrl+Alt+F9", moved.v);
     r.check("状态读回的是改后的键", "Ctrl+Alt+F9", (await sCall("hotkey_status")).v?.accelerator);
+    if (E2E_SETTINGS) {
+      r.check("改键写进 PET_SETTINGS_DIR 的 settings.json", "Ctrl+Alt+F9", readE2eHotkey());
+    } else {
+      r.info("未设 PET_SETTINGS_DIR：跳过隔离文件回读（本地裸跑）", "");
+    }
     // 这条判据原来只印 `.v`：hostInvoke 的 reject 分支形状是 `{ok:false,e,code}`、根本没有 `v`，
     // 于是 run#153 只剩一句「实得 undefined」，宿主真正的拒绝文案被丢掉（L09）。
     // 读回本身也可能超时，所以它的异常只折进诊断行，绝不要把下面的 r.check 一起带走。
@@ -2739,6 +2770,15 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
       r.info("「改回默认值」拒绝现场", JSON.stringify({ e: backToDefault.e ?? null, code: backToDefault.code ?? null, status: liveNow }));
     }
     r.check("改回默认值", "CommandOrControl+Alt+P", backToDefault.v);
+    if (E2E_SETTINGS) {
+      r.check("改回默认值也写进隔离文件", "CommandOrControl+Alt+P", readE2eHotkey());
+    }
+    const realSettingsAfter = fileSha256OrNull(REAL_SETTINGS);
+    r.check(
+      "真实 %APPDATA% settings.json 运行前后一致（只比 sha256/存在性）",
+      true,
+      realSettingsAfter === realSettingsBefore,
+    );
 
     logConsoleLedger("after agent hooks");
     r.group("hotkey_test：试注册命令的门禁、语法码与不改现状");

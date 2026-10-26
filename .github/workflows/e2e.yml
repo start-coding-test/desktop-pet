@@ -78,6 +78,9 @@ jobs:
       # Qoder 不受它影响、继续走 PET_AGENT_CONFIG_FILES。夹具目录由 verify-agent-bridge.mjs
       # 自己建自己删，本工作流不负责预置。
       PET_AGENT_HOME: ${{ github.workspace }}\temp\agent-home
+      # A31：热键 settings.json 只允许 debug 构建用 PET_SETTINGS_DIR 重定向；实例与套件读同一个目录。
+      # release 不读这个变量（hotkeys.rs 里由 cfg!(debug_assertions) 编译期裁掉）。
+      PET_SETTINGS_DIR: ${{ github.workspace }}\temp\settings-e2e
 
     steps:
       - uses: actions/checkout@v4
