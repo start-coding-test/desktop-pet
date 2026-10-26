@@ -304,7 +304,7 @@ function syncOverlay() {
         await ctx.overlay.show({
           x: config.overlayX,
           y: config.overlayY,
-          height: 150,
+          height: 168,
         });
       } else {
         await ctx.overlay.hide();

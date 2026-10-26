@@ -6,18 +6,23 @@ import { svg, tag, text } from "./dom.js";
 import { setAttrIfChanged, setClassIfChanged, setDatasetIfChanged, setTextIfChanged } from "./write.js";
 
 export const RING_CSS = `
-  .g-rings { display: flex; justify-content: space-between; gap: 10px; }
-  .g-ring { display: flex; flex-direction: column; align-items: center; gap: 2px; min-width: 0; }
+  .g-rings { display: flex; justify-content: space-between; align-items: center;
+    gap: var(--g-ring-gap, 10px); }
+  .g-ring { display: flex; flex-direction: column; align-items: center;
+    gap: var(--g-ring-item-gap, 3px); min-width: 0; }
   .g-ring-svg { display: block; }
-  .g-ring-track { fill: none; stroke: rgba(255,255,255,.14); stroke-width: 6; }
-  .g-ring-progress { fill: none; stroke-width: 6; stroke-linecap: round; }
-  .g-ring.good .g-ring-progress { stroke: #4ade80; }
-  .g-ring.warn .g-ring-progress { stroke: #f5c518; }
-  .g-ring.bad .g-ring-progress { stroke: #ff6b6b; }
-  .g-ring-value { font-size: 15px; font-weight: 600; color: #eef2f6; }
-  .g-ring-label { font-size: 11px; color: #9aa3b2; }
-  .g-ring-reset { font-size: 10px; color: #98a2b3; }
-  .g-ring.unavailable .g-ring-value, .g-ring.unavailable .g-ring-reset { color: #6b7280; }
+  .g-ring-track { fill: none; stroke: var(--g-ring-track, rgba(255,255,255,.14));
+    stroke-width: var(--g-ring-stroke, 7px); }
+  .g-ring-progress { fill: none; stroke-width: var(--g-ring-stroke, 7px); stroke-linecap: round; }
+  .g-ring.good .g-ring-progress { stroke: var(--g-ring-success, #3ddc97); }
+  .g-ring.warn .g-ring-progress { stroke: var(--g-ring-warning, #f5c451); }
+  .g-ring.bad .g-ring-progress { stroke: var(--g-ring-danger, #ff7b7b); }
+  .g-ring-value { font-size: var(--g-ring-value-size, 15px); font-weight: 600;
+    color: var(--g-ring-value, #f2f5f8); }
+  .g-ring-label { font-size: var(--g-ring-label-size, 11px); color: var(--g-ring-label, #9aa6b6); }
+  .g-ring-reset { font-size: var(--g-ring-reset-size, 9.5px); color: var(--g-ring-reset, #98a2b3); }
+  .g-ring.unavailable .g-ring-value, .g-ring.unavailable .g-ring-reset {
+    color: var(--g-ring-muted, #8b95a5); }
 `;
 
 /**

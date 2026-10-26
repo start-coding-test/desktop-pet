@@ -6,23 +6,52 @@ import { addStyle, tag, text } from "./dom.js";
 import { createRing, RING_CSS } from "./rings.js";
 import { setClassIfChanged, setTextIfChanged } from "./write.js";
 
-const CSS = `
-  .g-card { width: 300px; box-sizing: border-box; margin: 2px auto; padding: 6px 10px;
-    border-radius: 14px; background: rgba(16,18,24,.92); border: 1px solid rgba(255,255,255,.1);
-    box-shadow: 0 8px 26px rgba(0,0,0,.42); color: #f2f5f8;
-    font: 12px/1.35 "Segoe UI", "Microsoft YaHei", sans-serif; overflow: hidden; }
+export const OVERLAY_LAYOUT = {
+  height: 168,
+  paddingY: 10,
+  head: 16,
+  rings: 96,
+  foot: 14,
+  gap: 4,
+};
+
+export function overlayContentHeight() {
+  return OVERLAY_LAYOUT.head + OVERLAY_LAYOUT.rings + OVERLAY_LAYOUT.foot + OVERLAY_LAYOUT.gap * 2;
+}
+
+export const OVERLAY_CSS = `
+  .g-card {
+    --g-dark-bg: #0f141d; --g-dark-surface: #161d29; --g-dark-border: rgba(255,255,255,.12);
+    --g-dark-text: #f2f5f8; --g-dark-muted: #9aa6b6; --g-dark-accent: #7aa2ff;
+    --g-dark-success: #3ddc97; --g-dark-warning: #f5c451; --g-dark-danger: #ff7b7b;
+    --g-ring-value: #f2f5f8; --g-ring-label: #9aa6b6; --g-ring-reset: #98a2b3;
+    --g-ring-track: rgba(255,255,255,.14); --g-ring-success: #3ddc97;
+    --g-ring-warning: #f5c451; --g-ring-danger: #ff7b7b; --g-ring-muted: #8b95a5;
+    --g-ring-stroke: 6.5px; --g-ring-value-size: 13px; --g-ring-label-size: 9px;
+    --g-ring-reset-size: 8.5px; --g-ring-gap: 8px; --g-ring-item-gap: 2px;
+    width: 300px; box-sizing: border-box; margin: 2px auto 0; padding: 10px 14px;
+    display: flex; flex-direction: column; gap: 4px; border-radius: 18px;
+    background: linear-gradient(160deg, #161d29, #0f141d);
+    border: 1px solid var(--g-dark-border); box-shadow: 0 2px 6px rgba(0,0,0,.35);
+    color: var(--g-dark-text); font: 12px/1.35 "Segoe UI Variable", "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
   .g-card .g-head { display: flex; justify-content: space-between; align-items: baseline;
-    font-size: 10.5px; color: #9aa3b2; margin-bottom: 3px; gap: 8px; }
-  .g-card .g-title { font-weight: 600; color: #eef2f6; }
-  .g-card .g-foot { display: flex; justify-content: space-between; align-items: baseline;
-    margin-top: 2px; font-size: 10px; color: #9aa3b2; gap: 8px; }
-  .g-card .g-foot .g-error { color: #ff8a8a; }
-  .g-card .g-rings { gap: 4px; }
+    min-height: 16px; gap: 8px; }
+  .g-card .g-title { font-weight: 650; font-size: 12px; color: var(--g-dark-text); }
+  .g-card .g-head .g-muted { color: var(--g-dark-muted); font-size: 10px; }
+  .g-card .g-rings { min-height: 96px; gap: 8px; }
+  .g-card .g-foot { display: flex; justify-content: space-between; align-items: center;
+    min-height: 14px; gap: 8px; font-size: 10.5px; color: var(--g-dark-muted); }
+  .g-card .g-cost { color: var(--g-dark-text); background: rgba(122,162,255,.12);
+    border: 1px solid rgba(122,162,255,.22); border-radius: 999px; padding: 2px 8px;
+    font-weight: 600; white-space: nowrap; }
+  .g-card .g-foot .g-note { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .g-card .g-foot .g-error { color: var(--g-dark-danger); }
 `;
 
 export function mountOverlay(root, ctx, cleanups) {
   const dom = ctx.dom;
-  addStyle(dom, root, `${RING_CSS}\n${CSS}`);
+  addStyle(dom, root, `${RING_CSS}\n${OVERLAY_CSS}`);
 
   const card = tag(dom, "div", "g-card");
   const head = tag(dom, "div", "g-head");
@@ -31,9 +60,9 @@ export function mountOverlay(root, ctx, cleanups) {
   head.append(title, updated);
 
   const rings = tag(dom, "div", "g-rings");
-  const five = createRing(dom, { size: 46, label: "5 小时", kind: "five_hour" });
-  const weekly = createRing(dom, { size: 46, label: "本周", kind: "weekly" });
-  const monthly = createRing(dom, { size: 46, label: "本月", kind: "monthly" });
+  const five = createRing(dom, { size: 50, label: "5 小时", kind: "five_hour" });
+  const weekly = createRing(dom, { size: 50, label: "本周", kind: "weekly" });
+  const monthly = createRing(dom, { size: 50, label: "本月", kind: "monthly" });
   rings.append(five.box, weekly.box, monthly.box);
 
   const foot = tag(dom, "div", "g-foot");
