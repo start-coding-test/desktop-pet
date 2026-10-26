@@ -391,6 +391,13 @@ try {
   const page = await openPluginPage();
   r.check("插件页已挂载", true, page.hostOk);
   r.check("插件页在 Worker realm", "worker", page.realm);
+  const kpiText = await shadowText(settings.client, settingsHost, ".g-kpis").catch(() => "");
+  r.check("概览 KPI 不再显示购买/赠送", false, kpiText.includes("购买") || kpiText.includes("赠送"));
+  r.check(
+    "概览 KPI 显示缓存命中率与周期后缀",
+    true,
+    kpiText.includes("缓存命中率") && (kpiText.includes("账期") || kpiText.includes("全部")),
+  );
   const detailTabs = await shadowText(settings.client, settingsHost, ".g-tabs").catch(() => "");
   r.check("设置页有明细 tab", true, detailTabs.includes("明细"));
   const detailRanges = await shadowText(settings.client, settingsHost, ".g-detail-tabs").catch(() => "");

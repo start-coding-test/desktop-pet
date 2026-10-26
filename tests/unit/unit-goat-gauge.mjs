@@ -83,6 +83,9 @@ const {
   paginate,
   detailsModel,
 } = await import(new URL("../../plugins/com.pet.goat-gauge/views/settings/details.js", import.meta.url));
+const { billingPeriodCache, KPI_DEFS } = await import(
+  new URL("../../plugins/com.pet.goat-gauge/views/settings/dashboard.js", import.meta.url)
+);
 const { buildPanelPayload, COOKIE_STATES } = await import(
   new URL("../../plugins/com.pet.goat-gauge/panel.js", import.meta.url)
 );
@@ -1361,6 +1364,108 @@ eq("分页 20/页", 20, PAGE_SIZE);
 eq("缓存命中率 50/(50+50)", 0.5, cacheHitRate({ cacheReadTokens: 50, tokensIn: 50 }));
 eq("缓存命中率 input 已含缓存", 0.5, cacheHitRate({ cacheReadTokens: 50, tokensIn: 100, inputIncludesCache: true }));
 eq("缓存命中率分母 0", null, cacheHitRate({ cacheReadTokens: 0, tokensIn: 0 }));
+
+group("C09 概览缓存命中率");
+{
+  const periodView = {
+    fetchedAt: Date.UTC(2026, 9, 15, 12),
+    usage: { period_basis: "billing-period" },
+    plan: {
+      current_period_start: Date.UTC(2026, 9, 1),
+      current_period_end: Date.UTC(2026, 10, 1),
+    },
+    charts: {
+      "2026-09-30": [{ cache_read_tokens: 100 }],
+      "2026-10-02": [{ cache_read_tokens: 50 }],
+      "2026-11-02": [{ cache_read_tokens: 70 }],
+    },
+    daily: [
+      { at_ms: Date.UTC(2026, 8, 30, 12), tokens_in: 100 },
+      { at_ms: Date.UTC(2026, 9, 2, 12), tokens_in: 50 },
+      { at_ms: Date.UTC(2026, 10, 2, 12), tokens_in: 70 },
+    ],
+  };
+  const period = billingPeriodCache(periodView, { timeZone: "UTC" });
+  eq("C09 只统计计费周期（分子分母同窗）", 0.5, period.rate);
+  eq("C09 计费周期 text", "50%", period.text);
+  eq("C09 计费周期 scope", "period", period.scope);
+
+  const allView = {
+    ...periodView,
+    usage: { period_basis: "rolling" },
+    daily: [
+      { at_ms: Date.UTC(2026, 8, 30, 12), tokens_in: 100 },
+      { at_ms: Date.UTC(2026, 9, 2, 12), tokens_in: 50 },
+      { at_ms: Date.UTC(2026, 10, 2, 12), tokens_in: 30 },
+    ],
+  };
+  const all = billingPeriodCache(allView, { timeZone: "UTC" });
+  eq("C09 缺账期回退全部 scope", "all", all.scope);
+  eq("C09 缺账期回退全部 rate", 220 / 400, all.rate);
+  eq("C09 缺账期回退全部 text", "55%", all.text);
+
+  const input = {
+    fetchedAt: Date.UTC(2026, 9, 15, 12),
+    usage: { period_basis: "billing-period" },
+    plan: {
+      current_period_start: Date.UTC(2026, 9, 1),
+      current_period_end: Date.UTC(2026, 10, 1),
+    },
+    charts: { "2026-10-02": [{ cache_read_tokens: 50 }] },
+    daily: [{ at_ms: Date.UTC(2026, 9, 2, 12), tokens_in: 10 }],
+  };
+  const falseMode = billingPeriodCache(input, { timeZone: "UTC" });
+  eq("C09 inputIncludesCache=false 分母含 input", 50 / 60, falseMode.rate);
+  eq("C09 inputIncludesCache=false text", "83%", falseMode.text);
+  const trueMode = billingPeriodCache(input, { timeZone: "UTC", inputIncludesCache: true });
+  eq("C09 inputIncludesCache=true 分母只用 input", 1, trueMode.rate);
+  eq("C09 cache_read>input 夹到 100%", "100%", trueMode.text);
+
+  const empty = billingPeriodCache(
+    {
+      fetchedAt: Date.UTC(2026, 9, 15, 12),
+      usage: { period_basis: "billing-period" },
+      plan: { current_period_start: Date.UTC(2026, 9, 1), current_period_end: Date.UTC(2026, 10, 1) },
+      charts: {},
+      daily: [],
+    },
+    { timeZone: "UTC" },
+  );
+  eq("C09 分母 0 记 null", null, empty.rate);
+  eq("C09 分母 0 text", "—", empty.text);
+
+  const infinite = billingPeriodCache(
+    {
+      ...input,
+      charts: { "2026-10-02": [{ cache_read_tokens: Infinity }] },
+      daily: [{ at_ms: Date.UTC(2026, 9, 2, 12), tokens_in: 10 }],
+    },
+    { timeZone: "UTC" },
+  );
+  eq("C09 Infinity 记 null", null, infinite.rate);
+  const nan = billingPeriodCache(
+    {
+      ...input,
+      charts: { "2026-10-02": [{ cache_read_tokens: Number.NaN }] },
+      daily: [{ at_ms: Date.UTC(2026, 9, 2, 12), tokens_in: 10 }],
+    },
+    { timeZone: "UTC" },
+  );
+  eq("C09 NaN 按 0 计", 0, nan.rate);
+  eq("C09 NaN text", "0%", nan.text);
+
+  eq("C09 KPI 共 7 格", 7, KPI_DEFS.length);
+  check(
+    "C09 KPI 不含购买/赠送",
+    !KPI_DEFS.some(([, label]) => label.includes("购买") || label.includes("赠送")),
+  );
+  check(
+    "C09 KPI 含缓存命中率",
+    KPI_DEFS.some(([key, label]) => key === "cache" && label.includes("缓存命中率")),
+  );
+}
+
+group("C07 明细看板");
 
 {
   const items = Array.from({ length: 45 }, (_, i) => i);
