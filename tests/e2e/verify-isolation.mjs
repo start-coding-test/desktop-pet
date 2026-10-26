@@ -3,6 +3,8 @@
 // 只覆盖 dev 能验证的部分；CSP 与打包路径见 verify-release.mjs（每波次收尾手工跑一次）。
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { createServer } from "node:http";
 import { join, resolve, sep } from "node:path";
 import { argv, env } from "node:process";
 import {
@@ -247,11 +249,14 @@ const RESET_CHANGE_SPY = `(async () => {
 const sawChangedId = (id) =>
   `Array.isArray(window.__changeSpy) && window.__changeSpy.some((p) => Array.isArray(p?.ids) && p.ids.includes(${JSON.stringify(id)}))`;
 
-try {
-  await waitForPage(PORT, isPetPage, 60_000);
-} catch {
-  console.error(`连不上 dev 实例的 CDP 端口 ${PORT}。请先用 npm run dev:debug 启动。`);
-  process.exit(2);
+// A26：--attach-selftest 只跑本地假 CDP 端点，不需要 dev 实例；不带该参数时这一步与原来完全一致。
+if (!argv.includes("--attach-selftest")) {
+  try {
+    await waitForPage(PORT, isPetPage, 60_000);
+  } catch {
+    console.error(`连不上 dev 实例的 CDP 端口 ${PORT}。请先用 npm run dev:debug 启动。`);
+    process.exit(2);
+  }
 }
 
 // 往 plugins/ 写 fixture 会让 Vite 触发一次整页重载，所以先写完再连；
@@ -293,12 +298,18 @@ async function enableForConsent(pluginId) {
 
 /**
  * D09-D9 A：只吞「attach 这一页没成功」这一类失败，按文案匹配。
- * 本轮实测到的形状就两条：刚应答完的同意框会在 `/json/list` 里残留几帧，attach 它时 websocket 报错
- * （`cdp.mjs:29` 的原文），或者列出来到 attach 之间窗已经消失（`cdp.mjs:19` 的原文）。
- * 其余异常（CDP 协议错误、求值报错、宿主报错）**一律外抛** —— 把它们一起吞掉就是拿容错当遮羞布，
- * 也正是要防的那条「catch-all」。下面两条文案由自测判据钉住，其中第三条是反向对照（不许误吞）。
+ * 实测到的形状有三条：刚应答完的同意框会在 `/json/list` 里残留几帧，attach 它时 websocket 报错
+ * （`cdp.mjs:29` 的原文）；列出来到 attach 之间窗已经消失（`cdp.mjs:19` 的原文）；
+ * 半死页能应答 Runtime.enable 却不回 Log.enable，握手在 `cdp.mjs:103-104` 等满 20s 后抛出
+ * （A26；只认这两条**握手命令**，不写 `/CDP .* 超时/`）。
+ * 其余异常（CDP 协议错误、求值/导航/输入超时、宿主报错）**一律外抛** —— 把它们一起吞掉就是拿容错当遮羞布，
+ * 也正是要防的那条「catch-all」。三条文案都由自测判据钉住，另有反向对照（不许误吞）。
  */
-const ATTACH_FAILURES = [/CDP websocket 连接失败/, /等不到匹配的 target/];
+const ATTACH_FAILURES = [
+  /CDP websocket 连接失败/,
+  /等不到匹配的 target/,
+  /CDP (?:Runtime|Log)\.enable 超时 \d+ms/,
+];
 function isAttachFailure(err) {
   const msg = String(err?.message ?? err ?? "");
   return ATTACH_FAILURES.some((re) => re.test(msg));
@@ -547,14 +558,19 @@ function settledWithin(promise, ms = DENY_LOCK_SETTLE_MS) {
  * 只读一扇同意框（不点按钮），用于停用关窗用例；调用方负责关闭返回的 client。
  * D09-D9 C：读不到的页**跳过并继续轮询** —— 不可读页不能用来判「窗出现了」，
  * 也不能让它把整组带走；到点仍没等到就照原样抛，但把「有几页读不到、最后一次是哪句原文」带上。
+ * `listTargets` / `attachPage` 只为 A26 自测注入「永远读不到」的假页；实跑一律用默认值。
  */
-async function waitConsentWindow(pluginId, timeoutMs = 20_000) {
+async function waitConsentWindow(
+  pluginId,
+  timeoutMs = 20_000,
+  { listTargets = consentTargets, attachPage = attachListedPage } = {},
+) {
   const deadline = Date.now() + timeoutMs;
   let unreadable = 0;
   let lastError = "";
   while (Date.now() < deadline) {
-    for (const target of await consentTargets()) {
-      const { cs, unreadable: miss, error } = await attachListedPage(target);
+    for (const target of await listTargets()) {
+      const { cs, unreadable: miss, error } = await attachPage(target);
       if (!cs) {
         unreadable += miss;
         lastError = String(error ?? "").split("\n")[0];
@@ -579,8 +595,230 @@ async function waitConsentWindow(pluginId, timeoutMs = 20_000) {
     await sleep(200);
   }
   throw new Error(
-    `20 秒内没等到「${pluginId}」的同意框（只读；attach 读不到 ${unreadable} 页${lastError ? `，最后一次原文：${lastError}` : ""}）`,
+    `${timeoutMs / 1000} 秒内没等到「${pluginId}」的同意框（只读；attach 读不到 ${unreadable} 页${lastError ? `，最后一次原文：${lastError}` : ""}）`,
   );
+}
+
+// ---- A26：握手超时（Runtime.enable / Log.enable）的假 CDP 端点与自测 ----
+// 零依赖手搓（harness 不带 ws 库）：只服务自测，只监听 127.0.0.1 临时端口，不连应用。
+const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+function wsAccept(key) {
+  return createHash("sha1").update(`${key}${WS_GUID}`).digest("base64");
+}
+
+/** 服务端 → 客户端文本帧（无需掩码；自测消息都短于 65536）。 */
+function wsTextFrame(text) {
+  const payload = Buffer.from(text, "utf8");
+  if (payload.length < 126) return Buffer.concat([Buffer.from([0x81, payload.length]), payload]);
+  return Buffer.concat([Buffer.from([0x81, 126, payload.length >> 8, payload.length & 0xff]), payload]);
+}
+
+/** 从缓冲里摘一帧（客户端帧必有掩码）；不够一帧返回 null，等下次 data。 */
+function takeWsFrame(buf) {
+  if (buf.length < 2) return null;
+  const opcode = buf[0] & 0x0f;
+  const masked = (buf[1] & 0x80) !== 0;
+  let len = buf[1] & 0x7f;
+  let off = 2;
+  if (len === 126) {
+    if (buf.length < 4) return null;
+    len = buf.readUInt16BE(2);
+    off = 4;
+  } else if (len === 127) {
+    if (buf.length < 10) return null;
+    len = Number(buf.readBigUInt64BE(2));
+    off = 10;
+  }
+  const maskLen = masked ? 4 : 0;
+  if (buf.length < off + maskLen + len) return null;
+  const payload = Buffer.from(buf.subarray(off + maskLen, off + maskLen + len));
+  if (masked) {
+    const mask = buf.subarray(off, off + 4);
+    for (let i = 0; i < payload.length; i++) payload[i] ^= mask[i % 4];
+  }
+  return { opcode, text: payload.toString("utf8"), rest: buf.subarray(off + maskLen + len) };
+}
+
+/**
+ * A26 自测用假 CDP 端点：`/json/list` 列一页 consent target；WS 握手后只应答 `answerIds`
+ * 里的命令 id，其余一律静默 —— 超时由 `cdp.mjs::send` 自己按 20s（或调用方传入的短超时）抛出。
+ * `[1]` 复现生产同形：attach 的 Runtime.enable 有应答（id=1）、Log.enable 静默（id=2）。
+ * `[1, 2]` 让 attach 成功，之后的命令（id≥3）静默，用来产生真求值/重复握手超时。
+ */
+async function startFakeCdp(answerIds) {
+  const sockets = new Set();
+  const server = createServer((req, res) => {
+    if (req.url !== "/json/list") {
+      res.statusCode = 404;
+      res.end();
+      return;
+    }
+    const port = server.address().port;
+    res.setHeader("content-type", "application/json");
+    res.end(
+      JSON.stringify([
+        {
+          type: "page",
+          url: `http://127.0.0.1:${port}/src/consent.html`,
+          webSocketDebuggerUrl: `ws://127.0.0.1:${port}/devtools/page/selftest`,
+        },
+      ]),
+    );
+  });
+  server.on("upgrade", (req, socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.on("error", () => socket.destroy());
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\n" +
+        "Upgrade: websocket\r\n" +
+        "Connection: Upgrade\r\n" +
+        `Sec-WebSocket-Accept: ${wsAccept(req.headers["sec-websocket-key"])}\r\n\r\n`,
+    );
+    let buf = Buffer.alloc(0);
+    socket.on("data", (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      for (;;) {
+        const frame = takeWsFrame(buf);
+        if (!frame) return;
+        buf = frame.rest;
+        if (frame.opcode === 0x8) {
+          socket.end();
+          return;
+        }
+        if (frame.opcode !== 0x1) continue;
+        let msg;
+        try {
+          msg = JSON.parse(frame.text);
+        } catch {
+          continue;
+        }
+        if (answerIds.includes(msg.id)) socket.write(wsTextFrame(JSON.stringify({ id: msg.id, result: {} })));
+      }
+    });
+  });
+  await new Promise((res) => server.listen(0, "127.0.0.1", res));
+  return {
+    port: server.address().port,
+    async close() {
+      for (const socket of sockets) socket.destroy();
+      await new Promise((res) => server.close(res));
+    },
+  };
+}
+
+/**
+ * A26 自测：握手命令的 CDP 超时只折进「读不到页」，求值/导航/输入超时照旧外抛；
+ * 到点仍读不到仍是红。`withAttach` 的 20s attach 级复现只在 `--attach-selftest` 开，
+ * 主套件跑快变体（三条 800ms 真超时）。
+ */
+async function runAttachHandshakeSelfTest(rep, { withAttach = false } = {}) {
+  const selftestId = "zz.a26-selftest";
+  const fakeTarget = {
+    url: "http://127.0.0.1/selftest/consent.html",
+    webSocketDebuggerUrl: "ws://127.0.0.1/selftest",
+  };
+  const endpoints = [];
+  try {
+    // ① 快变体：attach 成功后的命令超时（真 send/ev；800ms 只缩短等待，不改任何被测逻辑）
+    const both = await startFakeCdp([1, 2]);
+    endpoints.push(both);
+    const client = await attach(both.port, () => true, 5_000);
+    let runtimeErr = null;
+    let logErr = null;
+    let evalErr = null;
+    try {
+      runtimeErr = await client.send("Runtime.enable", {}, 800).then(() => null, (e) => e);
+      logErr = await client.send("Log.enable", {}, 800).then(() => null, (e) => e);
+      evalErr = await client.ev("1", 800).then(() => null, (e) => e);
+    } finally {
+      client.close();
+    }
+    rep.check(
+      "自测：握手超时文案是 cdp.mjs 原文（含括号提示）",
+      "true|true",
+      [
+        String(runtimeErr?.message ?? "") === "CDP Runtime.enable 超时 800ms（调试端点可能已失去响应，重启 dev 实例再试）",
+        String(logErr?.message ?? "") === "CDP Log.enable 超时 800ms（调试端点可能已失去响应，重启 dev 实例再试）",
+      ].join("|"),
+    );
+    rep.check(
+      "自测：两条握手超时被认作 attach 失败（不再外抛带走整组）",
+      "true|true",
+      `${isAttachFailure(runtimeErr)}|${isAttachFailure(logErr)}`,
+    );
+
+    // ② 生产同形（仅 --attach-selftest）：真 attach 等 Log.enable 满 20s
+    if (withAttach) {
+      const runtimeOnly = await startFakeCdp([1]);
+      endpoints.push(runtimeOnly);
+      const attachErr = await attach(runtimeOnly.port, () => true, 5_000).then(() => null, (e) => e);
+      rep.check(
+        "自测：attach 级握手超时是真 CDP Log.enable 超时（20s，含括号提示）",
+        true,
+        String(attachErr?.message ?? "") === "CDP Log.enable 超时 20000ms（调试端点可能已失去响应，重启 dev 实例再试）",
+      );
+      rep.check("自测：attach 级握手超时同样被认作 attach 失败", true, isAttachFailure(attachErr));
+    }
+
+    // ③ 握手超时折成 unreadable、不抛；全读不到仍是「未确认」而非「无窗」
+    const scanRes = await readConsentPages(selftestId, false, [fakeTarget], () => Promise.reject(logErr)).then(
+      (value) => ({ ok: true, value }),
+      (err) => ({ ok: false, err }),
+    );
+    rep.check(
+      "自测：握手超时折成 unreadable=1，readConsentPages 不抛错",
+      "true|1",
+      `${scanRes.ok}|${scanRes.ok ? scanRes.value.unreadable : "抛错"}`,
+    );
+    const verdict = tallySamples(
+      [{ count: scanRes.ok ? scanRes.value.windows.length : 0, unreadable: scanRes.ok ? scanRes.value.unreadable : 0 }],
+      0,
+    );
+    rep.check(
+      "自测：全读不到时「无窗」判未确认（SKIPPED-1），ok=false —— 不得变绿",
+      "SKIPPED-1|false|true",
+      `${verdict.state}|${verdict.ok}|${consentVerdict(verdict) !== true}`,
+    );
+
+    // ④ 反向对照：真 Runtime.evaluate 超时不许被折，也不许被宽模式吞
+    const rethrown = await readConsentPages(selftestId, false, [fakeTarget], () => {
+      throw evalErr;
+    }).then(
+      () => null,
+      (err) => err,
+    );
+    rep.check("自测：求值超时不被折叠，readConsentPages 原样外抛", true, rethrown === evalErr);
+    rep.check(
+      "自测：握手白名单不认求值/导航/输入类超时",
+      "false|false|false",
+      [
+        isAttachFailure(evalErr),
+        isAttachFailure(new Error("CDP Page.navigate 超时 20000ms（调试端点可能已失去响应，重启 dev 实例再试）")),
+        isAttachFailure(new Error("CDP Input.dispatchMouseEvent 超时 20000ms（调试端点可能已失去响应，重启 dev 实例再试）")),
+      ].join("|"),
+    );
+
+    // ⑤ 到点仍读不到：waitConsentWindow 注入探针照原样抛，带页数与最后一次原文
+    const timedOut = await waitConsentWindow(selftestId, 300, {
+      listTargets: async () => [fakeTarget],
+      attachPage: async () => ({ cs: null, unreadable: 1, error: String(logErr?.message ?? "").split("\n")[0] }),
+    }).then(
+      () => null,
+      (err) => err,
+    );
+    const timeoutText = String(timedOut?.message ?? "");
+    rep.check(
+      "自测：到点仍读不到 → waitConsentWindow 照原样红（带读不到页数与最后一次原文）",
+      true,
+      /秒内没等到/.test(timeoutText) &&
+        /attach 读不到 [1-9]\d* 页/.test(timeoutText) &&
+        timeoutText.includes("CDP Log.enable 超时 800ms"),
+    );
+  } finally {
+    for (const endpoint of endpoints) await endpoint.close();
+  }
 }
 
 /**
@@ -662,6 +900,15 @@ async function grantProbeCap(capability, pluginId = PROBE_ID) {
     await restore();
   }
 }
+
+// A26：不连应用、不碰 9223，只对 127.0.0.1 上的假 CDP 端点跑握手容错自测。
+// 用法：node tests/e2e/verify-isolation.mjs --attach-selftest（含 20s 的 attach 级复现）
+if (argv.includes("--attach-selftest")) {
+  const selfReport = createReport("A26 attach 握手容错自测（假 CDP 端点，不连应用）");
+  await runAttachHandshakeSelfTest(selfReport, { withAttach: true });
+  process.exit(selfReport.summary() ? 1 : 0);
+}
+
 try {
   c = await attach(PORT, isPetPage);
   r.info("已连接", c.url);
@@ -3105,6 +3352,10 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
       isAttachFailure(new Error("写启停清单失败: permission_denied")),
     ].join("|"),
   );
+
+  // A26：握手命令超时的容错（快变体；20s 的 attach 级复现只在 --attach-selftest 跑）。
+  // 上面那条既有断言的 want/got 一字未动，第三条握手模式由这里新增的断言单独钉住。
+  await runAttachHandshakeSelfTest(r);
 
   // 7：未启用直接申请 → false 且无窗
   {
