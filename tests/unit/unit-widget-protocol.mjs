@@ -727,6 +727,10 @@ describe("A29 阈值输入框：契约回放下的 input→click 快照", () => 
     h.type(h.nums[1], "50");
     h.type(h.nums[2], "5");
     h.click(h.save);
+    // 三框各钉一条：少任何一只的订阅，对应的字段就回落到回显值（M1a 实测红的就是 pct 那条）
+    assert.equal(h.published.at(-1)?.payload.upper, "66.6", "upper 发的必须是注入值");
+    assert.equal(h.published.at(-1)?.payload.lower, "50", "lower 发的必须是注入值");
+    assert.equal(h.published.at(-1)?.payload.pct, "5", "pct 发的必须是注入值");
     assert.deepEqual(h.published.at(-1)?.payload, {
       action: "update",
       secid: "1.600519",
