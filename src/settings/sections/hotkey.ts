@@ -5,16 +5,24 @@ import { $ } from "../dom";
 
 const hotkeyStatus = () => $<HTMLElement>("hotkey-status");
 
+type HotkeyStatus = { accelerator: string; default: string; registered: boolean };
+
 export async function renderHotkey(): Promise<void> {
   const el2 = hotkeyStatus();
   if (!el2) return;
   try {
-    const info = await hostCall<{ accelerator: string; default: string }>("hotkey_status");
-    el2.replaceChildren(
-      document.createTextNode("当前："),
-      Object.assign(document.createElement("kbd"), { textContent: info.accelerator }),
-      document.createTextNode(info.accelerator === info.default ? "（默认）" : ""),
-    );
+    const info = await hostCall<HotkeyStatus>("hotkey_status");
+    el2.classList.remove("error", "error-banner");
+    if (info.registered === false) {
+      el2.classList.add("error", "error-banner");
+      el2.textContent = `当前快捷键 ${info.accelerator} 未生效（可能被其他程序占用），请换一个`;
+    } else {
+      el2.replaceChildren(
+        document.createTextNode("当前："),
+        Object.assign(document.createElement("kbd"), { textContent: info.accelerator }),
+        document.createTextNode(info.accelerator === info.default ? "（默认）" : ""),
+      );
+    }
     const input = $<HTMLInputElement>("hotkey-input");
     if (input && !input.value) input.value = info.accelerator;
   } catch (e) {
@@ -29,7 +37,7 @@ async function saveHotkey(accelerator: string): Promise<void> {
     const input = $<HTMLInputElement>("hotkey-input");
     if (input) input.value = saved;
     await renderHotkey();
-    el2?.classList.remove("error");
+    el2?.classList.remove("error", "error-banner");
   } catch (e) {
     if (el2) el2.textContent = `应用失败：${hostErrorMessage(e)}`;
   }

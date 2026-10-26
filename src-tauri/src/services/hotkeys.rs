@@ -202,10 +202,17 @@ fn unregister(app: &AppHandle, accel: &str) {
 
 #[tauri::command]
 pub fn hotkey_status(app: AppHandle) -> Result<Value, HostError> {
-    Ok(json!({
-        "accelerator": read_saved(&app).unwrap_or_else(|| DEFAULT_ACCEL.to_string()),
+    let accelerator = read_saved(&app).unwrap_or_else(|| DEFAULT_ACCEL.to_string());
+    let registered = app.global_shortcut().is_registered(accelerator.as_str());
+    Ok(status_payload(accelerator, registered))
+}
+
+fn status_payload(accelerator: String, registered: bool) -> Value {
+    json!({
+        "accelerator": accelerator,
         "default": DEFAULT_ACCEL,
-    }))
+        "registered": registered,
+    })
 }
 
 /// 换键：只认设置窗。先注册新键，成功才注销旧键并落盘。
@@ -385,6 +392,44 @@ mod tests {
                 " ) -> Result<bool, HostError> {"
             )),
             "hotkey_test 的 Err 侧必须是 HostError"
+        );
+    }
+
+    #[test]
+    fn status_payload_has_exact_camel_case_keys() {
+        let value = status_payload("Ctrl+Alt+P".to_string(), false);
+        let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "accelerator".to_string(),
+                "default".to_string(),
+                "registered".to_string()
+            ],
+            "hotkey_status 的 JSON 键集合必须精确为 accelerator/default/registered"
+        );
+        assert_eq!(
+            value.get("registered").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            status_payload("Ctrl+Alt+P".to_string(), true)
+                .get("registered")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn status_checks_the_registered_state() {
+        let flat = include_str!("hotkeys.rs")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains(concat!("is_", "registered(accelerator.as_str())")),
+            "hotkey_status 必须用当前 accelerator 查询真实注册状态"
         );
     }
 }
