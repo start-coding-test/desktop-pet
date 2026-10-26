@@ -32,6 +32,7 @@ MVP 范围：<这一轮只做什么>
 | 卡 | 标题 | 类型 | 状态 | 依赖 | 提交 | 评审 |
 |---|---|---|---|---|---|---|
 | S1 | 发布 0.2.0 便携包 | 工程发布 | **已完成**（2026-10-16 用户直接要求出包；B3/B4/A9b 未落地，包按当期 main 切，证据见卡面） | — | `93a6eef` + 本次提交 | — |
+| S3 | 发布 0.2.2（安装包 + 便携包） | 工程发布 | **已完成**（2026-10-27；tag `v0.2.2` → `bf585fe`；GitHub Release 双资产；真机 A27/A28/A29/A30/A32/C09/E03 通过，`verify:release` 36/0，main 组合 E2E 五套件全 0；已知项与校验值见发版说明） | — | `bf585fe` | — |
 | S2 | P1/P2 加固：同意框身份、订阅侧 ACL、点击穿透门禁、widget boot 超时、store 锁表回收、裸 IPC 判据换真执行 | 安全边界 + 工程 | **已落地待验收**（本次提交；离线门禁全绿，e2e 未跑 —— 理由与影响面见卡面与 [adr/0011](../adr/0011-consent-identity-and-subscribe-acl.md)） | — | 本次提交 | — |
 | S3 | settings 区强制进 Worker（门禁粒度从"窗口"收到"身份"） | 安全边界 | **进行中**（2026-10-17；宿主侧分流 + 纯逻辑钉已落地：`widgetUsesWorker` / `legacyWidgetReason` 都带上所在区，`settings` 一律 Worker，宿主 realm 给 settings 注入 `ctx.host` 那段删除；`verify-isolation` 里两处 settings 区探针按 Worker 契约重写与 runner 复跑待收尾） | — | `84b663e` | 离线门禁：`unit` 1255/0（基线 1249，+6 条 S3 钉）、`unit:widget` 140/0、`lint` / `build` rc 0、`check:docs` rules=8 failing=0、`check:shape` commands=48 s1=0 s2=0 string_err=0 failing=0。ADR-0011 已同步：settings 那条移出「已知未收口」，残余（例外名单仍在 badge/overlay、自报 id 分不出、入口点名键未动）照实保留 |
 | B2 | `agent:hooks` 受控能力：钩子配置从设置窗移交到插件页 | 本体功能 + 安全边界 | **已放行**（第二轮返工后 PM 全量重跑：cargo 72、`verify` **189/0**、`verify:agent` 53、`verify:release` 12、build 0；三条打回问题都修在脚本侧，根因见卡 §10 与提交说明） | — | `7b9b558` | — |
