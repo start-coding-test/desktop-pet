@@ -297,9 +297,11 @@ pub fn hotkey_test(
     crate::gate::settings(&window, "试注册快捷键")?;
     let probe = normalize_accel(&accelerator)?;
     // 试的就是当前生效的那个键：注册必然报「已占用」，那不是冲突。
-    // 比较对象必须是「当前生效」的键，而不是「已落盘」的 —— 没落盘时生效的是默认值
+    // 比较对象必须是「当前生效」的键，而不是「已落盘」的 —— 没落盘时生效的是默认值。
+    // E03：只有当前键确实已注册时才直接判 true —— 启动时注册失败（键被占）的路径上，
+    // 当前键并没有注册，必须真试一次，否则「测试占用」会给出与状态行相反的假阳性。
     let current = read_saved(&app).unwrap_or_else(current_default_accel);
-    if current == probe {
+    if current == probe && app.global_shortcut().is_registered(current.as_str()) {
         return Ok(true);
     }
     match apply(&app, &probe) {
@@ -553,6 +555,23 @@ mod tests {
                 "debug_assertions), )"
             )),
             "settings_file 必须走 settings_dir 并传 cfg!(debug_assertions)"
+        );
+    }
+
+    /* ============ E03：当前键未注册时「测试占用」必须真试 ============ */
+
+    #[test]
+    fn hotkey_test_only_short_circuits_registered_current_key() {
+        let flat = include_str!("hotkeys.rs")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains(concat!(
+                "if current == probe && app.global_shortcut().",
+                "is_registered(current.as_str()) {"
+            )),
+            "当前键只有在确实已注册时才能直接判 true"
         );
     }
 
