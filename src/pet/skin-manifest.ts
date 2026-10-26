@@ -167,7 +167,9 @@ export function manifestTiming(manifest: DesktopPetManifest): SpriteTiming {
   const timing: SpriteTiming = {};
   for (const [id, state] of Object.entries(manifest.states)) {
     timing[id as PetStateId] = {
-      frameSec: state.durationMs / 1000 / state.frames,
+      // 必须一次除法：先除 1000 再除 frames 会引入二进制误差（600/1000/12 = 0.049999999999999996），
+      // 而帧间隔是回归里逐字比对的判据
+      frameSec: state.durationMs / (state.frames * 1000),
       cycleSec: state.durationMs / 1000,
     };
   }

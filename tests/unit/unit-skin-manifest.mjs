@@ -249,6 +249,34 @@ group("v3 timing");
   eq("只包含清单里的状态", undefined, timing.review);
 }
 
+{
+  // 严格等值：回归里帧间隔是逐字比对的判据，二进制误差会直接判红
+  const strictTiming = (spec) => {
+    const raw = {
+      desktopPet: {
+        version: 3,
+        grid: { columns: 16, rows: 8 },
+        states: { idle: { row: 0, frames: 1, durationMs: 32 }, waving: spec },
+      },
+    };
+    const result = parse(raw);
+    eq("严格等值夹具被识别为 v3", "v3", result.kind);
+    return manifestTiming(result.manifest).waving;
+  };
+  const t300 = strictTiming({ row: 1, frames: 6, durationMs: 300 });
+  check(
+    "waving 300ms/6 帧严格等于 {frameSec:0.05,cycleSec:0.3}",
+    JSON.stringify({ frameSec: 0.05, cycleSec: 0.3 }) === JSON.stringify(t300),
+    `actual=${JSON.stringify(t300)}`,
+  );
+  const t600 = strictTiming({ row: 1, frames: 12, durationMs: 600 });
+  check(
+    "waving 600ms/12 帧（E2E §5.1 夹具）严格等于 {frameSec:0.05,cycleSec:0.6}",
+    JSON.stringify({ frameSec: 0.05, cycleSec: 0.6 }) === JSON.stringify(t600),
+    `actual=${JSON.stringify(t600)}`,
+  );
+}
+
 /* ============================ sliceAtlasV3 几何 ============================ */
 group("v3 切片几何");
 
@@ -529,4 +557,35 @@ const timingSet = () => ({
     observed.every((item) => item.endsWith(":0->1")),
     observed.join(","),
   );
+}
+
+{
+  // E2E 夹具同源：waving 600ms/12 帧，timing 由产品代码算出，550/610ms 判据不放宽
+  const result = parse({
+    desktopPet: {
+      version: 3,
+      grid: { columns: 16, rows: 8 },
+      states: {
+        idle: { row: 0, frames: 1, durationMs: 32 },
+        waving: { row: 1, frames: 12, durationMs: 600 },
+      },
+    },
+  });
+  const timing = manifestTiming(result.manifest);
+  const set = timingSet();
+  set.waving = frames(12);
+
+  const sm = new PetStateMachine(set, timing);
+  sm.request("waving");
+  sm.update(0.55);
+  eq("550ms 仍在 waving（清单 cycleSec=0.6）", "waving", sm.action);
+  sm.update(0.06);
+  eq("610ms 回落 idle", "idle", sm.action);
+
+  const smFrame = new PetStateMachine(set, timing);
+  smFrame.request("waving");
+  smFrame.update(0.04);
+  eq("40ms 不换帧（清单 frameSec=0.05）", 0, smFrame.frame.sx);
+  smFrame.update(0.02);
+  eq("60ms 换到下一帧", 1, smFrame.frame.sx);
 }
