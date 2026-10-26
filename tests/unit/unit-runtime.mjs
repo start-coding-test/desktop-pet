@@ -590,3 +590,33 @@ group("同意框刷新与拒绝文案");
     true,
   );
 }
+
+group("A30 热键状态契约");
+
+{
+  const hotkeyTs = readFileSync(
+    new URL("../../src/settings/sections/hotkey.ts", import.meta.url),
+    "utf8",
+  );
+  const hotkeysRs = readFileSync(
+    new URL("../../src-tauri/src/services/hotkeys.rs", import.meta.url),
+    "utf8",
+  );
+  check(
+    "A30 hotkey_status 读取真实注册状态",
+    hotkeysRs.includes("is_registered(accelerator.as_str())") &&
+      hotkeysRs.includes('"registered": registered'),
+    true,
+  );
+  check(
+    "A30 前端读取 camelCase registered",
+    hotkeyTs.includes("registered: boolean") && hotkeyTs.includes("info.registered"),
+    true,
+  );
+  check(
+    "A30 未生效提示与 error 样式",
+    hotkeyTs.includes("未生效（可能被其他程序占用），请换一个") &&
+      hotkeyTs.includes('classList.add("error", "error-banner")'),
+    true,
+  );
+}
