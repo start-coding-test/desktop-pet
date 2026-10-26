@@ -51,6 +51,11 @@ export function mountAdd(ctx, state) {
     ctx.bus.publish(TOPIC_CMD, { action: "search", keyword: kw });
   });
   addBtn.on("click", submitAdd);
+  // Worker 的 value 只随 input/change 快照回推；keydown 快照只带 key。
+  // 订阅 input 让宿主把每次输入的值写回虚拟节点（真正的写回在 widget-node.handleEvent）。
+  addInput.on("input", () => {
+    // 不复制 value、不写状态；这里只需要一个 input 监听让宿主转发快照。
+  });
   // 回车原来走 addBtn.click() 并当场 preventDefault：契约里 preventDefault 只能订阅时整键声明
   //（会拦掉全部按键），而这个输入框不在表单里、回车本无默认动作，所以只保留「回车=提交」
   addInput.on("keydown", (e) => {

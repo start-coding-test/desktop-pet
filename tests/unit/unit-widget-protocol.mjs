@@ -567,3 +567,76 @@ describe("S3：settings 区一律进 Worker，例外名单只对 badge / overlay
     assert.equal(WIDGET_CONTRACT_API_VERSION, 2);
   });
 });
+
+describe("A28 添加自选：真实 input→click 快照", () => {
+  async function mountAddHarness() {
+    const sent = [];
+    const session = new WidgetRenderSession((msg) => sent.push(msg));
+    const real = createDomFacade(session);
+    const inputs = [];
+    const buttons = [];
+    const dom = {
+      createElement(tag) {
+        const node = real.createElement(tag);
+        if (tag === "input") inputs.push(node);
+        if (tag === "button") buttons.push(node);
+        return node;
+      },
+      createElementNS(ns, tag) {
+        return real.createElementNS(ns, tag);
+      },
+    };
+    const published = [];
+    const statuses = [];
+    const ctx = { dom, bus: { publish: (topic, payload) => published.push({ topic, payload }) } };
+    const state = {
+      status: { set: (text, level) => statuses.push({ text, level }) },
+      section: (title, ...nodes) => ({ title, nodes }),
+    };
+    const { mountAdd } = await import("../../plugins/com.pet.astock/views/settings/add.js");
+    mountAdd(ctx, state);
+    session.flush();
+    return { session, sent, inputs, buttons, published, statuses };
+  }
+
+  it("input 快照回推后 search / 直接添加 / 回车都能读到关键字", async () => {
+    const h = await mountAddHarness();
+    const inputNode = h.inputs[0];
+    const search = h.buttons.find((b) => b.textContent === "搜索");
+    const add = h.buttons.find((b) => b.textContent === "直接添加");
+    assert.ok(inputNode, "输入框节点");
+    assert.ok(search, "搜索按钮");
+    assert.ok(add, "直接添加按钮");
+
+    const inputListens = h.sent
+      .flatMap((m) => m.ops)
+      .filter((o) => o.k === "listen" && o.id === inputNode.nodeId && o.event === "input");
+    assert.equal(inputListens.length, 1, "输入框必须订阅 input 快照，否则宿主不会回推 value");
+
+    // 负对照：不注入 input，直接点搜索仍应报「先输入代码或名称关键字」
+    h.session.handleEvent(search.nodeId, "click", {});
+    assert.equal(h.published.length, 0, "空输入不应发布 search");
+    assert.equal(h.statuses.at(-1)?.text, "先输入代码或名称关键字");
+
+    // 负对照：只有 keydown 快照（不带 value）时，回车也不应发布 add
+    h.session.handleEvent(inputNode.nodeId, "keydown", { key: "Enter" });
+    assert.equal(h.published.length, 0, "只有 keydown 不应发布 add");
+    assert.equal(h.statuses.at(-1)?.text, "先输入 6 位代码");
+
+    // 真实路径：input 快照先把 value 写回节点，再点搜索
+    h.session.handleEvent(inputNode.nodeId, "input", { value: "立昂微" });
+    h.session.handleEvent(search.nodeId, "click", {});
+    assert.deepEqual(h.published.at(-1)?.payload, { action: "search", keyword: "立昂微" });
+    assert.equal(h.statuses.at(-1)?.text, "正在搜索「立昂微」…");
+
+    // 直接添加
+    h.session.handleEvent(inputNode.nodeId, "input", { value: "600519" });
+    h.session.handleEvent(add.nodeId, "click", {});
+    assert.deepEqual(h.published.at(-1)?.payload, { action: "add", input: "600519" });
+
+    // 回车
+    h.session.handleEvent(inputNode.nodeId, "input", { value: "600519" });
+    h.session.handleEvent(inputNode.nodeId, "keydown", { key: "Enter" });
+    assert.deepEqual(h.published.at(-1)?.payload, { action: "add", input: "600519" });
+  });
+});
