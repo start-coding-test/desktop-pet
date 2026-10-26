@@ -325,6 +325,20 @@ try {
   await send({ action: "saveConfig", config: { demo: true } });
   const badgeText = await waitShadowText(c, badgeHost, ".g-badge", "5h 63%", 20_000);
   r.check("badge 显示演示 5h 63%", true, badgeText.includes("5h 63%"));
+  // C11：演示 view 必须带可复算的 daily/charts；rate=1500/(1500+3000)=1/3，KPI 文本由 fmtPct 显示 33%。
+  const demoView = await readView();
+  const demoCacheRead = Object.values(demoView?.charts ?? {})
+    .flat()
+    .reduce((sum, bucket) => sum + (Number(bucket?.cache_read_tokens) || 0), 0);
+  const demoCacheInput = (Array.isArray(demoView?.daily) ? demoView.daily : []).reduce(
+    (sum, day) => sum + (Number(day?.tokens_in) || 0),
+    0,
+  );
+  r.check(
+    "演示缓存 KPI 可复算（1500/(1500+3000)=1/3）",
+    1 / 3,
+    demoCacheRead / (demoCacheRead + demoCacheInput),
+  );
 
   const visible = await pollUntil(() => overlayVisible(), 15_000, 500);
   r.check("overlay 窗口可见", true, !!visible);

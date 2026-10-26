@@ -15,7 +15,7 @@ import { mergeChartBuckets, mergeUsagePages, nextPageCursor } from "./internal.j
 import { buildPanelPayload } from "./panel.js";
 import { mergeDaily, replaceChartDays } from "./daily.js";
 import { clearCookieAfterAuthFailure, COOKIE_EXPIRED_TEXT, maskCookie, migrateSecrets } from "./secrets.js";
-import { demoSnapshot, DEMO_SCENARIOS } from "./demo.js";
+import { demoSnapshot, demoViewData, pickUsageView, DEMO_SCENARIOS } from "./demo.js";
 import { appendHistory } from "./history.js";
 import { buildSnapshot, maskKey } from "./normalize.js";
 import { nextDelay } from "./schedule.js";
@@ -35,6 +35,9 @@ let daily = [];
 let countedThroughMs = 0;
 /** @type {Record<string, Array<Record<string, any>>>} */
 let chartsByDay = {};
+/** 演示模式的独立数据源；不写 daily/chartsByDay，不进 persist。 */
+/** @type {{daily: Array<Record<string, any>>, charts_by_day: Record<string, Array<Record<string, any>>>} | null} */
+let demoData = null;
 /** @type {Record<string, any> | null} */
 let snapshot = null;
 /** @type {Array<Array<number | null>>} */
@@ -198,6 +201,7 @@ function publishView() {
             mode: "key",
           }
         : null;
+  const usage = pickUsageView({ demo: config.demo, demoData, daily, chartsByDay });
   const view = {
     state: viewState,
     fetchedAt: Number(snapshot?.fetched_at) || 0,
@@ -212,8 +216,8 @@ function publishView() {
     config: cloneConfig(),
     cookie: { configured: !!cookie, state: cookieState, masked: maskCookie(cookie) },
     records,
-    daily,
-    charts: chartsByDay,
+    daily: usage.daily,
+    charts: usage.charts_by_day,
     net: {
       lastMinute: gate.stats().window,
       cooldownReason,
@@ -502,10 +506,18 @@ async function refreshSnapshot() {
   try {
     let next;
     if (config.demo) {
-      next = demoSnapshot(now, demoScenario);
+      const demoNext = demoSnapshot(now, demoScenario);
+      demoData = demoViewData(
+        now,
+        demoScenario,
+        undefined,
+        Number(demoNext.plan?.current_period_start) || undefined,
+      );
+      next = demoNext;
       viewState = "demo";
       lastError = "";
     } else {
+      demoData = null;
       const key = cred.apiKey;
       let whoami = whoamiCache?.data;
       if (!whoamiCache || now - whoamiCache.at > 3_600_000) {
@@ -748,6 +760,8 @@ async function handleCmd(cmd) {
         thresholds: { ...config.thresholds, ...(patch.thresholds ?? {}) },
       });
       await persist(["config"]);
+      if (!config.demo) demoData = null;
+      else if (!demoData) demoData = demoViewData(Date.now(), demoScenario);
       if (config.demo) scheduleNext(0);
       else if (cred.apiKey) scheduleNext(0);
       else {
@@ -769,6 +783,7 @@ async function handleCmd(cmd) {
         return;
       }
       demoScenario = String(cmd.scenario);
+      demoData = demoViewData(Date.now(), demoScenario);
       await refreshSnapshot();
       return;
     }
@@ -807,6 +822,7 @@ export async function activate(context) {
     await persist(["schema", "config", "cred"]);
     needsSchemaWrite = false;
   }
+  demoData = config.demo ? demoViewData(Date.now(), demoScenario) : null;
   viewState = config.demo ? "demo" : cred.apiKey ? "stale" : "onboarding";
   publishView();
   void syncOverlay();
@@ -817,6 +833,7 @@ export async function activate(context) {
 
 export async function deactivate() {
   stopped = true;
+  demoData = null;
   stopTimer();
   await overlayChain.catch(() => undefined);
   try {
