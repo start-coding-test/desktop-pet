@@ -52,6 +52,12 @@ export function mountPrefs(ctx, state) {
   const currencyCard = card(dom, "币种与汇率");
   const currencySel = tag(dom, "select");
   currencySel.dataset.field = "currency";
+  // 「应用」的 click 快照不带 value（widget-renderer.ts:88-96），宿主也只转发已订阅的事件（:236-249）——
+  // 不订阅 change，下面 :75 读到的永远是 render 写回的回显值，选的币种会被 stale 值覆盖回去。
+  currencySel.on("change", () => {
+    // 无副作用：只需要这条订阅让宿主把选中的 value 写回虚拟节点；发送时机仍由「应用」决定（别在这里 send，
+    // 否则会绕过下面 rateInput 的校验）。
+  });
   for (const [value, label] of [
     ["USD", "USD ($)"],
     ["CNY", "CNY (¥)"],

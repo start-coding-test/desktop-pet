@@ -746,3 +746,94 @@ describe("A29 阈值输入框：契约回放下的 input→click 快照", () => 
     assert.equal(C.clampNum("66.6"), 66.6, "正向对照：clampNum 没坏，上面那个 null 不是假的");
   });
 });
+
+describe("A32 币种下拉：契约回放下的 change→click 快照", () => {
+  // 契约回放与 A29 那组同一理由：宿主只把「插件订阅过的事件」转回 Worker（widget-renderer.ts:236-249、:245），
+  // 且只有 change/input 的快照带 value（:88-96）。直接调 handleEvent 会绕过转发条件，少订阅杀不动。
+  async function mountPrefsHarness() {
+    const sent = [];
+    const session = new WidgetRenderSession((msg) => sent.push(msg));
+    const real = createDomFacade(session);
+    const selects = [];
+    const inputs = [];
+    const buttons = [];
+    const dom = {
+      createElement(tagName) {
+        const node = real.createElement(tagName);
+        if (tagName === "select") selects.push(node);
+        if (tagName === "input") inputs.push(node);
+        if (tagName === "button") buttons.push(node);
+        return node;
+      },
+      createElementNS(ns, tagName) {
+        return real.createElementNS(ns, tagName);
+      },
+    };
+    const published = [];
+    const statuses = [];
+    const ctx = { dom, bus: { publish: (topic, payload) => published.push({ topic, payload }) } };
+    const state = { status: { set: (text, level) => statuses.push({ text, level }) } };
+    const ops = () => sent.flatMap((m) => m.ops);
+    const listens = (node, event) =>
+      ops().filter((o) => o.k === "listen" && o.id === node.nodeId && o.event === event).length;
+    const fire = (node, event, snapshot = {}) => {
+      if (listens(node, event) > 0) session.handleEvent(node.nodeId, event, snapshot);
+    };
+    const { mountPrefs } = await import("../../plugins/com.pet.goat-gauge/views/settings/prefs.js");
+    const prefs = mountPrefs(ctx, state);
+    prefs.render({ config: { currency: "USD", usdToCny: 7.2 } });
+    session.flush();
+    const byField = (name) => selects.find((n) => n.dataset.field === name);
+    // 「应用」按钮有四只（刷新/币种/阈值/位置），按创建顺序取第二只；它发的补丁里带 usdToCny，取错就会断言红
+    return { session, sent, ops, listens, fire, selects, inputs, buttons, published, statuses, prefs, byField };
+  }
+
+  it("两只 select：币种补上 change 订阅，徽标那条正确写法没被改动", async () => {
+    const h = await mountPrefsHarness();
+    assert.equal(h.selects.length, 2, "goat-gauge 设置页只有 currency 与 badgeMode 两只 select");
+    const currency = h.byField("currency");
+    const badge = h.byField("badgeMode");
+    assert.ok(currency && badge, "两只都要能按 dataset.field 认出来");
+    assert.equal(h.listens(currency, "change"), 1, "币种必须订阅 change，否则「应用」读到的还是回显值");
+    assert.equal(h.listens(currency, "input"), 0, "只补 change，不顺手多订一种");
+    assert.equal(h.listens(badge, "change"), 1, "徽标下拉原有的 change 订阅不许被动（同文件的正确写法）");
+  });
+
+  it("负对照：不注入 change 快照时，点「应用」发的就是回显的 USD", async () => {
+    const h = await mountPrefsHarness();
+    const currency = h.byField("currency");
+    const rate = h.inputs.find((n) => n.dataset.field === "usdToCny");
+    assert.equal(currency.value, "USD", "render 的回显（prefs.js:174）");
+    h.fire(rate, "input", { value: "8.1" });
+    h.fire(h.buttons[1], "click");
+    assert.deepEqual(h.published.at(-1)?.payload, {
+      action: "saveConfig",
+      config: { currency: "USD", usdToCny: 8.1 },
+    });
+  });
+
+  it("注入 change 快照后点「应用」发的就是所选币种；sanitizeConfig 与汇率校验都钉住", async () => {
+    const h = await mountPrefsHarness();
+    const S = await import("../../plugins/com.pet.goat-gauge/store-schema.js");
+    const currency = h.byField("currency");
+    const rate = h.inputs.find((n) => n.dataset.field === "usdToCny");
+    h.fire(currency, "change", { value: "CNY" });
+    h.fire(rate, "input", { value: "8.1" });
+    h.fire(h.buttons[1], "click");
+    assert.equal(h.published.at(-1)?.payload.config.currency, "CNY", "币种发的必须是选中值");
+    assert.equal(h.published.at(-1)?.payload.config.usdToCny, 8.1, "汇率同批带上");
+    assert.deepEqual(h.published.at(-1)?.payload, {
+      action: "saveConfig",
+      config: { currency: "CNY", usdToCny: 8.1 },
+    });
+    // 收口语义：这里没有「空串=清除」，脏值一律静默回落 USD（所以 stale 值会主动覆盖回 USD）
+    assert.equal(S.sanitizeConfig({ currency: "CNY" }).currency, "CNY", "正向对照");
+    assert.equal(S.sanitizeConfig({ currency: "" }).currency, "USD", "空值静默回落 USD");
+    // 校验顺序没被新订阅绕过：汇率非法仍然拦下、一条都不发
+    const before = h.published.length;
+    h.fire(rate, "input", { value: "0" });
+    h.fire(h.buttons[1], "click");
+    assert.equal(h.published.length, before, "汇率不合法时不该发出任何补丁");
+    assert.equal(h.statuses.at(-1)?.text, "汇率要在 1–20 之间");
+  });
+});
