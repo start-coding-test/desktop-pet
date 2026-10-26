@@ -56,7 +56,7 @@ v3 不由尺寸识别：只有图集同目录的 `pet.json` 里 `desktopPet.vers
 
 ### 节奏
 
-- `frameSec = durationMs / 1000 / frames`：帧间隔，九个状态都生效。
+- `frameSec = durationMs / (frames * 1000)`：帧间隔，九个状态都生效。必须一次除法——先除 1000 再除帧数会引入二进制误差（`600/1000/12 = 0.049999999999999996`），而帧间隔是回归里逐字比对的判据。
 - `cycleSec = durationMs / 1000`：整轮时长；手势（`waving` / `jumping` / `failed`）的停留时长用它。
 - `idle`（9 秒）、`waiting`（长久）与循环类（45 秒续期上限）的停留仍是宿主行为参数，不由清单覆盖。
 
