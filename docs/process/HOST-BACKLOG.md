@@ -54,6 +54,7 @@ MVP 范围：<这一轮只做什么>
 | E02 | debug 默认热键覆盖（`PET_HOTKEY_DEFAULT`）：E2E 机器占键时仍验证默认值路径 | 工程/回归 | **已放行**（2026-10-27；debug-only 覆盖，release 不读；`hotkey_status.default` 驱动判据，产品默认仍 `CommandOrControl+Alt+P`；详见 [adr/0015](../adr/0015-debug-only-default-hotkey-override.md)） | — | 本次提交 | — |
 | E03 | 「测试占用」对未注册的当前键必须真试（0.2.2 真机验收发现） | 工程/回归 | **已放行**（2026-10-27；当前键只有 `is_registered` 为真才直接判 true；启动时被占的默认键现在会如实报「注册失败」，与状态行一致；Rust 源码层判据 + 真机复演） | — | 本次提交 | — |
 | E04 | v3 CSP 回归、atlas 缓存失效与 0.2.2 打包版内存实测 | 工程/回归 + 文档 | **已放行**（2026-10-27；`verify-release` 补 `connect-src` 断言并真实 fetch `pet.json`；v3 清单无效时清 `atlasCache`；`pet.json` 请求加 `no-store` 并写明覆盖后重启；SKIN-FORMAT 记录 4608×6240 v3 皮肤实测总工作集 887 MiB） | — | 本次提交 | — |
+| E05 | goat badge 空态判据在 astock 共存时误红（改判自身高度/内容） | 回归 | **已放行**（2026-10-27；`#widget-badge` 宽度会被共存插件撑开，块级插槽继承宽度；空态改判 goat 插槽自身 `height===0` 且无文本，仍为严格断言，并保留失败现场诊断） | — | 本次提交 | — |
 
 **两处调度纠正（2026-10-10 规划方复核）**：
 
