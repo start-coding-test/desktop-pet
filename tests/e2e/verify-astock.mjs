@@ -1168,6 +1168,72 @@ try {
   const cleared = ((await invoke("store_get", { pluginId: PID, key: "watch" })).v ?? []).find((w) => w.secid === "1.600519");
   r.check("清空一个阈值不影响另外两个", [null, 99999, 3], [cleared?.upper, cleared?.lower, cleared?.pct]);
 
+  // ---------- Bug4：一次推送不能把正在输入的阈值冲掉 ----------
+  // 交接文档 §4.5 要的那条运行时判据。走真实链路：设置页里的阈值格是 Worker 渲染契约下
+  // 宿主按 op 流建出来的真元素（`rec.shadow` 是页面 realm 里的那个 shadow root），
+  // 在它上面派发一次真 input（宿主的 listen 就挂在元素本身，widget-renderer.ts:248），
+  // 再广播一次 sync 逼出 widget 的视图推送 —— 推送里 upper 仍是配置的空值，
+  // 界面必须还显示用户刚敲的 88.88。少了 watch-list.js 的行复用与编辑锁，这条当场红。
+  await settings.client.ev(`document.querySelector('#nav-plugins .nav-item[data-view=${JSON.stringify(PID)}]')?.click()`);
+  const numBoxReady = await waitUntil(
+    settings.client,
+    `(async () => {
+      const { widgetHost } = await import('/src/runtime/widget-host.ts');
+      const rec = (widgetHost.mounted.get(${JSON.stringify(PID)}) ?? [])[0];
+      return !!rec?.shadow?.querySelector('input.num[placeholder="涨到"]');
+    })()`,
+    20_000,
+  );
+  r.check("设置页找得到「涨到」那一格阈值输入框", true, numBoxReady);
+  const typedIn = await settings.client.ev(`(async () => {
+    const { widgetHost } = await import('/src/runtime/widget-host.ts');
+    const rec = (widgetHost.mounted.get(${JSON.stringify(PID)}) ?? [])[0];
+    const box = rec?.shadow?.querySelector('input.num[placeholder="涨到"]');
+    if (!box) return { ok: false, why: "框没了" };
+    const before = box.value;
+    box.value = "88.88";
+    box.dispatchEvent(new Event("input", { bubbles: true }));
+    return { ok: true, before, after: box.value };
+  })()`);
+  r.check("把 88.88 敲进「涨到」（下面那条才不是空转）", true, typedIn?.ok === true && typedIn.after === "88.88");
+  // 逼一次视图推送，并证明这一帧真的到了插件（不是只有我们自己在等）
+  const pushArrived = await c.ev(`(async () => {
+    const { bus } = await import('/src/runtime/event-bus.ts');
+    const got = await new Promise((res) => {
+      const off = bus.subscribe(${JSON.stringify(`${PID}:widget`)}, (x) => { off(); res(x); });
+      bus.publish(${JSON.stringify(`${PID}:cmd`)}, { action: "sync" }, ${JSON.stringify(PID)});
+      setTimeout(() => { off(); res(null); }, 6000);
+    });
+    return !!got && (got.watch ?? []).length > 0;
+  })()`);
+  r.check("sync 触发了一次视图推送且带着自选表", true, pushArrived);
+  await sleep(1200);
+  const stillTyped = await settings.client.ev(`(async () => {
+    const { widgetHost } = await import('/src/runtime/widget-host.ts');
+    const rec = (widgetHost.mounted.get(${JSON.stringify(PID)}) ?? [])[0];
+    return rec?.shadow?.querySelector('input.num[placeholder="涨到"]')?.value ?? "框没了";
+  })()`);
+  r.check("推送没有冲掉还没保存的输入", "88.88", String(stillTyped));
+  // 反向判据：编辑锁不是永不复位 —— 把值填回配置里的空值并派发 input，
+  // 下一帧推送就会照配置回显（配置没被我们改过，所以这一步不碰 store）
+  const restored = await settings.client.ev(`(async () => {
+    const { widgetHost } = await import('/src/runtime/widget-host.ts');
+    const rec = (widgetHost.mounted.get(${JSON.stringify(PID)}) ?? [])[0];
+    const box = rec?.shadow?.querySelector('input.num[placeholder="涨到"]');
+    if (!box) return "框没了";
+    box.value = "";
+    box.dispatchEvent(new Event("input", { bubbles: true }));
+    return "已回填";
+  })()`);
+  r.check("把那一格清回配置的空值（不留编辑残留给后面的组）", "已回填", String(restored));
+  await sleep(1200);
+  const echoBack = await settings.client.ev(`(async () => {
+    const { widgetHost } = await import('/src/runtime/widget-host.ts');
+    const rec = (widgetHost.mounted.get(${JSON.stringify(PID)}) ?? [])[0];
+    return rec?.shadow?.querySelector('input.num[placeholder="涨到"]')?.value ?? "框没了";
+  })()`);
+  r.check("回填后回显跟配置一致（锁已复位）", "", String(echoBack));
+
   r.group("配置：间隔下限与模式");
   await c.ev(`window.__bus.publish(${JSON.stringify(`${PID}:cmd`)}, ${JSON.stringify({ action: "config", value: { intervalSec: 1, mode: "overlay" } })}); true`);
   await sleep(1500);
