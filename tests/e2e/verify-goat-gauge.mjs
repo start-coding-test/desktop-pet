@@ -319,11 +319,31 @@ try {
     wanted.length > 0 && wanted.every((cap) => caps.has(cap)) && caps.size === wanted.length,
   );
 
+  // #widget-badge 的宽度会被共存插件的 badge 撑开（例如同时启用 A股盯盘），块级插槽会继承这个宽度；
+  // 空态要看 goat 插槽自己的高度与内容，不能把父容器的宽度算成它的尺寸。高度 0 且无文本才是真的没渲染。
   const empty = await waitUntil(
     c,
-    `(() => { const n = document.querySelector(${JSON.stringify(badgeHost)}); if (!n) return false; const b = n.getBoundingClientRect(); return b.width === 0 && b.height === 0; })()`,
+    `(() => { const n = document.querySelector(${JSON.stringify(badgeHost)}); if (!n) return false; const b = n.getBoundingClientRect(); return b.height === 0 && !n.textContent.trim(); })()`,
     10_000,
   );
+  if (!empty) {
+    const diag = await c.ev(`(async () => {
+      const n = document.querySelector(${JSON.stringify(badgeHost)});
+      const rect = n?.getBoundingClientRect();
+      const call = async (cmd, args = {}) => {
+        try { return await window.__TAURI_INTERNALS__.invoke(cmd, args); }
+        catch (e) { return { error: String(e) }; }
+      };
+      return {
+        rect: rect ? { x: rect.x, y: rect.y, w: rect.width, h: rect.height } : null,
+        html: n?.innerHTML?.slice(0, 500) ?? null,
+        config: await call('store_get', { pluginId: ${JSON.stringify(PID)}, key: 'config' }),
+        active: await call('pet_skin_active'),
+        enabled: await call('plugin_enabled_list'),
+      };
+    })()`);
+    r.info("badge 空态现场", JSON.stringify(diag));
+  }
   r.check("未配置且非演示时 badge 没有尺寸", true, empty);
 
   // 观察 petController；notify 用插件在 ctx.notify.show resolve 后发的 :status 记录。
