@@ -654,48 +654,69 @@ fn apply_startup_broadcast(ids: Option<&[String]>, linkage_on: bool) {
 /// AppHandle，单测能真的把顺序跑红；这里只负责把路径与现状凑出来。
 pub fn startup(app: &AppHandle) {
     let Some(data) = app_data(app) else { return };
-    // 迁移的证据只可能是 Qoder 形状的条目（见 migrate_from_legacy），所以这一步按 Qoder 取文件
-    let files = targets(app, &claude_style::QODER);
     let ids = crate::services::enabled::list_ids(app);
     // 清单还不存在（尚未迁移）= 说不出现状：既不拨广播闸门，也不动手清理
     let on = ids.as_ref().is_some_and(|v| linkage_on(app, v));
     apply_startup_broadcast(ids.as_deref(), on);
-    let adapter = adapter_for(agent_choice(&data).as_deref());
     let switches = recorded_switches(&data);
-    let migrated = startup_sequence(&data, &files, ids.as_deref(), on, &mut |files| {
-        let reports = uninstall(adapter, files, &switches);
-        for r in &reports {
-            if let Some(e) = &r.error {
-                log::warn!("启动清理失败: {e} (path: {})", r.path);
+    // 证据与残留都在用户目录里：连主目录都拿不到时，补写与清理都无从谈起，保持原样
+    match app.path().home_dir() {
+        Ok(home) => {
+            let outcome = startup_sequence(&data, &home, ids.as_deref(), on, &switches);
+            log::info!("启动补写联动状态: {:?}", outcome.migrated);
+            if let Some(reports) = outcome.cleaned {
+                for r in &reports {
+                    if let Some(e) = &r.error {
+                        log::warn!("启动清理失败: {e} (path: {})", r.path);
+                    }
+                }
+                if reports.iter().any(|r| r.managed > 0) {
+                    clear_switches(&data);
+                }
+                report(app, "startup-cleanup", &reports);
             }
         }
-        if reports.iter().any(|r| r.managed > 0) {
-            clear_switches(&data);
-        }
-        report(app, "startup-cleanup", &reports);
-    });
-    log::info!("启动补写联动状态: {migrated:?}");
+        Err(e) => log::warn!("拿不到用户主目录，启动不做联动补写与清理: {e}"),
+    }
     // 补写可能刚刚新建了状态文件，缓存要在第一次读事件之前对齐
     sync_current_agent(&data);
 }
 
+/// 启动阶段的两步，以及各自动了哪些文件。
+pub struct StartupOutcome {
+    /// 补写结果：升级上来的老用户第一次启动时，把「装过 hook」从配置文件挪进状态文件
+    pub migrated: Migrate,
+    /// `None` = 现状还说不出来、或联动开着：配置文件一个字都没动。
+    /// `Some(_)` = 真的清了一遍（候选文件都没有时是空表 —— 清过，只是没东西可清）。
+    pub cleaned: Option<Vec<FileReport>>,
+}
+
 /// 启动阶段的两步及其顺序。
 ///
-/// `strip` 由调用方给（宿主那边是真的摘条目 + 广播），所以这个函数**没有装的能力** ——
-/// 「启动只清不装」是签名层面的事实，不是注释里的约定。
+/// 顺序：先补写、后清理。反了就先擦掉证据，「停用摘掉、再启用装回来」对升级上来的用户
+/// 从此永不成立。放在这里而不是 `startup` 里，是因为它不碰 AppHandle，单测能把顺序与
+/// 「清了哪几家」都真的跑红。
+///
+/// 两个清单**不是同一份**，别合成一个：
+/// * 补写只认 Qoder 形状的条目（见 `migrate_from_legacy`），所以按 Qoder 的候选文件数证据；
+/// * 清残留按**每个已接线适配器各自的候选文件**（`uninstall_everywhere`）。残留可能留在任何
+///   一家（用户切换过 agent；状态文件缺失时 `adapter_for` 还退回 Qoder），只清 Qoder 会让
+///   其余三家的 `--pet-hook` 永远留在磁盘上 —— 这里从前是「Qoder 的文件 + 当前那家的
+///   适配器」，两头都不对，而单测只喂一个 Qoder 形状的文件正好把它盖住。
+///
+/// 这个函数**没有装的能力**（只调 uninstall），「启动只清不装」是行为层面的事实。
 /// `ids = None` 表示启停清单还不存在：说不出现状就不动手。
 pub fn startup_sequence(
     app_data_dir: &Path,
-    files: &[PathBuf],
+    home: &Path,
     ids: Option<&[String]>,
     linkage_on: bool,
-    strip: &mut dyn FnMut(&[PathBuf]),
-) -> Migrate {
-    let migrated = migrate_from_legacy(app_data_dir, files);
-    if ids.is_some() && !linkage_on {
-        strip(files);
-    }
-    migrated
+    switches: &Value,
+) -> StartupOutcome {
+    let migrated = migrate_from_legacy(app_data_dir, &claude_style::QODER.targets(home));
+    let cleaned =
+        (ids.is_some() && !linkage_on).then(|| agent_hooks::uninstall_everywhere(home, switches));
+    StartupOutcome { migrated, cleaned }
 }
 
 /// `desktop-pet.exe --pet-hook-cleanup` 的实体：卸载应用前把自家条目摘净。
@@ -1213,30 +1234,29 @@ mod tests {
     /// 它不需要 AppHandle，所以能把行为本身跑红（文本断言挡不住「把 files 传成空表」）。
     #[test]
     fn startup_records_the_choice_before_it_strips_the_evidence() {
+        let _env = adapters::lock_test_env();
         let dir = tmp_dir("startup-seq");
-        let cfg = dir.join("settings.json");
+        let home = dir.join("home");
+        let cfg = home.join(".qoder").join("settings.json");
+        fs::create_dir_all(cfg.parent().unwrap()).unwrap();
         fs::write(
             &cfg,
             json!({ "hooks": { "Stop": [ { "hooks": [ managed_entry("stop"), foreign_entry() ] } ] } })
                 .to_string(),
         )
         .unwrap();
-        let mut stripped = 0usize;
+        // 证据与残留都按 home 推：不换根就是去读开发机真 home，用例会在别人的文件上跑
+        std::env::set_var("PET_AGENT_HOME", &home);
+        std::env::remove_var("PET_AGENT_CONFIG_FILES");
         // 插件已停用（清单里不包括它）→ 该摘残余
-        let migrated = startup_sequence(
-            &dir,
-            std::slice::from_ref(&cfg),
-            Some(&[]),
-            false,
-            &mut |files| {
-                stripped += uninstall(&claude_style::QODER, files, &json!({}))
-                    .iter()
-                    .map(|r| r.managed)
-                    .sum::<usize>();
-            },
+        let outcome = startup_sequence(&dir, &home, Some(&[]), false, &json!({}));
+        assert_eq!(outcome.migrated, Migrate::Wrote(Some(QODER.to_string())));
+        let cleaned = outcome.cleaned.expect("联动关着就该清一遍");
+        assert_eq!(
+            cleaned.iter().map(|r| r.managed).sum::<usize>(),
+            1,
+            "联动关着就要把残余摘掉"
         );
-        assert_eq!(migrated, Migrate::Wrote(Some(QODER.to_string())));
-        assert_eq!(stripped, 1, "联动关着就要把残余摘掉");
         assert_eq!(
             agent_choice(&dir).as_deref(),
             Some(QODER),
@@ -1245,6 +1265,7 @@ mod tests {
         let after = fs::read_to_string(&cfg).unwrap();
         assert_eq!(after.matches("--pet-hook").count(), 0);
         assert!(after.contains("other-tool --notify"), "别人条目不受影响");
+        std::env::remove_var("PET_AGENT_HOME");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1284,9 +1305,10 @@ mod tests {
     }
 
     /// 启动「只清不装」的另一半：联动开着、或现状还说不出来时，配置文件一个字都不许动。
-    /// `startup_sequence` 拿到的闭包只能摘不能装，所以重装这条路在签名上就不存在。
+    /// `startup_sequence` 只调 uninstall，所以重装这条路在行为上就不存在。
     #[test]
     fn startup_leaves_the_configs_alone_when_linkage_is_on_or_unknown() {
+        let _env = adapters::lock_test_env();
         let cases: Vec<(Option<Vec<String>>, bool, &str)> = vec![
             (
                 Some(vec!["com.pet.agent-bridge".to_string()]),
@@ -1297,22 +1319,19 @@ mod tests {
         ];
         for (ids, on, why) in cases {
             let dir = tmp_dir("startup-keep");
-            let cfg = dir.join("settings.json");
+            let home = dir.join("home");
+            let cfg = home.join(".qoder").join("settings.json");
+            fs::create_dir_all(cfg.parent().unwrap()).unwrap();
             fs::write(
                 &cfg,
                 json!({ "hooks": { "Stop": [ { "hooks": [ managed_entry("stop") ] } ] } })
                     .to_string(),
             )
             .unwrap();
-            let mut called = false;
-            startup_sequence(
-                &dir,
-                std::slice::from_ref(&cfg),
-                ids.as_deref(),
-                on,
-                &mut |_| called = true,
-            );
-            assert!(!called, "{why}：还是去摘了条目");
+            std::env::set_var("PET_AGENT_HOME", &home);
+            std::env::remove_var("PET_AGENT_CONFIG_FILES");
+            let outcome = startup_sequence(&dir, &home, ids.as_deref(), on, &json!({}));
+            assert!(outcome.cleaned.is_none(), "{why}：还是去摘了条目");
             assert_eq!(
                 fs::read_to_string(&cfg)
                     .unwrap()
@@ -1321,8 +1340,81 @@ mod tests {
                 1,
                 "{why}：配置文件被动过了"
             );
+            std::env::remove_var("PET_AGENT_HOME");
             let _ = fs::remove_dir_all(&dir);
         }
+    }
+
+    /// 启动清理的判据是「每个已接线适配器各自的候选文件」，不是「只清 Qoder」，
+    /// 也不是「Qoder 的文件配当前选择那家的适配器」—— 后两种都会让切换过 agent
+    /// 的用户在 .zcode/.codex/.workbuddy 里留着指向桌面宠物的 `--pet-hook`，
+    /// 而单测只喂一个 Qoder 形状的文件正好把错配盖住。
+    #[test]
+    fn startup_cleanup_strips_residue_in_every_wired_adapter() {
+        let _env = adapters::lock_test_env();
+        let dir = tmp_dir("startup-all-families");
+        let home = dir.join("home");
+        // 四家都「装过」：夹具按各自 targets() 的目录约定摆好
+        fs::create_dir_all(home.join(".qoder")).unwrap();
+        fs::create_dir_all(home.join(".codex")).unwrap();
+        fs::create_dir_all(home.join(".workbuddy")).unwrap();
+        fs::create_dir_all(home.join(".zcode").join("cli")).unwrap();
+        fs::write(home.join(".qoder").join("settings.json"), "{}").unwrap();
+        fs::write(home.join(".codex").join("hooks.json"), "{}").unwrap();
+        fs::write(home.join(".workbuddy").join("settings.json"), "{}").unwrap();
+        fs::write(
+            home.join(".zcode").join("cli").join("config.json"),
+            json!({ "hooks": { "events": {} } }).to_string(),
+        )
+        .unwrap();
+        // 候选文件全从假 home 推：逐项覆盖变量会把它指到别处，一个都不留
+        std::env::set_var("PET_AGENT_HOME", &home);
+        std::env::remove_var("PET_AGENT_CONFIG_FILES");
+        std::env::remove_var("PET_AGENT_CODEX_FILES");
+        std::env::remove_var("PET_AGENT_WORKBUDDY_FILES");
+
+        let exe = Path::new(r"C:\app\desktop-pet.exe");
+        for adapter in adapters::wired() {
+            let files = adapter.targets(&home);
+            assert!(!files.is_empty(), "{} 的夹具没建对", adapter.id());
+            let reports = agent_hooks::install_files(*adapter, &files, exe, Some(dir.as_path()));
+            assert!(
+                agent_hooks::any_installed(&reports),
+                "{} 没装上，用例前提不成立",
+                adapter.id()
+            );
+        }
+
+        // 插件已停用、联动关着 → 启动清理该把四家的残留全摘掉
+        let outcome = startup_sequence(&dir, &home, Some(&[]), false, &json!({}));
+        assert_eq!(
+            outcome.migrated,
+            Migrate::Wrote(Some(QODER.to_string())),
+            "Qoder 有自家条目 → 照样补写用户的选择"
+        );
+        let cleaned = outcome.cleaned.expect("联动关着就该清一遍");
+        assert!(
+            cleaned.iter().map(|r| r.managed).sum::<usize>() >= adapters::wired().len(),
+            "四家各摘掉至少一条：{:?}",
+            cleaned
+                .iter()
+                .map(|r| (r.path.clone(), r.managed))
+                .collect::<Vec<_>>()
+        );
+        for adapter in adapters::wired() {
+            for file in adapter.targets(&home) {
+                let text = fs::read_to_string(&file).unwrap();
+                assert!(
+                    !text.contains(agent_hooks::HOOK_MARKER),
+                    "{} 的残留没摘掉: {}",
+                    adapter.id(),
+                    file.display()
+                );
+            }
+        }
+
+        std::env::remove_var("PET_AGENT_HOME");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// 挂点判据：联动只能挂在启停清单的唯一写入口上，且必须在清单落盘之后
