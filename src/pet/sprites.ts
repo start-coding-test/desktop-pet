@@ -96,6 +96,8 @@ export async function loadSpriteSet(url: string): Promise<LoadedSpriteSet> {
     height: img.naturalHeight,
   });
   if (parsed.kind === "invalid") {
+    // 这张图刚刚已经解码并进了 LRU；清单无效后不会再用它，留着会白占两个缓存位之一
+    atlasCache.delete(url);
     console.warn(`[pet] v3 清单无效，退回程序生成占位帧: ${parsed.reason}`);
     return { sprites: buildProceduralSpriteSet() };
   }
@@ -134,7 +136,8 @@ export async function readDesktopPetJson(
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const petUrl = new URL("pet.json", new URL(atlasUrl, document.baseURI)).href;
-    const res = await fetch(petUrl, { signal: controller.signal });
+    // 同一 slug 原地覆盖 pet.json 时不能命中 HTTP 缓存；图集本身的 LRU 仍是旧图，覆盖后需重启
+    const res = await fetch(petUrl, { signal: controller.signal, cache: "no-store" });
     if (!res.ok) return null;
     return await res.text();
   } catch {

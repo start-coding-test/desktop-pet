@@ -2149,7 +2149,14 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
           ? new Response(JSON.stringify(c.body), { status: 200 })
           : realFetch(url, init);
         const loaded = await s.loadSpriteSet(iconUrl);
-        out.push({ name: c.name, keys: Object.keys(loaded.sprites).sort(), timing: loaded.timing === undefined, warn: warns.join(' | '), expect: c.expect });
+        out.push({
+          name: c.name,
+          keys: Object.keys(loaded.sprites).sort(),
+          timing: loaded.timing === undefined,
+          warn: warns.join(' | '),
+          expect: c.expect,
+          cachedAfter: s.decodedAtlases().includes(iconUrl),
+        });
       }
       const none = [
         { name: '404', response: () => new Response('', { status: 404 }) },
@@ -2173,6 +2180,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     r.check(`无效 v3 清单（${item.name}）不带 timing`, true, item.timing);
     r.check(`无效 v3 清单（${item.name}）warn 带具体原因`, true,
       String(item.warn).includes("v3 清单无效") && String(item.warn).includes(item.expect));
+    r.check(`无效 v3 清单（${item.name}）的图集已从 atlasCache 删掉`, false, item.cachedAfter);
   }
   for (const item of fallback.cases.slice(3)) {
     r.check(`无清单（${item.name}）不走 v3 无效分支`, false, String(item.warn).includes("v3 清单无效"));
