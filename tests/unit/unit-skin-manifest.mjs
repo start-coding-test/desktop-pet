@@ -354,14 +354,17 @@ group("pet.json 读取");
   try {
     globalThis.document = { baseURI: "http://tauri.localhost/" };
     let seen = "";
-    globalThis.fetch = async (url) => {
+    let seenCache = "";
+    globalThis.fetch = async (url, init) => {
       seen = String(url);
+      seenCache = init?.cache ?? "";
       return { ok: true, text: async () => '{"desktopPet":{"version":3}}' };
     };
     const text = await sprites.readDesktopPetJson(
       "http://petskin.localhost/skin-a/sprite.webp",
     );
     eq("读取同目录的 pet.json", "http://petskin.localhost/skin-a/pet.json", seen);
+    eq("pet.json 请求带 no-store（同 slug 覆盖后不读旧 HTTP 缓存）", "no-store", seenCache);
     eq("返回原始 JSON 文本", '{"desktopPet":{"version":3}}', text);
 
     globalThis.fetch = async () => ({ ok: false, text: async () => "not found" });

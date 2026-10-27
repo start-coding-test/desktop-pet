@@ -223,6 +223,48 @@ try {
       (skinList.v ?? []).some((s) => s.slug === "deepseek"),
     );
     r.check("img-src 放行 petskin 协议", true, /img-src[^;]*petskin\.localhost/.test(header));
+    // v3 皮肤还要 fetch 同目录 pet.json；connect-src 一收紧，打包版会静默退回占位帧，dev 不注入 CSP 测不出来
+    r.check(
+      "connect-src 放行 petskin 协议（v3 要 fetch pet.json）",
+      true,
+      /connect-src[^;]*petskin\.localhost/.test(header),
+    );
+    const petProbeSkin = skin.v ?? (skinList.v ?? []).find((s) => s.slug === "deepseek");
+    const petJsonProbe = await c.ev(`(async () => {
+      const base = ${JSON.stringify(petProbeSkin?.url ?? "")};
+      if (!base) return { ok: false, reason: "no-skin" };
+      const url = new URL("pet.json", base).href;
+      try {
+        const res = await fetch(url, { cache: "no-store" });
+        const text = await res.text();
+        let parsed = null;
+        try { parsed = JSON.parse(text); } catch {}
+        return { ok: res.ok, status: res.status, url, parsed };
+      } catch (e) {
+        return { ok: false, url, reason: String(e) };
+      }
+    })()`);
+    r.check("打包版能真实读到 pet.json（connect-src 未收紧）", true, petJsonProbe?.ok === true);
+    r.check(
+      "pet.json 是合法 JSON",
+      true,
+      petJsonProbe?.parsed !== null && typeof petJsonProbe?.parsed === "object",
+    );
+    const petManifestVersion = petJsonProbe?.parsed?.desktopPet?.version ?? null;
+    r.info(
+      "pet.json 探测",
+      JSON.stringify({
+        url: petJsonProbe?.url ?? null,
+        status: petJsonProbe?.status ?? null,
+        reason: petJsonProbe?.reason ?? null,
+        desktopPetVersion: petManifestVersion,
+      }),
+    );
+    r.check(
+      "若 pet.json 带 desktopPet 清单则 version 为 3",
+      true,
+      petManifestVersion === null || petManifestVersion === 3,
+    );
     // 由页面自己发起的 <img> 加载才受 img-src 约束；被 CSP 拦下会走 onerror
     const decoded = await c.ev(`(async () => {
       const url = ${JSON.stringify(skin.v?.url ?? "")};
