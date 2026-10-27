@@ -55,8 +55,9 @@ export function mountPrefs(ctx, state) {
   // 「应用」的 click 快照不带 value（widget-renderer.ts:88-96），宿主也只转发已订阅的事件（:236-249）——
   // 不订阅 change，下面 :75 读到的永远是 render 写回的回显值，选的币种会被 stale 值覆盖回去。
   currencySel.on("change", () => {
-    // 无副作用：只需要这条订阅让宿主把选中的 value 写回虚拟节点；发送时机仍由「应用」决定（别在这里 send，
-    // 否则会绕过下面 rateInput 的校验）。
+    // 副作用只有一个：把这条 select 记进 editing，让下一次推送的回显别把用户刚选的币种冲掉
+    // （Bug4）。发送时机仍由「应用」决定（别在这里 send，否则会绕过下面 rateInput 的校验）。
+    editing.add(currencySel);
   });
   for (const [value, label] of [
     ["USD", "USD ($)"],
@@ -73,6 +74,9 @@ export function mountPrefs(ctx, state) {
   const currencyBtn = button(dom, "应用", "g-btn");
   currencyBtn.on("click", () => {
     editing.delete(rateInput);
+    // 币种是 select：应用一次就是把用户所选交给宿主，回显随后会追上 —— 这里一并放行，
+    // 别让 editing 变成「永不复位」（外部改的币种就再也进不来了）
+    editing.delete(currencySel);
     const rate = Number(rateInput.value);
     if (!Number.isFinite(rate) || rate < 1 || rate > 20) {
       state.status.set("汇率要在 1–20 之间", "error");
@@ -112,7 +116,10 @@ export function mountPrefs(ctx, state) {
   const displayCard = card(dom, "显示");
   const showOverlay = input(dom, "checkbox");
   showOverlay.dataset.field = "showOverlay";
-  showOverlay.on("change", () => send({ showOverlay: showOverlay.checked }));
+  showOverlay.on("change", () => {
+    editing.add(showOverlay);
+    send({ showOverlay: showOverlay.checked });
+  });
   const overlayLabel = tag(dom, "label");
   overlayLabel.append(showOverlay, text(dom, " 桌面悬浮卡"));
   const badgeSel = tag(dom, "select");
@@ -123,10 +130,18 @@ export function mountPrefs(ctx, state) {
     option.textContent = label;
     badgeSel.append(option);
   }
-  badgeSel.on("change", () => send({ badgeMode: badgeSel.value }));
+  badgeSel.on("change", () => {
+    // 徽标是「选了立即生效」：先记 editing 挡住回显，等推送里的 badgeMode 追上用户所选
+    // 时由 syncSelect 复位（见 render 下面那段）。
+    editing.add(badgeSel);
+    send({ badgeMode: badgeSel.value });
+  });
   const petBox = input(dom, "checkbox");
   petBox.dataset.field = "petReact";
-  petBox.on("change", () => send({ petReact: petBox.checked }));
+  petBox.on("change", () => {
+    editing.add(petBox);
+    send({ petReact: petBox.checked });
+  });
   const petLabel = tag(dom, "label");
   petLabel.append(petBox, text(dom, " 告警时宠物反应"));
   displayCard.append(
@@ -159,12 +174,38 @@ export function mountPrefs(ctx, state) {
   const demoCard = card(dom, "演示数据");
   const demoBox = input(dom, "checkbox");
   demoBox.dataset.field = "demo";
-  demoBox.on("change", () => send({ demo: demoBox.checked }));
+  demoBox.on("change", () => {
+    editing.add(demoBox);
+    send({ demo: demoBox.checked });
+  });
   const demoLabel = tag(dom, "label");
   demoLabel.append(demoBox, text(dom, " 使用固定种子的演示快照（不出网）"));
   demoCard.append(demoLabel, hint(dom, "演示模式也会走同一套告警/界面链路，供 e2e 使用。"));
 
   box.append(refreshCard, currencyCard, thresholdCard, displayCard, posCard, demoCard);
+
+  /**
+   * select 的回显：用户刚选过（在 editing 里）就先不动，等推送里的值追上用户所选时复位放行 ——
+   * 那时写回的就是用户自己选的那一项，冲不掉任何东西。
+   * 为什么不学文本框用 blur 复位：select 的 blur 不在宿主转发的 value 事件里，而「追上即放行」
+   * 既能挡住推送覆盖，又不会把 editing 写成永不复位（外部改的币种/徽标照样进得来）。
+   */
+  const syncSelect = (node, want) => {
+    if (editing.has(node)) {
+      if (String(node.value ?? "") === want) editing.delete(node);
+      else return;
+    }
+    node.value = want;
+  };
+
+  /** checkbox 同理：这条也是「选了立即发补丁」，回显追上即复位 */
+  const syncCheck = (node, want) => {
+    if (editing.has(node)) {
+      if (node.checked === want) editing.delete(node);
+      else return;
+    }
+    node.checked = want;
+  };
 
   function render(view) {
     const d = view ?? {};
@@ -177,11 +218,12 @@ export function mountPrefs(ctx, state) {
     if (!editing.has(monthlyInput)) monthlyInput.value = (thresholds.monthlyPct ?? [10]).join(",");
     if (!editing.has(xInput)) xInput.value = String(c.overlayX ?? 360);
     if (!editing.has(yInput)) yInput.value = String(c.overlayY ?? 220);
-    currencySel.value = c.currency === "CNY" ? "CNY" : "USD";
-    badgeSel.value = c.badgeMode ?? "five_hour";
-    showOverlay.checked = c.showOverlay !== false;
-    petBox.checked = c.petReact !== false;
-    demoBox.checked = c.demo === true;
+    // 下面五条以前是无条件写：推送一来就把用户刚选的币种/徽标/开关冲回旧值（Bug4）
+    syncSelect(currencySel, c.currency === "CNY" ? "CNY" : "USD");
+    syncSelect(badgeSel, String(c.badgeMode ?? "five_hour"));
+    syncCheck(showOverlay, c.showOverlay !== false);
+    syncCheck(petBox, c.petReact !== false);
+    syncCheck(demoBox, c.demo === true);
   }
 
   return { box, render };
