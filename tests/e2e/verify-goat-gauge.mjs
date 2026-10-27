@@ -554,6 +554,47 @@ try {
   r.check("设置页控件回显刷新间隔", "120", String(uiRefresh));
   r.check("设置页控件回显币种", "CNY", String(uiCurrency));
 
+  // ---------- Bug4：推送不能冲掉用户还没应用的 select 选择 ----------
+  // 走真实链路：CDP 在 closed shadow 上派发一次真 change（宿主的 listen 就挂在元素本身，
+  // src/runtime/widget-renderer.ts:248），再用一次 saveConfig 逼出 widget 的视图推送。
+  // 判据是「界面仍显示用户选的 USD，而配置里的 currency 仍是 CNY」——
+  // 少了 prefs.js 里那条 editing 守卫，这一帧的回显就会把 select 写回 CNY（当场红）。
+  const pickCurrency = (value) =>
+    shadowEval(
+      settings.client,
+      settingsHost,
+      `const sel = this.querySelector('select[data-field="currency"]');
+       if (!sel) return "缺 select";
+       sel.value = ${JSON.stringify(value)};
+       sel.dispatchEvent(new Event("change", { bubbles: true }));
+       return sel.value;`,
+    );
+  const readCurrencySel = () =>
+    shadowValue(settings.client, settingsHost, 'select[data-field="currency"]').catch(() => null);
+  r.check("把币种选成 USD 真的落到元素上", "USD", String(await pickCurrency("USD")));
+  await send({ action: "saveConfig", config: { overlayX: 301 } });
+  const pushed = await pollUntil(async () => {
+    const current = await storeGet("config");
+    return current?.overlayX === 301 && current?.currency === "CNY" ? current : null;
+  }, 8_000);
+  r.check("推送确实进到了插件（改了坐标而 currency 仍是 CNY）", true, !!pushed);
+  await sleep(800);
+  r.check("推送不回显用户还没应用的选择", "USD", String(await readCurrencySel()));
+  // 反向判据：配置追上所选后锁要放开，之后的外部改动照样进得来（别写成永不复位）
+  await send({ action: "saveConfig", config: { currency: "USD" } });
+  r.check(
+    "币种落进配置",
+    true,
+    !!(await pollUntil(async () => ((await storeGet("config"))?.currency === "USD" ? true : null), 8_000)),
+  );
+  await sleep(800);
+  await send({ action: "saveConfig", config: { currency: "CNY" } });
+  const backCny = await pollUntil(async () => {
+    const value = await readCurrencySel();
+    return value === "CNY" ? value : null;
+  }, 8_000);
+  r.check("配置改回 CNY 后界面跟着回显（编辑锁已复位）", "CNY", String(backCny));
+
   await settings.close();
   settings = null;
   settings = await openSettingsInvoker(PORT, c);
