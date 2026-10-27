@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
+import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { argv, env } from "node:process";
 import {
@@ -32,6 +33,7 @@ import {
   SPOOF_DIR,
   removeFixtures,
   removePreseedFixtures,
+  unisolatedAgentAdapters,
   writeFixtures,
 } from "./harness/fixtures.mjs";
 
@@ -2726,6 +2728,13 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     const statusFiles = Array.isArray(allowed.v?.files) ? allowed.v.files : [];
     const underTemp = statusFiles.length > 0 && statusFiles.every((f) => resolve(String(f.path)).startsWith(TEMP_ROOT + sep));
     r.info("hook 配置落点", statusFiles.map((f) => f.path).join(" ； ") || "(空)");
+    // 上面那道门只锁得住 Qoder：statusFiles 是宿主按当前 agent 回显的候选文件，
+    // 而不带 pluginId 的卸载走 uninstall_everywhere —— 扫 adapters::wired() 四家。
+    // 没有 PET_AGENT_HOME 换根时，ZCode/Codex/WorkBuddy 的候选文件顺着真实 home 解析，
+    // 写盘断言就会改写用户自己的配置（Bug1）。凡碰这条 sweep 的组，额外过这道隔离门。
+    const isolationGap = unisolatedAgentAdapters(env, homedir());
+    r.check("直调卸载前四家都已被隔离变量指到 temp", [], isolationGap);
+    const sweepSafe = underTemp && isolationGap.length === 0;
 
     let sampleForeign = "";
     // 「他人条目未变」的比较口径：宿主用 serde_json 整文件重写（BTreeMap 按键排序），
@@ -2784,7 +2793,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
 
     // 设置窗直调卸载（不带 pluginId，宿主路径）：翻候选文件摘自家条目，他人条目必须原样；
     // 铁律是随后经探针装回 —— 不装回会把后面「连带卸载」两条分支的起点掏空成假绿
-    if (underTemp) {
+    if (sweepSafe) {
       const foreignBeforeDirect = statusFiles.map((f) => foreignOf(readFileSync(f.path, "utf8")));
       const directUninstall = await sCall("agent_hooks_uninstall");
       const afterDirect = (await sCall("agent_hooks_status")).v;
@@ -2808,7 +2817,9 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     } else {
       r.info(
         "跳过「直调卸载再装回」断言",
-        "hook 配置未指向 temp/：直调卸载会改写真实用户配置，与本组 install 断言同一开关（PET_AGENT_CONFIG_FILES）",
+        underTemp
+          ? `不带 pluginId 的卸载会扫四家，而这几种 agent 仍指向真实 home：${isolationGap.join(", ")}（缺 PET_AGENT_HOME 换根）`
+          : "hook 配置未指向 temp/：直调卸载会改写真实用户配置，与本组 install 断言同一开关（PET_AGENT_CONFIG_FILES）",
       );
     }
 
@@ -2852,10 +2863,16 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
       (await sc.ev(`(async () => (await import('/src/runtime/bridge.ts')).grantedCapabilities(${JSON.stringify(hookId)}).includes('agent:hooks'))()`)) === true,
     );
     if (hasRevokeBtn) await clickReady(".btn-revoke");
-    const stripUp = hasRevokeBtn === true && (await waitUntil(sc, `document.getElementById('revoke-uninstall')?.checked === true`, 5_000).catch(() => false));
-    r.check("确认条默认勾选「同时卸载 hook」", true, stripUp);
+    // Bug3 之后这一行只对声明 agent:hooks 的插件出现，而且默认不勾。
+    // 判据拆成两半：「勾选框不存在」与「存在但没勾」是两种不同的红，别混成一条。
+    const hasUninstallBox =
+      hasRevokeBtn === true && (await waitUntil(sc, `!!document.getElementById('revoke-uninstall')`, 5_000).catch(() => false));
+    r.check("声明 agent:hooks 的插件：确认条里有「同时卸载 hook」勾选框", true, hasUninstallBox);
+    const stripUp =
+      hasUninstallBox === true &&
+      (await waitUntil(sc, `document.getElementById('revoke-uninstall')?.checked === false`, 3_000).catch(() => false));
+    r.check("该勾选框默认不勾（Bug3：撤销授权不等于卸载 hook）", true, stripUp);
     if (stripUp) {
-      await sc.ev(`(() => { document.getElementById('revoke-uninstall').checked = false; return true; })()`);
       await clickReady("#revoke-go");
     }
     r.check(
@@ -2879,15 +2896,40 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
       await waitUntil(sc, `(async () => !(await import('/src/runtime/bridge.ts')).grantedCapabilities(${JSON.stringify(hookId)}).includes('agent:hooks'))()`, 5_000),
     );
 
-    // 分支二「连带卸载」：写盘，仅 temp 模式
-    if (underTemp) {
+    // Bug3 的反面对照：zz.hookundeclared 声明了 storage（所以有「撤销授权」入口），
+    // 但没声明 agent:hooks —— 它的确认条里不该出现「同时卸载 Agent hook」这一行。
+    // 这条判据钉的是「误伤不再可能」：astock/todo/hr-ble 走的正是同一条渲染分支。
+    const undeclaredOpened = await clickReady(`.nav-item[data-view=${JSON.stringify(PRESEED_HOOK_UNDECLARED_ID)}]`);
+    const undeclaredBtn =
+      undeclaredOpened && (await waitUntil(sc, `!!document.querySelector('.btn-revoke')`, 8_000).catch(() => false));
+    r.check("未声明 agent:hooks 的插件也有「撤销授权」入口", true, undeclaredBtn);
+    if (undeclaredBtn) await clickReady(".btn-revoke");
+    const undeclaredStripUp =
+      undeclaredBtn === true &&
+      (await waitUntil(sc, `!!document.getElementById('revoke-confirm') && !document.getElementById('revoke-uninstall')`, 5_000).catch(() => false));
+    r.check("它的确认条里没有「同时卸载 hook」勾选框（Bug3）", true, undeclaredStripUp);
+    // 只取消，不真的撤这个对照插件的授权 —— 撤了会改变后面组的起点
+    await clickReady("#revoke-cancel");
+    r.check("取消后确认条收起", 0, await sc.ev(`document.querySelectorAll('#revoke-confirm').length`));
+
+    // 分支二「连带卸载」：写盘，且宿主侧不带 pluginId 的那条路会扫四家 —— 要过 sweepSafe
+    if (sweepSafe) {
       await clickReady(`.nav-item[data-view=pet]`);
       await clickReady(`.nav-item[data-view=${JSON.stringify(hookId)}]`);
       const hasBtn2 = await waitUntil(sc, `!!document.querySelector('.btn-revoke')`, 8_000).catch(() => false);
       r.check("重新进入插件页后撤销按钮再次可用", true, hasBtn2);
       if (hasBtn2) await clickReady(".btn-revoke");
-      const stripUp2 = hasBtn2 === true && (await waitUntil(sc, `document.getElementById('revoke-uninstall')?.checked === true`, 5_000).catch(() => false));
-      r.check("第二次确认条默认勾选（不取消，走连带卸载）", true, stripUp2);
+      // Bug3 之后默认不勾，连带卸载这一步要自己勾上 —— 顺手把「勾上确实换了行为」
+      // 也跑到了：不勾（分支一）不动配置文件，勾上（这里）才摘条目。
+      const boxUp2 =
+        hasBtn2 === true && (await waitUntil(sc, `!!document.getElementById('revoke-uninstall')`, 5_000).catch(() => false));
+      const ticked =
+        boxUp2 === true &&
+        (await sc.ev(
+          `(() => { const b = document.getElementById('revoke-uninstall'); b.checked = true; return b.checked === true; })()`,
+        )) === true;
+      r.check("第二次确认条默认不勾、勾上才走连带卸载（Bug3 反转原「默认勾选」判据）", true, hasBtn2 === true && boxUp2 && ticked);
+      const stripUp2 = boxUp2 && ticked;
       if (stripUp2) await clickReady("#revoke-go");
       r.check(
         "「连带卸载」的回显",
@@ -2901,6 +2943,13 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
         r.check("卸载后 --pet-hook 条目归零", 0, text.split("--pet-hook").length - 1);
         r.check("卸载后他人 hook 条目逐字段未变（键序由宿主归一）", sampleForeign, foreignOf(text));
       }
+    } else {
+      r.info(
+        "跳过「连带卸载」分支",
+        underTemp
+          ? `这条路径点确认后同样调 agent_hooks_uninstall 扫四家，未隔离：${isolationGap.join(", ")}`
+          : "hook 配置未指向 temp/",
+      );
     }
 
     await sc.ev(`(async () => { await window.__hookHost.unmount(${JSON.stringify(hookId)}); document.getElementById('hook-probe-slot')?.remove(); return true; })()`);

@@ -9,6 +9,14 @@ import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { check, group } from "./harness.mjs";
+import {
+  AGENT_ISOLATION_ADAPTERS,
+  AGENT_ISOLATION_ENV_NAMES,
+  agentIsolationEnv,
+  realHomeAgentFiles,
+  snapshotAgentFiles,
+  unisolatedAgentAdapters,
+} from "../e2e/harness/fixtures.mjs";
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const read = (rel) => readFileSync(join(REPO, rel), "utf8");
@@ -136,3 +144,119 @@ check(
   !arrayShape.object && !arrayShape.mapped && globShape.object && globShape.mapped && !globShape.noWildcard,
   JSON.stringify({ arrayShape, globShape }),
 );
+
+// ==== Bug1：agent 隔离 env 的收口 ====
+// 「只设 PET_AGENT_CONFIG_FILES」曾经只隔离 Qoder 一家：卸载前那条 --pet-hook-cleanup
+// 走 uninstall_everywhere，扫的是 adapters::wired() 四家，ZCode 只认 PET_AGENT_HOME、
+// Codex 与 WorkBuddy 缺省也退到它。这里把这条口径钉成可跑的判据，而不是等真机出事。
+group("Agent 隔离 env 收口（Bug1）");
+// 反斜杠必须成对写：源里单写 `\U` 会被 JS 当无效转义吃掉，REAL 就退化成 "C:Usersme"，
+// 下面所有 startsWith / 等值判定会全绿但测的是个假路径 —— 所以专门钉一条防住这个坑。
+const REAL = "C:\\Users\\me";
+check("夹具 home 是带反斜杠的 Windows 路径（转义没被吃掉）", REAL.includes("\\Users\\me"), REAL);
+check(
+  "一个隔离变量都没设：四家全裸奔",
+  JSON.stringify(unisolatedAgentAdapters({}, REAL)) ===
+    JSON.stringify(["qoder", "zcode", "codex", "workbuddy"]),
+  JSON.stringify(unisolatedAgentAdapters({}, REAL)),
+);
+check(
+  "只设 PET_AGENT_CONFIG_FILES：ZCode/Codex/WorkBuddy 仍退到真实 home（就是这次的 bug）",
+  JSON.stringify(unisolatedAgentAdapters({ PET_AGENT_CONFIG_FILES: "T:/a.json;T:/b.json" }, REAL)) ===
+    JSON.stringify(["zcode", "codex", "workbuddy"]),
+  JSON.stringify(unisolatedAgentAdapters({ PET_AGENT_CONFIG_FILES: "T:/a.json" }, REAL)),
+);
+check(
+  "三个逐文件变量齐设但没换根：只剩 ZCode（它没有逐文件变量）",
+  JSON.stringify(
+    unisolatedAgentAdapters(
+      {
+        PET_AGENT_CONFIG_FILES: "T:/a.json",
+        PET_AGENT_CODEX_FILES: "T:/c.json",
+        PET_AGENT_WORKBUDDY_FILES: "T:/w.json",
+      },
+      REAL,
+    ),
+  ) === JSON.stringify(["zcode"]),
+);
+check(
+  "换根到 temp：四家都隔离",
+  unisolatedAgentAdapters({ PET_AGENT_HOME: "T:/pet-e2e/agent-home" }, REAL).length === 0,
+);
+check(
+  "PET_AGENT_HOME 指到真实 home 本身 = 与没设同判（isHomeRoot 口径）",
+  JSON.stringify(unisolatedAgentAdapters({ PET_AGENT_HOME: REAL }, REAL)) ===
+    JSON.stringify(["qoder", "zcode", "codex", "workbuddy"]),
+  JSON.stringify(unisolatedAgentAdapters({ PET_AGENT_HOME: REAL }, REAL)),
+);
+check("PET_AGENT_HOME 是真实 home 的子目录：按换根成功判（不是 agent 目录就没危险）", unisolatedAgentAdapters({ PET_AGENT_HOME: join(REAL, "temp-x") }, REAL).length === 0);
+check("空串与全空白都算没设", unisolatedAgentAdapters({ PET_AGENT_HOME: "   " }, REAL).length === 4);
+check(
+  "agentIsolationEnv 只挑已设置的键，不覆盖成空串",
+  JSON.stringify(agentIsolationEnv({ PET_AGENT_CONFIG_FILES: "T:/a.json", PET_AGENT_HOME: "  ", PET_AGENT_INBOX: "T:/inbox" })) ===
+    JSON.stringify({ PET_AGENT_CONFIG_FILES: "T:/a.json", PET_AGENT_INBOX: "T:/inbox" }),
+  JSON.stringify(agentIsolationEnv({ PET_AGENT_CONFIG_FILES: "T:/a.json", PET_AGENT_HOME: "  ", PET_AGENT_INBOX: "T:/inbox" })),
+);
+check(
+  "隔离变量全集覆盖逐文件三件套 + 换根 + 收件目录",
+  AGENT_ISOLATION_ENV_NAMES.join(",") ===
+    "PET_AGENT_CONFIG_FILES,PET_AGENT_HOME,PET_AGENT_CODEX_FILES,PET_AGENT_WORKBUDDY_FILES,PET_AGENT_INBOX",
+  AGENT_ISOLATION_ENV_NAMES.join(","),
+);
+check(
+  "真实 home 候选文件：Qoder 两份 + ZCode 两份 + Codex/WorkBuddy 各一份",
+  realHomeAgentFiles(REAL).length === 6 &&
+    realHomeAgentFiles(REAL).every((p) => p.startsWith(REAL)) &&
+    realHomeAgentFiles(REAL).includes(join(REAL, ".zcode", "cli", "config.json")) &&
+    realHomeAgentFiles(REAL).includes(join(REAL, ".codex", "hooks.json")) &&
+    realHomeAgentFiles(REAL).includes(join(REAL, ".workbuddy", "settings.json")),
+  JSON.stringify(realHomeAgentFiles(REAL)),
+);
+check("snapshotAgentFiles 把缺文件与有文件区分开", JSON.stringify(snapshotAgentFiles([join(REAL, "no-such-dir", "x.json")])[0]).includes("missing"));
+
+// 跨语言一致性：JS 侧这张表是给 e2e 判「哪家会退到真实 home」用的，Rust 加了适配器而这里没跟上，
+// 隔离判据会静默变松 —— 所以按 mod.rs 的 WIRED 数组体反查数量与 id。
+const adaptersDir = "src-tauri/src/services/agent/adapters";
+const modSrc = read(`${adaptersDir}/mod.rs`);
+const wiredBody = modSrc.match(/static WIRED[^=]*=\s*&\[([\s\S]*?)\];/)?.[1] ?? "";
+const wiredEntries = [...wiredBody.matchAll(/&([a-z_]+)::([A-Z_]+)/g)].map((m) => ({ mod: m[1], name: m[2] }));
+check(
+  "JS 隔离表的数量与 Rust WIRED 一致",
+  wiredEntries.length > 0 && wiredEntries.length === AGENT_ISOLATION_ADAPTERS.length,
+  `rust=${wiredEntries.length} js=${AGENT_ISOLATION_ADAPTERS.length}`,
+);
+const rustIds = wiredEntries
+  .map(({ mod: m }) => {
+    const src = (() => {
+      try {
+        return read(`${adaptersDir}/${m}.rs`);
+      } catch {
+        return "";
+      }
+    })();
+    return (
+      src.match(/fn id\(&self\)\s*->\s*&'static str\s*\{\s*"([a-z-]+)"/)?.[1] ??
+      src.match(/\bid:\s*"([a-z-]+)"/)?.[1] ??
+      "?"
+    );
+  })
+  .sort()
+  .join(",");
+check(
+  "JS 隔离表的 id 与 Rust 适配器 id 逐一对应",
+  rustIds === AGENT_ISOLATION_ADAPTERS.map((a) => a.id).sort().join(","),
+  `rust=${rustIds} js=${AGENT_ISOLATION_ADAPTERS.map((a) => a.id).sort().join(",")}`,
+);
+
+// 手动脚本那条路：guard 必须扩到 PET_AGENT_HOME（卸载器子进程继承会话环境）
+check("手动脚本 guard 了 PET_AGENT_HOME", ps1.includes("guard: PET_AGENT_HOME"));
+check("手动脚本缺省时自己代填一个一次性 home 根", ps1.includes("$env:PET_AGENT_HOME = "));
+check("手动脚本拒绝 PET_AGENT_HOME 等于真实 profile", ps1.includes("REFUSED: PET_AGENT_HOME is the real user home"));
+check("手动脚本拒绝 home 根落在真实 agent 目录里", ps1.includes("is or sits inside a real agent directory"));
+check("手动脚本的文档说明了四家各自认哪个变量", ps1.includes("ZCode reads PET_AGENT_HOME and nothing else"));
+
+// 套件那条路：cleanup 子进程的 env 必须来自同一份收口，而不是各拼一份
+const bridge = read("tests/e2e/verify-agent-bridge.mjs");
+check("cleanup 子进程的 env 走统一的 agentIsolationEnv", bridge.includes("{ ...env, ...agentIsolationEnv(env) }"));
+check("起子进程前先判隔离缺口，名单非空就不 spawn", bridge.includes("unisolatedAgentAdapters(env, REAL_HOME)") && bridge.includes("if (isolationGap.length > 0)"));
+check("cleanup 跑完显式判真实 home 的条数未变", bridge.includes("realHomeAgentFiles(REAL_HOME)") && bridge.includes("--pet-hook 条数未被 cleanup 改动"));

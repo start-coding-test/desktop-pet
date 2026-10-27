@@ -1,5 +1,5 @@
 import { hostCall, hostErrorMessage } from "../runtime/host-error";
-import { RISK_FLAGS } from "../runtime/plugin-capabilities";
+import { AGENT_HOOKS, RISK_FLAGS } from "../runtime/plugin-capabilities";
 import { validateManifest } from "../runtime/plugin-runtime";
 import { widgetHost } from "../runtime/widget-host";
 import { $, el } from "./dom";
@@ -51,17 +51,25 @@ export async function renderPluginPage(): Promise<void> {
       const revoke = el("button", "撤销授权", "btn-revoke");
       revoke.type = "button";
       revoke.addEventListener("click", () => {
-        // 撤销前的宿主确认条（CONTEXT.md「生命周期」）：默认连带卸载 hook，可以只撤能力。
-        // 卸载复用 agent_hooks_uninstall 的宿主路径（不带 pluginId）——撤销入口在宿主壳里，
-        // 不能指望插件还活着来收自己的 hook。
+        // 撤销前的宿主确认条（CONTEXT.md「生命周期」）：默认只撤能力。
+        // 「同时卸载 Agent hook」这一行**只对声明了 agent:hooks 的插件出现**：勾选走的是
+        // 宿主侧 agent_hooks_uninstall（不带 pluginId → 扫 adapters::wired() 四家），
+        // 与 astock / todo / hr-ble 这些没声明该能力的插件毫无关系，默认连带卸载就是误伤（Bug3）。
+        // 卸载复用宿主路径而不带 pluginId：撤销入口在宿主壳里，不能指望插件还活着来收自己的 hook。
+        const canUninstallHooks = (manifest.permissions ?? []).includes(AGENT_HOOKS);
         const strip = el("div", undefined, "revoke-confirm");
         strip.id = "revoke-confirm";
-        const line = el("label", undefined, "row-line");
-        const alsoUninstall = document.createElement("input");
-        alsoUninstall.type = "checkbox";
-        alsoUninstall.id = "revoke-uninstall";
-        alsoUninstall.checked = true;
-        line.append(alsoUninstall, document.createTextNode("同时卸载 Agent hook"));
+        let alsoUninstall: HTMLInputElement | null = null;
+        if (canUninstallHooks) {
+          const line = el("label", undefined, "row-line");
+          alsoUninstall = document.createElement("input");
+          alsoUninstall.type = "checkbox";
+          alsoUninstall.id = "revoke-uninstall";
+          // 默认不勾：撤能力与卸 hook 是两件事，要连带得由用户明确勾上
+          alsoUninstall.checked = false;
+          line.append(alsoUninstall, document.createTextNode("同时卸载 Agent hook"));
+          strip.append(line);
+        }
         const go = el("button", "确认撤销");
         go.type = "button";
         go.id = "revoke-go";
@@ -71,7 +79,7 @@ export async function renderPluginPage(): Promise<void> {
         cancel.addEventListener("click", () => strip.remove());
         go.addEventListener("click", async () => {
           go.disabled = true;
-          if (alsoUninstall.checked) {
+          if (alsoUninstall?.checked) {
             try {
               await hostCall("agent_hooks_uninstall");
             } catch (err) {
@@ -81,7 +89,7 @@ export async function renderPluginPage(): Promise<void> {
           }
           try {
             await hostCall("permission_revoke", { pluginId: manifest.id });
-            revoke.textContent = alsoUninstall.checked ? "已撤销（含卸载 hook）" : "已撤销（仅能力）";
+            revoke.textContent = alsoUninstall?.checked ? "已撤销（含卸载 hook）" : "已撤销（仅能力）";
             revoke.disabled = true;
           } catch (err) {
             // 撤销现在是宿主端会失败的命令（门禁、非法 id），不能装成成功
@@ -90,7 +98,7 @@ export async function renderPluginPage(): Promise<void> {
           }
           strip.remove();
         });
-        strip.append(line, go, cancel);
+        strip.append(go, cancel);
         revoke.after(strip);
       });
       perms.append(revoke);

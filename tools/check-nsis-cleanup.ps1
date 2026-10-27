@@ -25,7 +25,11 @@
 
   WHAT IT NEVER DOES: it never writes to a real agent configuration directory. It
   refuses to run unless PET_AGENT_CONFIG_FILES is set and none of the listed paths
-  sit under .qoder / .qoder-cn / .zcode / .codex / .workbuddy / .codebuddy.
+  sit under .qoder / .qoder-cn / .zcode / .codex / .workbuddy / .codebuddy. The other
+  three adapters are isolated through PET_AGENT_HOME, because the uninstall sweep walks
+  EVERY wired adapter: the script defaults that variable to a throwaway TEMP folder when
+  the caller did not set it, and refuses outright if it names the real user profile or
+  sits inside a real agent directory.
 
 .PARAMETER InstallRoot
   Base folder for the silent install of Case A. Defaults to a pid-scoped folder
@@ -159,6 +163,45 @@ foreach ($f in $cfgFiles) {
   if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
 }
 Pass ("target configs: " + ($cfgFiles -join ", "))
+
+# --- 0b. Guard rails: the home root the other three adapters fall back to ------
+# PET_AGENT_CONFIG_FILES alone does NOT isolate the uninstall sweep. The cleanup branch
+# runs uninstall_everywhere over EVERY wired adapter: Qoder honours PET_AGENT_CONFIG_FILES,
+# ZCode reads PET_AGENT_HOME and nothing else, Codex and WorkBuddy prefer their own
+# *_FILES lists but fall back to PET_AGENT_HOME -- and only then to the real home
+# (src-tauri\src\services\agent\adapters\claude_style.rs:170-191, zcode.rs:140-153).
+# With the variable unset, the uninstaller's child strips --pet-hook entries out of the
+# .zcode / .codex / .workbuddy configurations belonging to whoever runs this script.
+Step "guard: PET_AGENT_HOME"
+$agentHome = $env:PET_AGENT_HOME
+if ([string]::IsNullOrWhiteSpace($agentHome)) {
+  # Default to a throwaway root and deliberately do NOT create it: an absent .zcode /
+  # .codex / .workbuddy under that root means zero candidate files, so zero writes.
+  $agentHome = Join-Path $env:TEMP ("pet-nsis-home-" + $PID)
+  $env:PET_AGENT_HOME = $agentHome
+  Note ("PET_AGENT_HOME was not set; defaulted to a throwaway root: " + $agentHome)
+}
+$homeFull = [System.IO.Path]::GetFullPath($agentHome).TrimEnd('\', '/').ToLowerInvariant()
+$profileHome = ""
+if ($env:USERPROFILE) {
+  $profileHome = [System.IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd('\', '/').ToLowerInvariant()
+}
+# A home root equal to the real profile is the same exposure as leaving it unset --
+# every agent directory is created underneath it (same rule as isHomeRoot in verify-release.mjs).
+if ($profileHome -ne "" -and $homeFull -eq $profileHome) {
+  Write-Host "REFUSED: PET_AGENT_HOME is the real user home." -ForegroundColor Red
+  Write-Host "Every agent directory (.zcode / .codex / .workbuddy) resolves under it,"
+  Write-Host "which is exactly what an unset variable would have done. Point it at a"
+  Write-Host "throwaway folder under TEMP and re-run."
+  exit 2
+}
+foreach ($b in $blocked) {
+  if (($homeFull + '\').Contains($b)) {
+    Write-Host ("REFUSED: PET_AGENT_HOME " + $agentHome + " is or sits inside a real agent directory (" + $b + ").") -ForegroundColor Red
+    exit 2
+  }
+}
+Pass ("isolated agent home root: " + $homeFull)
 
 $conf = Get-Content -Raw (Join-Path $Repo "src-tauri\tauri.conf.json") | ConvertFrom-Json
 $identifier = $conf.identifier

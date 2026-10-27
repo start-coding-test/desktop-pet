@@ -1,6 +1,6 @@
 // 验证用临时插件 fixture：由脚本写入 plugins/、跑完删除（.gitignore 已忽略这两个名字，
 // 中途崩溃也不会被误提交）。前缀 zz. 便于人工识别残留。
-import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 
 export const PROBE_ID = "zz.probe";
@@ -338,4 +338,90 @@ export function cleanAgentTempState({ tempRoot, configFiles, agentHome }) {
   const leftovers = findPrePetBackups(root);
   if (leftovers.length) throw new Error(`agent 临时备份未清干净: ${leftovers.join(", ")}`);
   return { files: live, removedBackups, removedDirs };
+}
+
+// ==== Agent 隔离 env 的统一口径（Bug1）====
+// 四家适配器的候选文件全从 env 解析，而变量不止一个：Qoder 认 `PET_AGENT_CONFIG_FILES`、
+// Codex 认 `PET_AGENT_CODEX_FILES`、WorkBuddy 认 `PET_AGENT_WORKBUDDY_FILES`，ZCode 只认
+// `PET_AGENT_HOME`（zcode.rs:140-153，它没有逐文件变量）。逐文件变量缺省时也退到
+// `PET_AGENT_HOME` 整体换根，两者都没有才用真实 home（claude_style.rs:170-191）。
+// 所以「只设 PET_AGENT_CONFIG_FILES」只隔离了一家：凡是起一个会改配置的子进程
+//（`--pet-hook-cleanup` → `uninstall_everywhere` 扫 `adapters::wired()` 四家），
+// 都会顺着真实 home 去探测并摘掉另外三家用户自己的条目。
+// 各套件不要再各拼一份 env —— 拼漏一个就是事故。
+
+/** 与 `adapters::WIRED` 一一对应。`filesEnv` 为 null = 这家没有逐文件变量，只能靠换根隔离。
+ * `realHomeFiles` 是它在**真实 home** 下的候选文件（相对 home，正斜杠）——
+ * 抄自 `claude_style.rs:271-274`（Qoder 两个目录 / settings.json）、`zcode.rs:42-44`
+ * 与 `:140-153`、`codex.rs:41-47`、`workbuddy.rs:38-43`。适配器改了落点就要跟着改这里，
+ * 判据靠它钉住「没隔离的子进程到底会改写哪些用户文件」。 */
+export const AGENT_ISOLATION_ADAPTERS = [
+  {
+    id: "qoder",
+    filesEnv: "PET_AGENT_CONFIG_FILES",
+    realHomeFiles: [".qoder/settings.json", ".qoder-cn/settings.json"],
+  },
+  { id: "zcode", filesEnv: null, realHomeFiles: [".zcode/cli/config.json", ".zcode/cli/setting.json"] },
+  { id: "codex", filesEnv: "PET_AGENT_CODEX_FILES", realHomeFiles: [".codex/hooks.json"] },
+  { id: "workbuddy", filesEnv: "PET_AGENT_WORKBUDDY_FILES", realHomeFiles: [".workbuddy/settings.json"] },
+];
+
+/** 会随子进程一起带过去的隔离变量全集。收件目录也算：不设的话本机全局 hook 的真实会话
+ * 会混进套件读的那份 inbox（口径同 verify-agent-bridge.mjs 顶部的 INBOX 注释）。 */
+export const AGENT_ISOLATION_ENV_NAMES = [
+  "PET_AGENT_CONFIG_FILES",
+  "PET_AGENT_HOME",
+  "PET_AGENT_CODEX_FILES",
+  "PET_AGENT_WORKBUDDY_FILES",
+  "PET_AGENT_INBOX",
+];
+
+const isBlankEnv = (value) => typeof value !== "string" || value.trim() === "";
+
+/**
+ * 从给定 env 里挑出没空白的隔离变量，返回可直接展开进 spawn `env:` 的补丁对象。
+ * 只返回已设置的键，不会把外部值覆盖成空串（Rust 侧 `!v.trim().is_empty()` 同口径）。
+ */
+export function agentIsolationEnv(source = {}) {
+  const out = {};
+  for (const name of AGENT_ISOLATION_ENV_NAMES) {
+    if (!isBlankEnv(source[name])) out[name] = source[name];
+  }
+  return out;
+}
+
+/**
+ * 给定 env 下**仍会退到真实 home** 的适配器 id 列表；返回空数组才允许起一个会改
+ * agent 配置的子进程。`PET_AGENT_HOME` 指到真实 home 本身与没设是同一件事（四家的
+ * 目录都建在它下面），所以那种值按未隔离判 —— 与 verify-release.mjs 的 `isHomeRoot` 同口径。
+ */
+export function unisolatedAgentAdapters(source = {}, realHome = "") {
+  const root = source.PET_AGENT_HOME;
+  const rootIsolated =
+    !isBlankEnv(root) && (isBlankEnv(realHome) ? true : resolve(root) !== resolve(realHome));
+  return AGENT_ISOLATION_ADAPTERS.filter((a) => !(rootIsolated || !isBlankEnv(source[a.filesEnv]))).map(
+    (a) => a.id,
+  );
+}
+
+/** 真实 home 下四家的候选文件（绝对路径）。文件在不在由调用方判，这里只拼路径 ——
+ * 一个都没有也是合法结果（那台机器没装这些客户端）。 */
+export function realHomeAgentFiles(realHome) {
+  return AGENT_ISOLATION_ADAPTERS.flatMap((a) => a.realHomeFiles.map((rel) => join(realHome, ...rel.split("/"))));
+}
+
+/**
+ * 把一组文件拍成可逐项比较的快照串：`路径|mtime|size`，读不到记 `路径|missing`。
+ * 判「子进程只在隔离目录里干活、真实 home 的配置一个字没动」用这条。
+ * 单看 mtime 不够：文件被删时 mtime 根本读不到，必须与「有文件」区分开，所以三种情况都进串。
+ */
+export function snapshotAgentFiles(files) {
+  return files.map((file) => {
+    try {
+      const st = statSync(file);
+      return `${file}|${st.mtimeMs}|${st.size}`;
+    } catch {
+      return `${file}|missing`;
+    }
+  });
 }

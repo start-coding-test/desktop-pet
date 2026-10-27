@@ -5,6 +5,7 @@
 //   2) 采集→归一化→宠物 —— 往收件目录追加事件，断言宠物动作、台词、总线 topic 与去重。
 // 不依赖 petdex，也不需要 Qoder 真跑起来：事件是按其 hook 形状直接造的。
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { argv, env } from "node:process";
@@ -22,6 +23,7 @@ import {
   waitUntil,
   writeEnabledIds,
 } from "./harness/cdp.mjs";
+import { agentIsolationEnv, realHomeAgentFiles, unisolatedAgentAdapters } from "./harness/fixtures.mjs";
 import { waitWidgetRealm } from "./harness/widget-realm.mjs";
 
 const PORT = Number(env.CDP_PORT ?? argv.find((a) => a.startsWith("--port="))?.split("=")[1] ?? 9223);
@@ -1482,41 +1484,77 @@ try {
     };
     const pagesBefore = (await listPages(PORT).catch(() => [])).length;
     const inboxBefore = readInboxLen();
-    // 独立进程只从 environment 取夹具路径：显式带上与宿主同一条覆盖，避免 runner 环境差异
+    // 独立进程只从 environment 取夹具路径：显式带上**全套**隔离变量，避免 runner 环境差异
     // 让 cleanup 去扫真实 home（基线里 stripped=0 的首个失败点）。
-    const cleanupEnv = { ...env };
-    if (env.PET_AGENT_CONFIG_FILES) cleanupEnv.PET_AGENT_CONFIG_FILES = env.PET_AGENT_CONFIG_FILES;
-    const cleanup = spawnSync(EXE, ["--pet-hook-cleanup"], {
-      encoding: "utf8",
-      timeout: 5_000,
-      env: cleanupEnv,
-    });
-    r.info("cleanup stdout", String(cleanup.stdout ?? "").trim());
-    r.check("清理分支 5 秒内退出且退出码为 0", 0, cleanup.status);
-    r.check("清理分支没有被超时杀掉", undefined, cleanup.error);
-    r.check("stdout 报告摘掉了条目", true, /result=done .*stripped=[1-9]\d* .*failed=0/.test(String(cleanup.stdout)));
-    r.check("清理后自家条目归零", [0, 0], [ours(cfgA), ours(cfgB)]);
-    r.check("清理不动别人条目与其他键", foreignBeforeToggle, `${foreignOf(cfgA)}|${foreignOf(cfgB)}`);
-    r.check("清理分支不往收件目录写（没被当成一条 hook 事件）", inboxBefore, readInboxLen());
-    // 只判「没多出页面」：本组前后可能有一张状态卡按自己的超时收起，那与清理分支无关
-    const pagesAfter = (await listPages(PORT).catch(() => [])).length;
-    r.check("清理分支没有开新窗口", true, pagesAfter <= pagesBefore);
-    r.check("dev 实例仍然存活（没被单实例锁抢占或重载）", token, await c.ev(`window.__verifyToken ?? null`));
+    // 只转发 PET_AGENT_CONFIG_FILES 不够（Bug1）：cleanup 走 uninstall_everywhere，扫的是
+    // adapters::wired() 四家 —— Qoder 认逐文件变量，ZCode 只认 PET_AGENT_HOME，Codex 与
+    // WorkBuddy 缺省时也退到 PET_AGENT_HOME。漏一个，用户真配置里的条目就被摘掉了。
+    // 所以先当场算一次「哪几家还会退到真实 home」，名单非空就一个子进程都不起：
+    // 宁可少跑这一组，也不拿用户自己的配置当夹具。
+    const REAL_HOME = homedir();
+    const isolationGap = unisolatedAgentAdapters(env, REAL_HOME);
+    r.check("隔离变量齐备：四家都不会退到真实 home", [], isolationGap);
+    r.info("转发的隔离变量", Object.keys(agentIsolationEnv(env)).join(", ") || "(一个都没设)");
+    if (isolationGap.length > 0) {
+      r.info(
+        "跳过清理分支",
+        `这几家的候选文件仍落在真实 home：${isolationGap.join(", ")}；给 dev:debug 与本套件带上同一个 PET_AGENT_HOME（temp 下）再跑`,
+      );
+    } else {
+      const cleanupEnv = { ...env, ...agentIsolationEnv(env) };
+      // 真实 home 下四家的候选文件：先记下「在不在 + 我们那种条目有几条」。判据用条数而不是
+      // mtime —— Qoder 自己随时可能重写 settings.json，mtime 会变红但那与清理分支无关；
+      // 而「cleanup 顺手摘掉真实条目」必然让带 --pet-hook 的行数掉下来。
+      const REAL_FILES = realHomeAgentFiles(REAL_HOME);
+      const realOurs = () =>
+        REAL_FILES.map((f) => {
+          try {
+            return `${f}=${readFileSync(f, "utf8").split("--pet-hook").length - 1}`;
+          } catch {
+            return `${f}=缺文件`;
+          }
+        });
+      const realBefore = realOurs();
+      const cleanup = spawnSync(EXE, ["--pet-hook-cleanup"], {
+        encoding: "utf8",
+        timeout: 5_000,
+        env: cleanupEnv,
+      });
+      r.info("cleanup stdout", String(cleanup.stdout ?? "").trim());
+      r.check("清理分支 5 秒内退出且退出码为 0", 0, cleanup.status);
+      r.check("清理分支没有被超时杀掉", undefined, cleanup.error);
+      r.check(
+        "stdout 报告摘掉了条目",
+        true,
+        /result=done .*stripped=[1-9]\d* .*failed=0/.test(String(cleanup.stdout)),
+      );
+      r.check("清理后自家条目归零", [0, 0], [ours(cfgA), ours(cfgB)]);
+      r.check("清理不动别人条目与其他键", foreignBeforeToggle, `${foreignOf(cfgA)}|${foreignOf(cfgB)}`);
+      r.check("清理分支不往收件目录写（没被当成一条 hook 事件）", inboxBefore, readInboxLen());
+      // 只判「没多出页面」：本组前后可能有一张状态卡按自己的超时收起，那与清理分支无关
+      const pagesAfter = (await listPages(PORT).catch(() => [])).length;
+      r.check("清理分支没有开新窗口", true, pagesAfter <= pagesBefore);
+      r.check("dev 实例仍然存活（没被单实例锁抢占或重载）", token, await c.ev(`window.__verifyToken ?? null`));
 
-    // 第二遍专撞坏配置：清理失败绝不能拦住卸载，所以退码仍是 0 且文件一字不改
-    const broken = "{ 半截 JSON";
-    writeFileSync(cfgA, broken);
-    const brokenB = readFileSync(cfgB, "utf8");
-    const cleanup2 = spawnSync(EXE, ["--pet-hook-cleanup"], {
-      encoding: "utf8",
-      timeout: 5_000,
-      env: cleanupEnv,
-    });
-    r.info("cleanup2 stdout", String(cleanup2.stdout ?? "").trim());
-    r.check("撞到坏配置仍然退出码 0", 0, cleanup2.status);
-    r.check("坏配置文件一字不改", broken, readFileSync(cfgA, "utf8"));
-    r.check("坏配置不牵连另一个文件", brokenB, readFileSync(cfgB, "utf8"));
-    r.check("坏配置在 stdout 里留痕", true, /failed=1/.test(String(cleanup2.stdout)));
+      // 第二遍专撞坏配置：清理失败绝不能拦住卸载，所以退码仍是 0 且文件一字不改
+      const broken = "{ 半截 JSON";
+      writeFileSync(cfgA, broken);
+      const brokenB = readFileSync(cfgB, "utf8");
+      const cleanup2 = spawnSync(EXE, ["--pet-hook-cleanup"], {
+        encoding: "utf8",
+        timeout: 5_000,
+        env: cleanupEnv,
+      });
+      r.info("cleanup2 stdout", String(cleanup2.stdout ?? "").trim());
+      r.check("撞到坏配置仍然退出码 0", 0, cleanup2.status);
+      r.check("坏配置文件一字不改", broken, readFileSync(cfgA, "utf8"));
+      r.check("坏配置不牵连另一个文件", brokenB, readFileSync(cfgB, "utf8"));
+      r.check("坏配置在 stdout 里留痕", true, /failed=1/.test(String(cleanup2.stdout)));
+
+      // Bug1 的显式判据：两遍 cleanup 之后，真实 home 下四家的配置文件一条都没被摘走
+      r.check("真实 home 下四家的 --pet-hook 条数未被 cleanup 改动", realBefore, realOurs());
+      r.info("真实 home 候选文件", realBefore.join(" ； ") || "(本机一家客户端都没装)");
+    }
 
     // 复位成套件后面用例需要的样子：两份样例都只留用户自己的条目，不带我们的东西
     writeFileSync(cfgA, foreignOnly("a"));
