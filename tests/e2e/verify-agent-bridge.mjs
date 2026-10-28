@@ -23,7 +23,12 @@ import {
   waitUntil,
   writeEnabledIds,
 } from "./harness/cdp.mjs";
-import { agentIsolationEnv, realHomeAgentFiles, unisolatedAgentAdapters } from "./harness/fixtures.mjs";
+import {
+  AGENT_ISOLATION_ADAPTERS,
+  agentIsolationEnv,
+  realHomeAgentFiles,
+  unisolatedAgentAdapters,
+} from "./harness/fixtures.mjs";
 import { waitWidgetRealm } from "./harness/widget-realm.mjs";
 
 const PORT = Number(env.CDP_PORT ?? argv.find((a) => a.startsWith("--port="))?.split("=")[1] ?? 9223);
@@ -1200,8 +1205,59 @@ try {
   const underTemp = files0.length > 0 && files0.every((f) => resolve(String(f.path)).startsWith(TEMP_ROOT + sep));
   r.info("hook 配置落点", files0.map((f) => f.path).join(" ； ") || "(空)");
   r.check("目标文件都在 temp/ 下（写盘断言只碰样例，不碰真实用户配置）", true, underTemp);
-  if (!underTemp) {
-    r.info("跳过写盘断言", "hook 配置未指向 temp/a9a（启动时未设 PET_AGENT_CONFIG_FILES）；本组不写任何文件");
+  // Bug1 缺口（P1）：本组点的是「卸载」，而 agent_hooks_uninstall → agent_hooks::uninstall_everywhere
+  // （agent_hooks.rs:398-403）扫的是 adapters::wired() **四家**的 targets(home)：Qoder 认逐文件
+  // 变量，ZCode/Codex/WorkBuddy 只认 PET_AGENT_HOME（claude_style.rs:170-191、zcode.rs:140-153）。
+  // 只重定向前者时，另外三家会落到真实 ~/.codex、~/.workbuddy、~/.zcode —— 用户自己的配置被
+  // 顺手摘掉，正是 Bug1 的原貌。所以本组的前置必须是「四家的候选文件全在 temp 下」：两个隔离
+  // 变量都齐备、逐家路径都在 temp；缺哪个就把变量名写进失败原因判红（缺项即红，不静默 skip）。
+  // 红在前、正文不跑是防事故（真跑到写盘那步就会改用户的配置），不是把判据降级成跳过。
+  const envList = (name) =>
+    name
+      ? String(env[name] ?? "")
+          .split(";")
+          .map((s) => s.trim())
+          .filter(Boolean)
+      : [];
+  const AGENT_HOME = String(env.PET_AGENT_HOME ?? "").trim();
+  const inTemp = (p) => resolve(String(p)).startsWith(TEMP_ROOT + sep);
+  // 四家的候选文件：逐文件变量优先（与适配器同一条优先级），否则按 PET_AGENT_HOME 换根拼。
+  // 路径表复用 harness/fixtures.mjs 的 AGENT_ISOLATION_ADAPTERS —— 那张表逐条抄自
+  // claude_style.rs:271-282（Qoder 两个目录 / settings.json）、zcode.rs:42-44 与 :140-153、
+  // codex.rs:39-50、workbuddy.rs:36-48，并且有跨语言用例钉住「JS 表 = Rust adapters::WIRED」，
+  // 不在这里再抄一份（抄两份必然漂移）。dsh 没有可改写的 hook 文件（installs_files() 返回
+  // false），按 realHomeFiles 为空滤掉，剩下的正好是卸载会扫的那四家。
+  const AGENT_FAMILIES = AGENT_ISOLATION_ADAPTERS.filter((a) => a.realHomeFiles.length > 0).map((a) => {
+    const listed = envList(a.filesEnv);
+    return {
+      id: a.id,
+      // 两家形状不同：Qoder/Codex/WorkBuddy 是 hooks.<事件>[].hooks[]，
+      // ZCode 是 hooks.events.<事件>[]（外加 hooks.enabled 总开关），快照要分开写。
+      claudeStyle: a.id !== "zcode",
+      paths: listed.length > 0 ? listed : a.realHomeFiles.map((rel) => join(AGENT_HOME, ...rel.split("/"))),
+    };
+  });
+  const isolationProblems = [];
+  if (envList("PET_AGENT_CONFIG_FILES").length === 0) {
+    isolationProblems.push("缺 PET_AGENT_CONFIG_FILES —— Qoder 的候选文件没被重定向，会落到真实 home 的 .qoder/settings.json");
+  }
+  if (AGENT_HOME === "") {
+    isolationProblems.push("缺 PET_AGENT_HOME —— ZCode/Codex/WorkBuddy 的候选文件会退到真实 home");
+  } else if (!inTemp(AGENT_HOME)) {
+    isolationProblems.push(`PET_AGENT_HOME 不在 temp 下：${AGENT_HOME}`);
+  }
+  for (const fam of AGENT_FAMILIES) {
+    for (const p of fam.paths) {
+      if (!inTemp(p)) isolationProblems.push(`${fam.id} 的候选文件不在 temp 下：${p}`);
+    }
+  }
+  r.check("四家 hook 配置全部在 temp 下（缺哪个隔离变量就点名判红）", [], isolationProblems);
+  const writesSafe = underTemp && isolationProblems.length === 0;
+  if (!writesSafe) {
+    r.info(
+      "跳过写盘断言",
+      `隔离前置不成立（${isolationProblems.join("；") || "Qoder 的候选文件不在 temp 下"}）；本组一个文件都不写`,
+    );
   } else {
     // 「他人条目未变」沿用「逐字段未变」的同一口径：按键排序的规范串比较。
     // 注意这个排序只是**比对手段**，不代表宿主的行为：A02 起宿主开了 serde_json 的
@@ -1229,6 +1285,105 @@ try {
       }
       return JSON.stringify(out);
     };
+
+    // Bug1 缺口（P1）的夹具：安装前在四家的候选文件里各放一条「别人家」的条目 + 一条自家
+    // 陈旧条目（模拟旧 exe 路径留下的残渣）。自家那条是关键：不种它，「卸载后 --pet-hook 计数
+    // 为 0」永远是 0，等于没判（P1 Bug4 那类伪断言）；种上之后，只有卸载真的扫到这家才会归零
+    // —— 而它扫的正是 adapters::wired() 四家的 targets(home)，也就是 Bug1 出事的那条路径。
+    const staleHook = (agent, timeoutField = "timeout") => ({
+      type: "command",
+      command: `"D:\\old\\desktop-pet.exe" --pet-hook stop --agent ${agent}`,
+      [timeoutField]: 2,
+    });
+    const foreignWithStale = (tag, agent) =>
+      JSON.stringify(
+        {
+          theme: "dark",
+          note: `keep-${tag}`,
+          hooks: {
+            PreToolUse: [
+              { hooks: [{ type: "command", command: `other-tool-${tag} --notify`, timeout: 5 }, staleHook(agent)] },
+            ],
+          },
+        },
+        null,
+        2,
+      );
+    // ZCode 的形状与另外三家不同：事件挂在 hooks.events.<事件> 下、自家条目独占一个分组、
+    // 超时字段叫 timeoutMs（zcode.rs:36-37、:181-195），另有一个 hooks.enabled 总开关
+    // （语义与 WorkBuddy 的 disableAllHooks 相反：true = 开着）。总开关种成 **false**：⑨组
+    // 的 ZCode 夹具原值就是 false（sample(false)），而 linkage 只在卸载/切回时清 hooksEnabled
+    // —— 万一上一轮崩在「ZCode 已装、还没切回」之间，这条记录会留到本轮，于是这里的卸载会
+    // 按记录 restore_switch 一次。原值对齐 false，那次恢复就是写回 false，不会把这条判据
+    // 变成假红；反过来若种成 true，宿主一次**合法**的恢复就会让它红。总开关照旧进快照
+    // （别人家的键同样是别人的东西）：真要有人把它改成 true，该红。
+    const zcodeForeignWithStale = (tag) =>
+      JSON.stringify(
+        {
+          mcpServers: { [`fake-${tag}`]: { command: `npx fake-mcp-${tag}` } },
+          hooks: {
+            enabled: false,
+            events: {
+              Stop: [
+                { hooks: [{ type: "command", command: `other-tool-${tag}.cmd`, timeoutMs: 3000 }] },
+                { hooks: [staleHook("zcode", "timeoutMs")] },
+              ],
+            },
+          },
+          permissions: { allow: ["Bash"] },
+        },
+        null,
+        2,
+      );
+    // 「别人家的东西未变」的规范化快照：摘掉带 --pet-hook 的条目后再按键排序规整整篇。
+    // 比只比 hooks 内层严：非 hooks 的键（theme/note/mcpServers/permissions/总开关）与分组上的
+    // matcher 一起进快照 —— 卸载动的是别人整份文件，只对 hooks 内层取值等于少判一半；
+    // 也比「原文逐字节」稳：宿主真改写时会重新序列化，缩进/空行会让原文比对假红，
+    // 而「别人的条目与键有没有变」才是本组的判据（键序另有 Rust 那条往返单测钉住）。
+    const withoutManaged = (groups) => {
+      const kept = [];
+      for (const g of groups ?? []) {
+        const inner = (g?.hooks ?? []).filter((h) => !String(h?.command ?? "").includes("--pet-hook"));
+        if (inner.length > 0) kept.push({ ...g, hooks: inner });
+      }
+      return kept;
+    };
+    const claudeStyleSnapshot = (path) => {
+      const v = JSON.parse(readFileSync(path, "utf8"));
+      const hooks = {};
+      for (const [event, groups] of Object.entries(v.hooks ?? {})) {
+        const kept = withoutManaged(groups);
+        if (kept.length > 0) hooks[event] = kept;
+      }
+      return JSON.stringify(canon({ ...v, hooks }));
+    };
+    const zcodeSnapshot = (path) => {
+      const v = JSON.parse(readFileSync(path, "utf8"));
+      const events = {};
+      for (const [event, groups] of Object.entries(v?.hooks?.events ?? {})) {
+        const kept = withoutManaged(groups);
+        if (kept.length > 0) events[event] = kept;
+      }
+      return JSON.stringify(canon({ ...v, hooks: { ...(v?.hooks ?? {}), events } }));
+    };
+    const familySnapshot = (fam) => {
+      const take = fam.claudeStyle ? claudeStyleSnapshot : zcodeSnapshot;
+      return fam.paths.map((p) => `${fam.id}|${p}|${existsSync(p) ? take(p) : "<缺文件>"}`);
+    };
+    const allFamilies = () => AGENT_FAMILIES.flatMap(familySnapshot);
+    const petHooksIn = (p) => (existsSync(p) ? readFileSync(p, "utf8").split("--pet-hook").length - 1 : "<缺文件>");
+
+    // 落种子。Qoder 的 cfgA/cfgB 在上面已种过（且 ② 还要再改写 cfgA），所以这里只种另外三家。
+    // 目录也建：targets() 只把「父目录存在」的当候选（claude_style.rs:180-191 的 exists 过滤，
+    // ZCode 更是 `.zcode` 不存在就一个候选都不给），少了这条，卸载根本扫不到它，判据成了空判。
+    for (const fam of AGENT_FAMILIES) {
+      if (fam.id === "qoder") continue;
+      for (const [i, p] of fam.paths.entries()) {
+        const tag = `${fam.id}${i === 0 ? "" : i + 1}`;
+        mkdirSync(dirname(p), { recursive: true });
+        writeFileSync(p, fam.claudeStyle ? foreignWithStale(tag, fam.id) : zcodeForeignWithStale(tag));
+      }
+    }
 
     // 打开 agent 桥的插件页（套件前面已把它加进启用清单；没加上就补一次开关，与用户点开关同一条路径）
     await settings.client.ev(`document.querySelector('#nav-plugins .nav-item[data-view=${JSON.stringify(AGENT_ID)}]')?.click(); true`);
@@ -1268,6 +1423,9 @@ try {
     );
     writeFileSync(cfgA, stale);
     const expectForeign = `${foreignOf(cfgA)}|${foreignOf(cfgB)}`;
+    // 四家的「别人条目」基线：这一刻四家的种子都已就位（cfgA 刚被改写成 stale），正是
+    // 「安装之前」的口径；安装后与卸载后各比一次，判据只加严不改宽。
+    const expectForeignAll = allFamilies();
     await clickShadow(".hk-refresh", "「刷新」按钮存在且可点");
     const repair = await waitUntil(settings.client, stateExpr("repair"), 15_000);
     const repairText = String(await statusText());
@@ -1298,6 +1456,16 @@ try {
         ),
     );
     r.check("安装不改别人条目（复用按键排序规范串口径）", expectForeign, `${foreignOf(cfgA)}|${foreignOf(cfgB)}`);
+    // 四家判据（Bug1 缺口）：安装只装 linkage 里当前那一家（commands/agent.rs:149-172 只扫
+    // current_adapter），所以另外三家的条目一个字都不该动，它们那几条陈旧条目也该还在。
+    // 反过来说：安装若也做全盘清扫，扫的同样是四家的 targets(home)，与卸载是同一颗雷。
+    r.check("安装后四家的别人条目逐家未变（整篇规范化快照，含非 hooks 键）", expectForeignAll, allFamilies());
+    for (const fam of AGENT_FAMILIES) {
+      if (fam.id === "qoder") continue;
+      for (const p of fam.paths) {
+        r.check(`安装后 ${fam.id} 的陈旧条目仍在（安装只动当前那一家）`, 1, petHooksIn(p));
+      }
+    }
     const shownInstall = String(await statusText());
     r.check("回显条数与随后一次 status() 一致", true, shownInstall.includes(`共 ${stAfterInstall.managed} 条`));
 
@@ -1309,6 +1477,17 @@ try {
       r.check("卸载后 --pet-hook 条目归零", 0, readFileSync(p, "utf8").split("--pet-hook").length - 1);
     }
     r.check("卸载不动别人条目（与 verify-isolation 同口径：按键排序规范串）", expectForeign, `${foreignOf(cfgA)}|${foreignOf(cfgB)}`);
+    // Bug1 缺口的正面判据：卸载走 uninstall_everywhere（agent_hooks.rs:398-403），扫的是
+    // adapters::wired() 四家的 targets(home)，所以四家都要逐家验 —— 只验 Qoder 那两份的话，
+    // 另外三家在真实 home 下被顺手摘掉时这里照样全绿，而那正是 Bug1 的原貌。
+    // 两条判据互补：① 别人家的条目与键逐家未变（整篇规范化快照，逐家逐文件带路径）；
+    // ② 每家每份文件的 --pet-hook 计数归零（种子里的陈旧条目必须被真摘掉，证明这家确实被扫到）。
+    r.check("卸载后四家的别人条目逐家未变（整篇规范化快照，含非 hooks 键）", expectForeignAll, allFamilies());
+    for (const fam of AGENT_FAMILIES) {
+      for (const p of fam.paths) {
+        r.check(`卸载后 ${fam.id} 的 --pet-hook 计数为 0（${p}）`, 0, petHooksIn(p));
+      }
+    }
 
     // ⑤ 旧断言「agent:hooks 的授权弹过同意框」已删除：它写的是「这一轮跑动期间真实 Agent
     // 插件的授权弹过框」，用户本就启用并授权 com.pet.agent-bridge 时收尾门控原样保留授权，

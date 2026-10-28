@@ -1,0 +1,20 @@
+# 行尾口径：入库与检出都锁 LF。
+#
+# 为什么需要：CI 跑 windows-latest，Git for Windows 默认 core.autocrlf=true 会把工作区
+# 检出成 CRLF。单测里有按行匹配文件内容的判据（tests/unit/unit-dsh-bridge.mjs 检查
+# integrations/dsh-bridge/cordis.patch.yml 时曾把换行硬编码成 "\n"），在 CRLF 工作区
+# 就会误红（P1）。行尾属于检出细节，不该决定判据结果，所以统一钉成 LF。
+#
+# 边界：只影响后续检出，不改已入库 blob（当前索引里没有任何 i/crlf 文件：git ls-files
+# --eol | grep -c i/crlf == 0）；二进制文件由 text=auto 识别为 binary，不做转换。
+* text=auto eol=lf
+
+# 逐项确认过「不需要按 CRLF 交付」、因此不单独声明 eol=crlf 的文本文件（逐个看过内容与
+# 引用方，不靠文件名猜）：
+#   tools/check-nsis-cleanup.ps1 / tools/generate-app-icon.ps1 / tools/win-zorder.ps1
+#     —— PowerShell 5.1+/7 都接受 LF 行尾的 .ps1；三者在索引里本来就是 LF（i/lf），
+#        对它们声明 eol=crlf 只会平白改变检出字节，并不会修好任何东西。
+#   src-tauri/windows/installer-hooks.nsi
+#     —— makensis 接受 LF 的 .nsi；索引里本来也是 LF，且 CI 的 tests/unit/unit-nsis-hook.mjs
+#        自己按 /\r?\n/ 切行，不挑行尾。
+# 仓库里没有 *.bat / *.cmd / *.sh。

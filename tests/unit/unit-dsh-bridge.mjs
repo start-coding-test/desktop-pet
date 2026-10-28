@@ -33,6 +33,15 @@ function rustList(src, marker) {
   return [...src.slice(open, close).matchAll(/"([^"]+)"/g)].map((m) => m[1]);
 }
 
+/** 取 Rust 顶层 `fn name` 的函数体原文（到下一个行首 `}` 为止）。 */
+function rustFn(src, name) {
+  const at = src.indexOf(`fn ${name}`);
+  if (at < 0) throw new Error(`找不到 fn ${name}`);
+  const end = src.indexOf("\n}", at);
+  if (end < 0) throw new Error(`找不到 fn ${name} 的结尾`);
+  return src.slice(at, end);
+}
+
 const phases = rustList(rust("src-tauri/src/services/agent/phases.rs"), "pub const PHASES");
 const agentIds = rustList(rust("src-tauri/src/services/agent/phases.rs"), "pub const AGENT_IDS");
 const detailKeys = rustList(rust("src-tauri/src/services/agent/state.rs"), "const KEYS");
@@ -233,7 +242,8 @@ group("resolveInbox 的三级顺序");
   eq(
     "环境变量也必须是绝对路径",
     bridge.resolveInbox({}, { PET_AGENT_INBOX: "rel", APPDATA: "C:\\Users\\x\\AppData\\Roaming" }).dir,
-    join("C:\\Users\\x\\AppData\\Roaming", "AppData", "Roaming", bridge.APP_IDENTIFIER, "agent", "inbox"),
+    // APPDATA 本身已是 …\AppData\Roaming，第三级只接 identifier\agent\inbox
+    join("C:\\Users\\x\\AppData\\Roaming", bridge.APP_IDENTIFIER, "agent", "inbox"),
   );
 }
 
@@ -244,6 +254,52 @@ group("resolveInbox 的三级顺序");
   const rel = bridge.resolveInbox({}, { PET_AGENT_INBOX: "rel", APPDATA: "" });
   eq("有值但不是绝对路径时同样判 null", rel.dir, null);
   eq("来源指向最后一个候选", rel.source, "PET_AGENT_INBOX");
+}
+
+/* ================== 收件目录回退值 ↔ 宿主拼法对读（防回归） ================== */
+// 桥的第三级回退不该是「抄一份常量」：宿主的拼法只有一处 ——
+//   inbox.rs::app_data_dir_standalone() = %APPDATA% + identifier()
+//   inbox.rs::inbox_dir(app_data)      = app_data + "agent" + "inbox"
+// 这里按源码把这两段 join 读出来（identifier 再经 state.rs 的 include_str! 对回那张
+// tauri.conf.json），与桥解析出的目录逐字比。以后再往哪边多拼一层 AppData\Roaming，
+// 断言就会红 —— 这一层错曾经一直是绿的，因为期望值是照着 bug 抄的。
+group("收件目录回退值 = 宿主 %APPDATA%\\<identifier>\\agent\\inbox");
+
+const inboxSrc = rust("src-tauri/src/services/agent/inbox.rs");
+const stateSrc = rust("src-tauri/src/services/agent/state.rs");
+const appDataFn = rustFn(inboxSrc, "app_data_dir_standalone");
+const inboxFn = rustFn(inboxSrc, "inbox_dir");
+/** 函数体里 `.join("字面量")` 的段（按出现顺序）；`join(标识符)` 不算，另由断言钉。 */
+const literalJoins = (body) => [...body.matchAll(/\.join\(\s*"([^"]+)"\s*\)/g)].map((m) => m[1]);
+
+deep("宿主 app_data_dir_standalone 不自己加 AppData\\Roaming（只按 identifier 拼一层）", literalJoins(appDataFn), []);
+check(
+  "宿主 app_data_dir_standalone 用的是 identifier()",
+  /\.join\(\s*identifier\(\)\s*\)/.test(appDataFn),
+  appDataFn,
+);
+deep("宿主 inbox_dir 挂在 APPDATA 之后的段就是 agent/inbox", literalJoins(inboxFn), ["agent", "inbox"]);
+
+// identifier() 的实参是 include_str! 的那份配置：解析回真实文件再读一次，
+// 免得「宿主的拼法」和「桥比对的 identifier」根本不是同一份 tauri.conf.json。
+const confFromState = /include_str!\(\s*"([^"]+)"\s*\)/.exec(rustFn(stateSrc, "identifier"))?.[1];
+eq(
+  "identifier() 嵌的就是 src-tauri/tauri.conf.json（不是另抄一份常量）",
+  typeof confFromState === "string" && confFromState.endsWith("tauri.conf.json"),
+  true,
+);
+const embedded = confFromState
+  ? JSON.parse(readFileSync(new URL(confFromState, new URL("src-tauri/src/services/agent/", ROOT)), "utf8"))
+  : {};
+eq("identifier() 读到的那份配置与上面比对的一致", embedded.identifier, tauriConf.identifier);
+
+{
+  // 真实 Windows 上 %APPDATA% 的取值形状；宿主与桥都必须只往后接 identifier\agent\inbox。
+  const appData = "C:\\Users\\x\\AppData\\Roaming";
+  const hostSubpath = [tauriConf.identifier, ...literalJoins(inboxFn)];
+  const resolved = bridge.resolveInbox({}, { APPDATA: appData });
+  eq("回退命中的来源就是 APPDATA（不是别的级）", resolved.source, "APPDATA");
+  eq("收件目录回退值与宿主拼法逐字一致", resolved.dir, join(appData, ...hostSubpath));
 }
 
 /* ============================ 真写盘：createSink / apply ============================ */
@@ -374,7 +430,10 @@ const patch = await readFile(new URL("cordis.patch.yml", BUNDLE), "utf8");
 check("patch 用 insert 行挂插件", /^- insert:$/m.test(patch));
 check(
   "patch 里的 name 就是包名（写错的话 DSH 加载器导入不到）",
-  new RegExp(`^\\s+- id: pet-agent-bridge$\\n\\s+name: ${manifest.name}$`, "m").test(patch),
+  // 换行写 `\r?\n`：CI 的 windows runner 上工作区可能被检出成 CRLF（Git for Windows 默认
+  // core.autocrlf=true），此前硬编码 `\n` 会让这条在 CRLF 工作区误红。行尾是检出细节，
+  // 不属于 patch 的契约内容 —— 判据仍然只认「name 必须紧跟 id 行」，只是不再挑行尾。
+  new RegExp(`^\\s+- id: pet-agent-bridge$\\r?\\n\\s+name: ${manifest.name}$`, "m").test(patch),
   patch,
 );
 

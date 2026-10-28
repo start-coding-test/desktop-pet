@@ -23,7 +23,9 @@ export const INBOX_ENV = "PET_AGENT_INBOX";
 /** 宿主 `tauri.conf.json` 里的 identifier：改那里就必须改这里，单测钉着。 */
 export const APP_IDENTIFIER = "com.desktoppet.pet";
 
-const APP_DATA_INBOX = ["AppData", "Roaming", APP_IDENTIFIER, "agent", "inbox"];
+// %APPDATA% 本身就是 `C:\Users\<user>\AppData\Roaming`：这里只接 identifier 之后的段，
+// 再写一次 `AppData\Roaming` 就会拼到 `...\Roaming\AppData\Roaming\...`，宿主永远读不到。
+const APP_DATA_INBOX = [APP_IDENTIFIER, "agent", "inbox"];
 
 export function apply(ctx, config) {
   // 连订阅面都没有的宿主里什么都别做：桥不能因为「对面少了一个方法」把插件加载搞崩。

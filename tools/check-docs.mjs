@@ -342,6 +342,10 @@ const TOP_EXCLUDED = new Map([
   ['.git', '版本库元数据'],
   ['.dispatch', '派单流水线工作区（.gitignore 整目录覆盖，含台账与卡片，只在本地）'],
   ['.workbuddy', '外部 AI 助手产物（.gitignore 覆盖）'],
+  // AgentTeams 团队会话的运行时目录（team.json + inbox/*.jsonl）：只在成员本机存在、不进仓库，
+  // CI 检出里没有它；不收口的话任何人在团队工作区跑 check:docs 都会被 R-G 判红（t8 收口）。
+  // 只排除这一个目录，别改成通配/前缀豁免——那会把别的未知顶层目录一起放过去。
+  ['.agent-teams', 'AgentTeams 团队运行时目录（team.json / inbox，未入库；本工作区才有，CI 检出里不存在）'],
   ['.vscode', '编辑器本地配置（.gitignore 整目录覆盖，不入库）'],
 ]);
 

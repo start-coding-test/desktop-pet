@@ -27,6 +27,32 @@
   + 同名 zip，`.gitignore` 已覆盖。重出前先核 `src-tauri/target/release/desktop-pet.exe` 的 mtime 晚于
   `src/` 与 `src-tauri/` 的最后一次提交，否则是过期二进制；插件是磁盘加载，改 `plugins/` 不需要重编本体。
 
+### 发版前置（CI 绿 → 分支保护 → 打包 → 记录）
+
+0.2.3 就是反面教材（2026-10-28）：B5 与发版两笔提交（`7448b3f` / `02e5102`）**直接推了 `main`**，安装包在 CI 之前就打好了，E2E（`verify:agent` 285/0、`verify` 482/0）**只在本地跑过**；`.github/workflows/e2e.yml` 是 `workflow_dispatch`，那一轮没触发，CI 侧没有绿，`main` 的分支保护也一直没开。本地读数算证据，但**不能替代 CI 绿**。下面四步按序做，前一步不绿不进下一步：
+
+1. **CI 必绿**：合并前 `main` 上的 CI（`.github/workflows/ci.yml`，job `windows`）必须跑完且结论绿；E2E 门不随 push 自动跑，要手动触发 `E2E（手动触发）` 工作流并**亲眼看到那一次 run 绿**，把 run id 记下来。本地跑出来的 285/0 只是旁证，不能写成「已过 E2E 门」。
+2. **分支保护先开**：按下节命令开 `main` 保护——要求 PR、要求 CI checks、禁 force push、禁直推。没开之前，任何「已过门禁」的说法都不成立。
+3. **再打包**：CI 绿 **且** 分支保护开着之后，才出安装包 / 便携包；产物对应的提交必须就是那次绿 run 的提交（`git rev-parse HEAD` 对得上，别拿本地未推的改动出包）。
+4. **记录写全**：Release 说明、[本体任务卡](HOST-BACKLOG.md) 状态、`release-package/` 里的更新说明都要写清当时的 CI 状态（绿 run id，或「未跑」）、E2E 是 CI 跑的还只是本地跑的、分支保护开没开。**没跑就写「未跑」，不许写「全绿」**。
+
+`main` 分支保护的开启命令（**需要仓库管理员**；本机没有 `gh`、也没有仓库 token，**以下命令本轮没有执行，保护仍是关闭状态**，`<owner>/<repo>` 即 `start-coding-test/desktop-pet`）：
+
+```bash
+gh api -X PUT repos/<owner>/<repo>/branches/main/protection \
+  -F 'required_status_checks[strict]=true' \
+  -F 'required_status_checks[contexts][]=windows' \
+  -F 'enforce_admins=true' \
+  -F 'required_pull_request_reviews[required_approving_review_count]=1' \
+  -F 'restrictions=' \
+  -F 'allow_force_pushes=false' \
+  -F 'allow_deletions=false'
+# 回读确认：应看到 contexts=["windows"]、required_approving_review_count=1、allow_force_pushes=false
+gh api repos/<owner>/<repo>/branches/main/protection
+```
+
+`windows` 是 `.github/workflows/ci.yml` 的 job 名（CI 的 required status check 上下文），job 改名就得同步改这里。没有 `gh` 就在 GitHub 网页 Settings → Branches → Add branch protection rule 里勾：Require a pull request before merging（≥1 approval）、Require status checks to pass（选 `windows`）、Do not allow force pushes、Do not allow deletions；勾了 Require a pull request 也就禁了直推。开完把回读结果贴进 [本体任务卡](HOST-BACKLOG.md) 的 B5 行，别只在口头说「开了」。
+
 ## 实施步骤
 
 1. **脚手架 + 宠物窗** ✅

@@ -46,6 +46,9 @@ release-package/
 .dispatch/
 docs-dispatch/
 
+# AgentTeams 团队会话的运行时目录（team.json + inbox/*.jsonl），只在成员本机存在、不入库
+.agent-teams/
+
 # 本机开发文档（给外部助手的方案稿），不入库（用户 2026-10-15 定）
 # 它从未被跟踪过，所以 GitHub 历史里本来就没有它，加这条只是防止以后 git add docs/ 顺手带上去
 docs/goat-gauge-插件开发方案.md
