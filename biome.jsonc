@@ -6,7 +6,15 @@
     "useIgnoreFile": true
   },
   "files": {
-    "includes": ["src/**", "packages/**", "plugins/**", "tests/**", "tools/**", "vite.config.ts"]
+    "includes": [
+      "src/**",
+      "packages/**",
+      "plugins/**",
+      "integrations/**",
+      "tests/**",
+      "tools/**",
+      "vite.config.ts"
+    ]
   },
   // 格式化器先不启用：本仓库没有既成的排版约定，在同一波里全量重排会把
   // 八个 verify 套件与四个插件的 diff 撑成几千行，评审看不到真正的改动。

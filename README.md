@@ -46,10 +46,10 @@ Tauri 2 + TypeScript/Vite 实现的桌面宠物框架：宠物本体只提供窗
 **示例插件**
 
 - `com.pet.hr-ble`：扫描并连接心率设备，徽标小字或波形悬浮窗
-- `com.pet.agent-bridge`：把编码 Agent 的会话状态转成宠物动作与台词。事件由 Qoder hook 采集（宿主自己收，不依赖第三方）；hook 的配置入口走插件自己的设置页（能力 `agent:hooks`，见 [ADR-0001](docs/adr/0001-agent-hooks-capability-in-plugin-page.md)）
+- `com.pet.agent-bridge`：把编码 Agent 的会话状态转成宠物动作与台词。事件由 Qoder hook 采集（宿主自己收，不依赖第三方）；hook 的配置入口走插件自己的设置页（能力 `agent:hooks`，见 [ADR-0001](docs/adr/0001-agent-hooks-capability-in-plugin-page.md)）。第五家 DSH 没有 hook 文件，走 `integrations/dsh-bridge/` 这个 cordis 桥插件往同一个收件目录投递（见 [ADR-0016](docs/adr/0016-dsh-agent-bridge-is-a-plugin-not-hook-files.md)）
 - `com.pet.todo`：待办清单。字段照 todo.txt 约定（`(A)` 优先级、`due:` 到期、`@项目`、`+上下文`），徽标显示剩余条数、桌面卡片可勾选、到点弹系统通知并让宠物有反应，变化时广播标准 topic `com.pet.todo:changed`。数据只存插件自己的隔离存储 —— **整个插件零本体改动**
 
-**Agent 事件接入**：安装/卸载 Qoder hook 是插件可申请的能力 `agent:hooks`，入口在 agent 桥插件自己的设置页（宿主设置窗那张「Agent 事件接入」卡片已删除，见 [ADR-0001](docs/adr/0001-agent-hooks-capability-in-plugin-page.md)）。宿主 exe 自身兼任 hook 接收器（`--pet-hook <phase>` 分支，只落一个文件就退出），收件目录由 watcher 读增量并归一化成会话状态；安装只增删自己标记的条目，不动其他 hook，首次改动会留 `.pre-pet-backup` 备份。
+**Agent 事件接入**：安装/卸载 Qoder hook 是插件可申请的能力 `agent:hooks`，入口在 agent 桥插件自己的设置页（宿主设置窗那张「Agent 事件接入」卡片已删除，见 [ADR-0001](docs/adr/0001-agent-hooks-capability-in-plugin-page.md)）。宿主 exe 自身兼任 hook 接收器（`--pet-hook <phase>` 分支，只落一个文件就退出），收件目录由 watcher 读增量并归一化成会话状态；安装只增删自己标记的条目，不动其他 hook，首次改动会留 `.pre-pet-backup` 备份。同一能力下还有「桥」这种形态：DSH 侧只认插件，宿主就只负责投递收件行、检测桥装没装、记录用户选择，`integrations/dsh-bridge/` 随安装包发出但不代装（见 [ADR-0016](docs/adr/0016-dsh-agent-bridge-is-a-plugin-not-hook-files.md)）。
 
 **尚未完成**：`llm-token-usage` 示例插件（暂缓）。插件入口与 widget 现已默认运行在 Web Worker 里（[ADR-0006](docs/adr/0006-plugin-host-in-web-worker.md)、[ADR-0008](docs/adr/0008-widget-host-in-web-worker-render-commands.md)），同 realm 只剩显式 opt-out 的逃生门（`host:realm-plugin-host` / `host:widget-realm-plugin-host`）—— 走逃生门的插件仍可直接 `import { invoke }` 绕过 JS 桥，这一条不是隔离边界。
 

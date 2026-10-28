@@ -1,17 +1,22 @@
-//! Agent 适配器：把「某个客户端的 hook 配置长什么样」收进一处，宿主其余部分只认这个接口。
+//! Agent 适配器：把「某个客户端怎么接入」收进一处，宿主其余部分只认这个接口。
 //!
-//! 需要它是因为四家客户端在三个维度上都不一样：
+//! 需要它是因为各家在三个维度上都不一样：
 //!   * 配置文件在哪（目录、文件名、有没有环境覆盖入口）；
 //!   * `hooks` 那一段的形状（嵌套层级、超时字段叫什么、有没有总开关）；
 //!   * 装完之后还要用户做什么才生效（新开会话 / 去 /hooks 信任 / 彻底重启）。
 //!
 //! 启停联动、来源过滤、卸载前清理这些编排不该跟着这些差异一起分叉，所以它们只调本模块。
 //!
+//! 有一家在这个接口上就是错的，所以单列：DSH 没有 hook 配置文件，它的桥是 DSH 自己的
+//! cordis 插件（`integrations/dsh-bridge/`）。它在这里只借用「选项清单 + 来源标识」，
+//! `installs_files()` 返回 false，`linkage::switch_agent` 据此走「不写文件」的分支。
+//!
 //! 生命周期口径：**每次装卸都重新问 `targets()`，不缓存**。客户端可能是装上又卸掉的，
 //! 缓存住一份 home 根目录的探测结果就会往已经不存在的目录里写配置。
 
 pub mod claude_style;
 pub mod codex;
+pub mod dsh;
 pub mod workbuddy;
 pub mod zcode;
 
@@ -37,6 +42,16 @@ pub trait AgentAdapter: Sync {
 
     /// 候选配置文件：所在目录不存在就不算装了这个客户端，绝不凭空造配置
     fn targets(&self, home: &Path) -> Vec<PathBuf>;
+
+    /// 这个 Agent 的接入方式是「往配置文件里装 hook 条目」吗？
+    ///
+    /// 默认 `true`。DSH 返回 `false`：它的桥是 DSH 侧插件，宠物这边没有文件可装，
+    /// `switch_agent` / `agent_hooks_install` 据此走「只校验 + 记录选择」的分支。
+    /// 把它做成接口上的一项，是为了让调用方不必按 `id == "dsh"` 分派 —— 那种分派会在
+    /// 加第六家时静默漏掉。
+    fn installs_files(&self) -> bool {
+        true
+    }
 
     /// 装：解析 → 拒绝坏结构 → 摘自家旧条目 → 追加自家条目。返回新文本。
     /// `cmd` 由调用方给（命令串里带哪个 `--agent` 是宿主的口径，不是客户端的形状）
@@ -136,6 +151,7 @@ static WIRED: &[&dyn AgentAdapter] = &[
     &zcode::ZCODE,
     &codex::CODEX,
     &workbuddy::WORKBUDDY,
+    &dsh::DSH,
 ];
 
 pub fn wired() -> &'static [&'static dyn AgentAdapter] {
@@ -347,9 +363,9 @@ mod tests {
         assert!(!is_wired("Qoder"), "id 是大小写敏感的，别拿显示名当 id");
     }
 
-    /// `--agent` 白名单里的四家**现在都接了线**。这条是「扩表时漏掉一家」唯一的离线判据：
+    /// `--agent` 白名单里的每一家**现在都接了线**。这条是「扩表时漏掉一家」唯一的离线判据：
     /// 上面那条 subset 判据在少一家时照样绿，而症状出现在用户那边 —— 设置页那一格点了没反应，
-    /// 宿主报「还不认识这个 Agent」。同时它反向钉住「白名单不许悄悄多出第五个值」：
+    /// 宿主报「还不认识这个 Agent」。同时它反向钉住「白名单不许悄悄多出第六个值」：
     /// 加了 CLI 取值却没写适配器，这条会红着提醒你把两处一起改。
     #[test]
     fn every_cli_agent_id_is_wired() {
@@ -364,10 +380,17 @@ mod tests {
                 "{id} 在 --agent 白名单里但没有适配器，点了会拒"
             );
         }
-        // 事件表长度按各家事实钉住：数字本身不是重点，「谁家的表被顺手改短了」才是
+        // 事件表长度按各家事实钉住：数字本身不是重点，「谁家的表被顺手改短了」才是。
+        // DSH 是 0：它没有可安装的条目，事件映射在 integrations/dsh-bridge/mapping.js。
         let per_family: Vec<(&str, usize)> =
             wired().iter().map(|a| (a.id(), a.events().len())).collect();
-        for (id, want) in [("qoder", 12), ("zcode", 7), ("codex", 10), ("workbuddy", 7)] {
+        for (id, want) in [
+            ("qoder", 12),
+            ("zcode", 7),
+            ("codex", 10),
+            ("workbuddy", 7),
+            ("dsh", 0),
+        ] {
             assert_eq!(
                 per_family.iter().find(|(x, _)| *x == id).map(|(_, n)| *n),
                 Some(want),

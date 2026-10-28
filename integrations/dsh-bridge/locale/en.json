@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Pet Agent Bridge",
+    "description": "Forwards DSH session activity to the DesktopPet inbox so the pet can show running, waiting and finished turns."
+  }
+}

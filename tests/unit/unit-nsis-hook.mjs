@@ -121,12 +121,25 @@ group("bundle.resources 真的投递到 plugins/<插件ID>/");
 // 两种写法都会静默丢插件，且都不出包就看不出来：
 // 数组形式里 `..` 被 tauri 渲染成字面目录 `_up_`，资源根下没有 plugins/；
 // 对象映射的源一旦含通配符就走 glob 分支，目标只取文件名 —— 五个插件的 manifest.json 同名互相覆盖。
+//
+// 现在有两个资源根：`plugins/`（各插件目录）与 `integrations/`（DSH 桥 bundle，
+// 要落成 <安装目录>/integrations/dsh-bridge 供用户在 DSH 里 install_bundle）。
+// 判定因此放宽成「目标 = 源目录名 + /」，但根白名单钉死，多的根必须显式加进来 ——
+// 否则又会出现「资源被投到 <安装目录>/foo/ 却没人文件名对得上」的静默错。
+const RESOURCE_ROOTS = ["plugins/", "integrations/"];
 const judgeResources = (value) => {
   const out = { object: false, mapped: false, noWildcard: false };
   if (value === null || typeof value !== "object" || Array.isArray(value)) return out;
   out.object = true;
   const entries = Object.entries(value);
-  out.mapped = entries.length > 0 && entries.every(([, to]) => typeof to === "string" && to.startsWith("plugins/"));
+  out.mapped =
+    entries.length > 0 &&
+    entries.every(([from, to]) => {
+      if (typeof to !== "string" || !RESOURCE_ROOTS.some((root) => to.startsWith(root))) return false;
+      // `<dir>` → `<dir>/`：目标必须与源目录同名，拍平或改名都会让运行时按 id 找不到资源
+      const base = from.replace(/\/+$/u, "").split(/[\\/]/u).pop();
+      return to === `${base}/`;
+    });
   out.noWildcard = entries.length > 0 && entries.every(([from]) => !from.includes("*"));
   return out;
 };
@@ -134,15 +147,24 @@ const resources = conf?.bundle?.resources;
 const judged = judgeResources(resources);
 const dump = JSON.stringify(resources);
 check("bundle.resources 是对象映射而不是数组", judged.object, dump);
-check("每个源都有以 plugins/ 开头的目标（空串与缺失都判红）", judged.mapped, dump);
+check("每个源都有同名目标、且只投到 plugins|integrations 两个根（空串与缺失都判红）", judged.mapped, dump);
 check("bundle.resources 的源不含通配符（含则层级被拍平）", judged.noWildcard, dump);
-// 反向对照：同一组判定喂给两个历史反例，必须各自判假，防「怎么改都绿」的空判
+// 反向对照：同一组判定喂给三个历史反例，必须各自判假，防「怎么改都绿」的空判
 const arrayShape = judgeResources(["../plugins/**/*"]);
 const globShape = judgeResources({ "../plugins/**/*": "plugins/" });
+const renamedShape = judgeResources({ "../plugins": "foo/" });
 check(
-  "反向对照：数组形式被 object/mapped 拦下，glob 键只被 noWildcard 拦下",
-  !arrayShape.object && !arrayShape.mapped && globShape.object && globShape.mapped && !globShape.noWildcard,
-  JSON.stringify({ arrayShape, globShape }),
+  // glob 那条在新口径下被两道拦（目标该是 `*/`、键里还有 `*`），反例只要求「别全绿」
+  "反向对照：数组被 object/mapped 拦下，glob 被 mapped+noWildcard 拦下，改名目标被 mapped 拦下",
+  !arrayShape.object &&
+    !arrayShape.mapped &&
+    globShape.object &&
+    !globShape.mapped &&
+    !globShape.noWildcard &&
+    renamedShape.object &&
+    !renamedShape.mapped &&
+    renamedShape.noWildcard,
+  JSON.stringify({ arrayShape, globShape, renamedShape }),
 );
 
 // ==== Bug1：agent 隔离 env 的收口 ====

@@ -75,7 +75,7 @@
 │   │   │   ├── hotkeys.rs      # 全局快捷键唤出插件页
 │   │   │   ├── fullscreen.rs   # 前台全屏探测（游戏模式的传感部分）
 │   │   │   ├── agent_hooks.rs  # Qoder hook 配置的安装与卸载
-│   │   │   ├── agent/          # hook 收件目录、事件归一化与会话状态机
+│   │   │   ├── agent/          # hook 收件目录、事件归一化与会话状态机；dsh_bridge.rs 只管桥插件检测（无文件可装）
 │   │   │   └── skins/          # Petdex 图集下载/解析/磁盘布局 + petskin:// 协议
 │   │   └── window/             # 窗口层
 │   │       ├── pet.rs          # 宠物窗：透明/置顶/拖拽/点击穿透
@@ -104,6 +104,8 @@
 │   ├── com.pet.astock/         # A股盯盘：自选/提醒/badge/overlay + 分时/K线/五档
 │   ├── com.pet.goat-gauge/     # Command Code GOAT 用量：额度环/余额/账期/告警
 │   └── # 暂缓：llm-token-usage/ 目录未创建（用户 2026-10-10 决定，勿按存在处理）
+├── integrations/               # 随安装包投递、但装进别的软件的桥（宿主不代装，见 ADR-0016）
+│   └── dsh-bridge/             # DSH 的 cordis 桥插件：session/event → 桌宠收件行（index.js + mapping.js + cordis.patch.yml + locale/ + icon.svg）
 ├── packages/
 │   └── sdk/                    # 插件 SDK：类型声明 + schema + 名单，全部是单一事实源
 │       ├── index.d.ts          # 插件 ctx / PetAPI 的类型声明
@@ -218,6 +220,7 @@ export default {
 - d) 装卸失败不拦启停：清单先落盘，`src-tauri/src/services/agent/linkage.rs` 的 `reconcile` 没有 Result；每个文件的结果经 `host:agent-hooks-report` 广播。读-改-写三步由 `src-tauri/src/services/agent_hooks.rs` 里的 `HOOK_IO` 一把锁串行（调用方有四个，锁放在被调方才漏不掉）。
 - e) 卸载应用走 `bundle.windows.nsis.installerHooks`（`src-tauri/windows/installer-hooks.nsi`）的 `NSIS_HOOK_PREUNINSTALL` → `desktop-pet.exe --pet-hook-cleanup`。分流排在建窗与单实例锁之前，退出码恒为 0（清理失败不能拦住卸载）；带 `/UPDATE` 的升级跳过清理，否则每次覆盖安装都摘一次 hook 而启动又只清不装，桥就静默失效了。
 - f) 老用户迁移：状态文件还不存在时，按「候选配置文件里有自家条目」补写 `qoder`（没有就写 `null`）。这一步必须早于启动清理——先摘条目就再也看不出用户装过。判据写在 `linkage.rs` 的单测里。
+- g) 第五家 DSH 走另一条路：它没有 hook 配置文件，桥是 DSH 自己的 cordis 插件（`integrations/dsh-bridge/`，随安装包投到 `<安装目录>/integrations/dsh-bridge`）。`adapters/dsh.rs` 的 `installs_files()` 返回 `false`，`linkage::switch_agent` 因此不进「装文件」分支，只做「检测 + 记录选择 + 旧 hook 摘净」：检测读 `~/.dsh/profiles/*/package.json` 的 `dsh.profile.bundles` 里有没有桥包名（`services/agent/dsh_bridge.rs`）。**宿主不代装**——DSH 的规矩是 bundle 只能经它自己的 `plugin_manager`（`action:"install_bundle"`）安装，代写 profile 的包清单与 patch 会绕过人家的加载器；用户装一次即可，桥对重复安装幂等。桥把 `session/created|session/event|session/disposed` 映射成收件行写进同一个 inbox（`agent: "dsh"`），来源过滤、状态机、插件表现与四家 hook 完全复用。
 
 运行时验证：`npm run verify:agent`（临时 `PET_AGENT_CONFIG_FILES` 样例里做停用/再启用与清理分支）、`tests/unit/unit-nsis-hook.mjs`（NSIS 接线的静态半区，进 `npm run unit`）、`tools/check-nsis-cleanup.ps1`（真实安装包的卸载与覆盖安装，发版前手动跑）。
 

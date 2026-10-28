@@ -25,6 +25,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::host_error::{HostError, INTERNAL, INVALID_ARG, INVALID_STATE, NOT_FOUND};
 use crate::plugin_caps::AGENT_HOOKS;
 use crate::services::agent::adapters::{self, claude_style, AgentAdapter};
+use crate::services::agent::dsh_bridge;
 use crate::services::agent::phases::{AGENT_FLAG, DEFAULT_AGENT};
 use crate::services::agent::AgentState;
 use crate::services::agent_hooks::{self, FileReport};
@@ -253,6 +254,39 @@ pub fn note_installed(app: &AppHandle, agent: &str, reports: &[FileReport]) {
     }
 }
 
+/// 「没有文件可装的 Agent」（DSH）接上时记下选择。
+///
+/// 与 `note_installed` 的区别只在判据：那边看的是 hook 报告里真装上了几条，这边没有报告
+/// 可看 —— 桥装没装已由调用方先核过，所以这里直接落用户的显式选择。没有这一步，
+/// 桥接上以后来源过滤（`linkage::current_agent()`）仍按上一个 Agent 算，桌宠不会动。
+pub fn note_attached(app: &AppHandle, agent: &str) {
+    note_choice(app, Some(agent));
+}
+
+/// bridge 形态的「接入」：没有文件可写，只校验桥在不在 + 记下选择。
+///
+/// 抽到本模块而不是留在命令体里，有两个理由：命令体要过 `check:shape` 的 20 行上限；
+/// 而「先核桥、再落选择」跟 `switch_agent` 的 bridge 分支是同一口径，写两遍必然漂。
+pub fn attach_bridge(
+    app: &AppHandle,
+    adapter: &dyn adapters::AgentAdapter,
+    home: &Path,
+) -> Result<Value, HostError> {
+    let bridge = dsh_bridge::detect(home, &dsh_bridge::bundle_dir(app)?);
+    if !bridge.detected {
+        return Err(HostError::new(
+            NOT_FOUND,
+            dsh_bridge::not_detected(adapter.display_name(), Path::new(&bridge.bundle_dir)),
+        ));
+    }
+    note_attached(app, adapter.id());
+    Ok(json!({
+        "files": [],
+        "hint": adapter.post_install_hint(),
+        "bridge": bridge,
+    }))
+}
+
 /// 设置页主动卸载，或「撤销授权」连带的宿主卸载：都算用户明确退出，记成 null。
 pub fn note_uninstalled(app: &AppHandle) {
     note_choice(app, None);
@@ -354,6 +388,40 @@ pub fn switch_agent(
         .next()
         .cloned()
         .unwrap_or_default();
+    // 没有文件可装的 Agent（DSH）：桥住在对方进程里，宠物这边只做两件事 ——
+    // 校验桥确实装上了，再记下用户的选择。这里**不能**走 install_files：
+    // 「装 0 个文件成功」既骗用户也骗 note_installed（它在 any_installed 为假时直接 return，
+    // 选择记不下来，桌宠会一直盯着上一个 Agent）。
+    if !adapter.installs_files() {
+        if !first_error.is_empty() {
+            return Err(HostError::new(
+                INVALID_STATE,
+                format!("卸下旧的 hook 失败，未接上新的: {first_error}"),
+            ));
+        }
+        let bundle = dsh_bridge::detect(home, &dsh_bridge::bundle_dir(app)?);
+        if !bundle.detected {
+            return Err(HostError::new(
+                NOT_FOUND,
+                format!(
+                    "{}；旧的 hook 已卸下（{} 条），新的未接上",
+                    dsh_bridge::not_detected(adapter.display_name(), Path::new(&bundle.bundle_dir)),
+                    removed.iter().map(|r| r.managed).sum::<usize>()
+                ),
+            ));
+        }
+        note_attached(app, adapter.id());
+        return Ok(json!({
+            "agent": adapter.id(),
+            "displayName": adapter.display_name(),
+            "removed": removed.iter().map(|r| r.managed).sum::<usize>(),
+            "files": [],
+            "hint": adapter.post_install_hint(),
+            "bridge": bundle,
+            // null = 这家没有「装后读日志自检」这回事，不是「查过且干净」
+            "selfCheck": null,
+        }));
+    }
     match plan_install(!first_error.is_empty(), !targets.is_empty()) {
         // 停在原状态：不装新的，但要把「哪些文件没摘干净」如实说清（已经摘掉的部分不假装没发生）
         SwitchPlan::StopAfterRemoveFailure => Err(HostError::new(
@@ -1349,12 +1417,15 @@ mod tests {
     /// 也不是「Qoder 的文件配当前选择那家的适配器」—— 后两种都会让切换过 agent
     /// 的用户在 .zcode/.codex/.workbuddy 里留着指向桌面宠物的 `--pet-hook`，
     /// 而单测只喂一个 Qoder 形状的文件正好把错配盖住。
+    ///
+    /// 只跑「有文件可装」的那几家：DSH 的桥是 DSH 侧插件，宠物这边根本没有残留可摘，
+    /// 把它算进「每家各摘一条」会让本用例的基数失真（它由 `dsh_bridge` 的单测负责）。
     #[test]
     fn startup_cleanup_strips_residue_in_every_wired_adapter() {
         let _env = adapters::lock_test_env();
         let dir = tmp_dir("startup-all-families");
         let home = dir.join("home");
-        // 四家都「装过」：夹具按各自 targets() 的目录约定摆好
+        // 有文件可装的那几家都「装过」：夹具按各自 targets() 的目录约定摆好
         fs::create_dir_all(home.join(".qoder")).unwrap();
         fs::create_dir_all(home.join(".codex")).unwrap();
         fs::create_dir_all(home.join(".workbuddy")).unwrap();
@@ -1373,8 +1444,21 @@ mod tests {
         std::env::remove_var("PET_AGENT_CODEX_FILES");
         std::env::remove_var("PET_AGENT_WORKBUDDY_FILES");
 
+        // 「不写文件」现在恰好只有一家（DSH）。哪天多出一家，本用例要一起改 ——
+        // 静默把它过滤掉就没人记得清理逻辑要不要跟着变。
+        let file_writers: Vec<&dyn AgentAdapter> = adapters::wired()
+            .iter()
+            .copied()
+            .filter(|a| a.installs_files())
+            .collect();
+        assert_eq!(
+            file_writers.len() + 1,
+            adapters::wired().len(),
+            "目前恰好一家不写文件（DSH）：新增第二家请同步本用例"
+        );
+
         let exe = Path::new(r"C:\app\desktop-pet.exe");
-        for adapter in adapters::wired() {
+        for adapter in &file_writers {
             let files = adapter.targets(&home);
             assert!(!files.is_empty(), "{} 的夹具没建对", adapter.id());
             let reports = agent_hooks::install_files(*adapter, &files, exe, Some(dir.as_path()));
@@ -1385,7 +1469,7 @@ mod tests {
             );
         }
 
-        // 插件已停用、联动关着 → 启动清理该把四家的残留全摘掉
+        // 插件已停用、联动关着 → 启动清理该把各家的残留全摘掉
         let outcome = startup_sequence(&dir, &home, Some(&[]), false, &json!({}));
         assert_eq!(
             outcome.migrated,
@@ -1394,14 +1478,14 @@ mod tests {
         );
         let cleaned = outcome.cleaned.expect("联动关着就该清一遍");
         assert!(
-            cleaned.iter().map(|r| r.managed).sum::<usize>() >= adapters::wired().len(),
-            "四家各摘掉至少一条：{:?}",
+            cleaned.iter().map(|r| r.managed).sum::<usize>() >= file_writers.len(),
+            "有文件的那几家各摘掉至少一条：{:?}",
             cleaned
                 .iter()
                 .map(|r| (r.path.clone(), r.managed))
                 .collect::<Vec<_>>()
         );
-        for adapter in adapters::wired() {
+        for adapter in &file_writers {
             for file in adapter.targets(&home) {
                 let text = fs::read_to_string(&file).unwrap();
                 assert!(

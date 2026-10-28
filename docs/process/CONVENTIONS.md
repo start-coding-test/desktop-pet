@@ -177,10 +177,18 @@ clippy `-D warnings` 与 fmt `--check` 退出码 0、`check:shape` 48 全 0、`c
   而 CI 那条九文件 `--test-concurrency=1` 的命令形状本地 **3/3 绿**；node 24.9.0 两种形状各 5/5 全绿
   → 判定为 **node 22 报告通道的负载相关间歇缺陷**，修法是把 CI 对齐到 24，不是改套件判据。
   复现口径记下来，下次别靠猜：`temp/` 里解压官方便携版跑同一条命令做 A/B（用完删，不碰 nvm 的符号链接）
-- **跑运行时回归的两条前置（都是踩过才记的）**：
+- **跑运行时回归的三条前置（都是踩过才记的）**：
   ① `verify:agent` 的写盘组要求宿主被 `PET_AGENT_CONFIG_FILES="<仓库>\\temp\\a9a\\cfg-a.json;<仓库>\\temp\\a9a\\cfg-b.json" npm run dev:debug` 指到 temp 样例；
   不带这个变量起实例时**整组自跳**，守卫「目标文件都在 temp/ 下」当场判红（读数会变成 `54 passed / 1 failed`，看着像回归、其实是启动方式不对；带对了是 **76/0**，A09 之后）。
   样例路径必须正好是 `temp/a9a/cfg-a.json`/`cfg-b.json` —— 套件写的是这两个文件，指到别处会得到另一条「K 线/条目归零」类的假红。
+  ①b **同一条起实例的命令还要带 `PET_AGENT_HOME="<仓库>\\temp\\agent-home"`（Bug1，2026-10-27）**：
+  卸载/清理那条路走的是 `uninstall_everywhere`，扫 `adapters::wired()` **五家**（第五家 dsh 没有文件可写，天然不碰 home），
+  而 `PET_AGENT_CONFIG_FILES` 只管得住 Qoder ——
+  ZCode 只认 `PET_AGENT_HOME`（它没有逐文件变量），Codex/WorkBuddy 缺省也退到它。漏了这个变量，套件起的
+  `--pet-hook-cleanup` 子进程和宿主自己的直调卸载就会去摘用户真实 `~/.zcode`、`~/.codex`、`~/.workbuddy` 里的条目。
+  现在这条不再只是纪律：`tests/e2e/harness/fixtures.mjs` 的 `unisolatedAgentAdapters()` 按 Rust 的回退链建模，
+  判不出隔离就不起子进程并当场判红（`verify-agent-bridge.mjs` ⑧ 组、`verify-isolation.mjs` 的 `sweepSafe`）；
+  套件与实例必须带**同一套**变量，否则判据红在「隔离缺口」而不是被测行为上。
   ② **跑套件期间不要改 `src/` 下的宿主模块**。Vite 会用 `?t=` 重发变更过的模块，
   而套件里按干净 URL 动态 import（如 `verify-isolation.mjs:1411` 取 `bridge.ts` 的能力缓存）会拿到**第二个实例**，
   缓存自然是空的 —— 表现成「桥缓存里少了一条能力」的假红。改完代码再起一次干净实例（或先 `reloadAndWait`）复跑，

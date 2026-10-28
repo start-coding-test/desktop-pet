@@ -321,7 +321,19 @@ function parseArchTree() {
 // R-G 反向面的纳管口径（卡 R8 §2，目录级）：白名单 = 必须在 §4 树里出现的顶层模块；
 // 排除表 = 产物/临时/流水线目录（每条带理由）。磁盘上的顶层目录必须命中二者之一，
 // 都不中标 → 红（不许用"遍历全部子目录"的写法，也不许新顶层目录静默漏过）。
-const TOP_CHECKED = ['src', 'src-tauri', 'plugins', 'packages', 'tests', 'tools', 'docs', 'assets', '.github', 'public'];
+const TOP_CHECKED = [
+  'src',
+  'src-tauri',
+  'plugins',
+  'integrations',
+  'packages',
+  'tests',
+  'tools',
+  'docs',
+  'assets',
+  '.github',
+  'public',
+];
 const TOP_EXCLUDED = new Map([
   ['dist', 'Vite 构建产物（.gitignore 覆盖），存在与否取决于本机是否构建过'],
   ['node_modules', '依赖目录（.gitignore 覆盖）'],
@@ -393,6 +405,7 @@ function ruleG() {
       for (const m of members) need(`src-tauri/src/${sub}/${m}`, `${sub} 成员`);
     }
     for (const d of dirNames('plugins')) need(`plugins/${d}`, '插件 id');
+    for (const d of dirNames('integrations')) need(`integrations/${d}`, '外部集成 id');
     for (const d of dirNames('packages')) need(`packages/${d}`, 'packages 子目录');
     for (const d of dirNames('tests')) need(`tests/${d}`, 'tests 子目录');
     for (const d of dirNames('docs')) need(`docs/${d}`, 'docs 子目录');

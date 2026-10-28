@@ -1,0 +1,5 @@
+# 桌宠 Agent 桥：只插一行 Host 插件。桥没有 client half（桌宠在 DSH 外面，
+# 不需要往 Web 界面塞任何东西），所以这里不写 dsh.client 字段。
+- insert:
+    - id: pet-agent-bridge
+      name: dsh-pet-agent-bridge

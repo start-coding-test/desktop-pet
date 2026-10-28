@@ -4,9 +4,9 @@
 
 ## 当前状态
 
-- **阶段**：**0.2.2 已发布（2026-10-27）**；框架与插件运行时落地，main 组合 E2E（verify / agent / worker / todo / goat）全绿，收尾完成，暂无进行中开发。历史评审修复见 [docs/process/CODE-REVIEW.md](docs/process/CODE-REVIEW.md) 与 [约定与验收明细](docs/process/CONVENTIONS.md)。
+- **阶段**：**0.2.2 已发布（2026-10-27）**；框架与插件运行时落地，main 组合 E2E（verify / agent / worker / todo / goat）全绿。当前在做 0.2.3 前的增量：Agent 桥接第五家 DSH（离线门禁与 e2e 全绿：`verify:agent` 285/0、`verify` 482/0，见 B5 卡）。历史评审修复见 [docs/process/CODE-REVIEW.md](docs/process/CODE-REVIEW.md) 与 [约定与验收明细](docs/process/CONVENTIONS.md)。
 - **已完成**：宠物窗（Petdex 九状态 + 状态机 + 渲染层 + 点击穿透）、Petdex 桌宠资源安装、插件运行时、Rust 能力服务（ble / store / http / notify / 权限同意框 / Agent hook 收件）、设置窗、按插件分开的 overlay 悬浮窗、五个示例插件（心率蓝牙 / Agent 桥 / 待办 / A股盯盘 / GOAT 用量）、v0.2.2 安装包与便携包。
-- **进行中**：无；llm-token-usage 按用户决定暂缓。
+- **进行中**：DSH Agent 桥（第五家）：`integrations/dsh-bridge/` 桥插件 + 宿主 `mode=bridge` 接入形态，见 [ADR-0016](docs/adr/0016-dsh-agent-bridge-is-a-plugin-not-hook-files.md)；待真机验证「DSH 里 `install_bundle` 一次后桌宠联动」。llm-token-usage 按用户决定暂缓。
 - 完整设计见 [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md)；插件 API 见 [docs/plugin-dev/PLUGIN_SDK.md](docs/plugin-dev/PLUGIN_SDK.md)。
 
 ## 技术决策（已确认，勿重新选型）

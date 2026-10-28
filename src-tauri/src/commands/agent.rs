@@ -22,6 +22,7 @@ use tauri::{AppHandle, Manager};
 
 use crate::host_error::{HostError, INTERNAL, NOT_FOUND};
 use crate::services::agent::adapters::{self, AgentAdapter};
+use crate::services::agent::dsh_bridge;
 use crate::services::agent::linkage;
 use crate::services::agent_hooks;
 use crate::services::permission::PermissionState;
@@ -66,12 +67,32 @@ fn exe_path_error(e: std::io::Error) -> HostError {
 fn snapshot(app: &AppHandle) -> Result<Value, HostError> {
     // 按「当前联动的那一家」查，不是写死 Qoder：设置页回显的必须就是用户选中的那个 Agent
     let adapter = linkage::current_adapter(app);
-    let files = adapter.targets(&home_dir(app)?);
+    let home = home_dir(app)?;
+    // 没有文件可装的那家（DSH）：状态来自「桥装没装上」，不是配置里有几条 hook。
+    // 两种「已安装」共用 `installed` 字段，但判据不同，所以连 `mode` 一起回给设置页。
+    if !adapter.installs_files() {
+        let bridge = dsh_bridge::detect(&home, &dsh_bridge::bundle_dir(app)?);
+        return Ok(json!({
+            "exe": exe_path().map(|p| p.display().to_string()).unwrap_or_default(),
+            "mode": "bridge",
+            "bridge": bridge,
+            "installed": bridge.detected,
+            "managed": 0,
+            "expectedPerFile": 0,
+            "files": [],
+            "agent": adapter.id(),
+            "displayName": adapter.display_name(),
+            "hint": adapter.post_install_hint(),
+            "options": adapters::choices(),
+        }));
+    }
+    let files = adapter.targets(&home);
     let reports = agent_hooks::status_reports(adapter, &files);
     let managed: usize = reports.iter().map(|r| r.managed).sum();
     let expected = adapter.events().len();
     Ok(json!({
         "exe": exe_path().map(|p| p.display().to_string()).unwrap_or_default(),
+        "mode": "hook",
         "files": reports,
         "managed": managed,
         // 装了但条数不对（比如换过 exe 路径）时，UI 该提示「需要修复」而不是「已安装」
@@ -81,7 +102,7 @@ fn snapshot(app: &AppHandle) -> Result<Value, HostError> {
         "agent": adapter.id(),
         "displayName": adapter.display_name(),
         "hint": adapter.post_install_hint(),
-        // 四选一的清单（含还没接线的槽位，界面按 wired=false 禁选）
+        // 五选一的清单（含还没接线的槽位，界面按 wired=false 禁选）
         "options": adapters::choices(),
     }))
 }
@@ -131,8 +152,13 @@ pub fn agent_hooks_install(
     plugin_id: Option<String>,
 ) -> Result<Value, HostError> {
     assert_caller(&app, &window, plugin_id.as_deref(), "查询或改动 Agent hook")?;
-    // 「安装」装的是当前选中的那一家（四选一由 agent_linkage_set 负责改这个选择）
+    // 「安装」装的是当前选中的那一家（五选一由 agent_linkage_set 负责改这个选择）
     let adapter = linkage::current_adapter(&app);
+    // 没有文件可装的那家（DSH）：「接入」= 校验桥在不在 + 记下选择。
+    // 这里不能走 install_files —— 装 0 个文件「成功」会让设置页显示已安装、实际毫无作用。
+    if !adapter.installs_files() {
+        return linkage::attach_bridge(&app, adapter, &home_dir(&app)?);
+    }
     let files = required_hook_configs(adapter, &home_dir(&app)?)?;
     let reports = agent_hooks::install_files(
         adapter,

@@ -1652,10 +1652,13 @@ try {
 
     const stZ = (await settings.invoke("agent_hooks_status")).v;
     r.check("状态页按当前那一家报（agent=zcode，每文件 7 条）", ["zcode", 7, 7], [stZ?.agent, stZ?.expectedPerFile, stZ?.managed]);
-    r.check("四选一清单列全四个槽位", ["codex", "qoder", "workbuddy", "zcode"], (stZ?.options ?? []).map((o) => o.id).sort());
+    r.check("五选一清单列全五个槽位", ["codex", "dsh", "qoder", "workbuddy", "zcode"], (stZ?.options ?? []).map((o) => o.id).sort());
     // A02 时这里是「codex/workbuddy 标 wired=false」。A03 把两家接上线之后事实变了，
-    // 判据跟着变严而不是删掉：四家全 true，且清单仍由宿主的 options 给（界面不自己养名单）。
-    r.check("四家都已接线（不再有禁选槽位）", [true, true, true, true], (stZ?.options ?? []).map((o) => o.wired).sort());
+    // 判据跟着变严而不是删掉：五家全 true，且清单仍由宿主的 options 给（界面不自己养名单）。
+    // 第五家 dsh 是 bridge 形态（没有 hook 文件可装），它的 hint 必须指路到桥插件的 install_bundle。
+    r.check("五家都已接线（不再有禁选槽位）", [true, true, true, true, true], (stZ?.options ?? []).map((o) => o.wired).sort());
+    const dshOption = (stZ?.options ?? []).find((o) => o.id === "dsh");
+    r.check("dsh 的选项指路到桥插件的 install_bundle", true, /install_bundle/.test(String(dshOption?.hint)));
     r.check("装完提示由适配器给（新开会话才生效）", true, /新开/.test(String(stZ?.hint)));
 
     // 来源过滤在真实切换之后仍只对当前那一家放行：注入 qoder 事件不该动桌宠，zcode 事件该动

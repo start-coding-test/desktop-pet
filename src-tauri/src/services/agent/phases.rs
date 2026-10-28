@@ -49,7 +49,10 @@ pub const PHASES: &[&str] = &[
 
 /// `--agent` 允许的取值 = 已注册的适配器 id。缺省按 `qoder`：
 /// PR-1 及更早装好的 hook 条目不带这个参数，重装之前它们都来自 Qoder。
-pub const AGENT_IDS: &[&str] = &["qoder", "zcode", "codex", "workbuddy"];
+///
+/// `dsh` 是第五个：它没有 hook 条目（桥是 DSH 侧插件），这个取值来自桥写的收件行
+/// （`integrations/dsh-bridge/mapping.js` 的 `agent: "dsh"`），来源过滤靠它区分两边。
+pub const AGENT_IDS: &[&str] = &["qoder", "zcode", "codex", "workbuddy", "dsh"];
 
 pub const DEFAULT_AGENT: &str = "qoder";
 
@@ -180,9 +183,17 @@ mod tests {
     #[test]
     fn unknown_agent_is_rejected_not_silently_qoder() {
         assert_eq!(
-            parse(&["x", "--pet-hook", "pre", "--agent", "dsh"]),
+            parse(&["x", "--pet-hook", "pre", "--agent", "cursor"]),
             HookArgs::Rejected("未知 agent"),
-            "PR-3 之前的 dsh 只能算未知值：悄悄按 qoder 处理会让来源过滤失效"
+            "不认识的值只能算未知：悄悄按 qoder 处理会让来源过滤失效"
+        );
+        // dsh 现在是已知值（桥写的收件行带 `agent: "dsh"`），不能再拿它当反例
+        assert_eq!(
+            parse(&["x", "--pet-hook", "pre", "--agent", "dsh"]),
+            HookArgs::Event(HookCommand {
+                phase: "pre",
+                agent: "dsh"
+            })
         );
         assert_eq!(
             parse(&["x", "--pet-hook", "pre", "--agent"]),

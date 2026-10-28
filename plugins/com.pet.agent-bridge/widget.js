@@ -1,6 +1,8 @@
 // 状态显示的两个区（A9b 之后没有第三区了）：
 //   badge   = 宠物旁的一行小字
-//   settings= 设置窗里的 Agent 四选一与 hook 装卸（ctx.host 只注入给这个区）
+//   settings= 设置窗里的 Agent 五选一与接入/断开（ctx.host 只注入给这个区）
+// 「接入」有两种形态，由宿主 status() 的 `mode` 区分：hook（往配置文件装条目）与
+// bridge（DSH：桥是 DSH 侧插件，宠物这边没有文件可装，只校验装没装）。
 // 会话状态的「桌面可见」那一层已经交给本体气泡的常驻行（`ctx.pet.setStatus`，宿主侧是 B3）：
 // 头顶那张 overlay 大卡删了，插件也不再申请 overlay 能力。
 // 所有数据来自 `${PID}:widget` topic，而 topic 里根本没有会话标题与命令摘要 ——
@@ -93,7 +95,7 @@ function mountSettings(root, ctx) {
   // 面板是新建的、会话早就在跑：开口要一次当前值，否则 badge 会显示成默认态
   sendSync();
 
-  // Agent hook 的装/卸与四选一（B2 把宿主那张卡片删掉后，这里就是唯一入口）。
+  // Agent hook 的装/卸与五选一（B2 把宿主那张卡片删掉后，这里就是唯一入口）。
   // 宿主 status() 给的 displayName 顺带交给入口 realm —— 常驻行要显示 Agent 名，
   // 而入口 realm 没有 ctx.host，只有这个区拿得到它，插件里因此不留第二份名字表。
   mountHookPanel(root, ctx, (displayName) => sendSync(displayName));
@@ -122,7 +124,7 @@ function mountHookPanel(root, ctx, reportName) {
   box.className = "hk-box";
   const hd = ctx.dom.createElement("div");
   hd.className = "hk-hd";
-  hd.textContent = "Agent hook 接入（同一时间只联动一个）";
+  hd.textContent = "Agent 接入（同一时间只联动一个）";
   const picker = ctx.dom.createElement("div");
   picker.className = "hk-agents";
   const st = ctx.dom.createElement("div");
@@ -140,14 +142,21 @@ function mountHookPanel(root, ctx, reportName) {
     return;
   }
 
-  // 四选一的清单来自宿主的 status().options（含还没接线的槽位），界面自己不养一份名单 ——
+  // 五选一的清单来自宿主的 status().options（含还没接线的槽位），界面自己不养一份名单 ——
   // 名单与注册表漂移的表现是「点了一个宿主不认识的 Agent」，那比少一个按钮难查得多。
   let options = [];
   let current = "";
+  // 当前这家的接入形态（宿主给）：hook = 配置文件装条目，bridge = DSH 的插件桥。
+  /** @type {"hook" | "bridge"} */
+  let currentMode = "hook";
   // 上一次 set/install 带回的提示与自检结果；跟着 render 走，避免刷新一次就丢
   let lastHint = null;
   let lastCheck = null;
   let pendingSwitch = null;
+  // 动作区的两个文案随形态变（hook：安装/卸载；bridge：接入/断开）。
+  // 按钮节点在下面才建，这里先占位，避免 render 引用到还没初始化的 const。
+  /** @type {(mode: "hook" | "bridge") => void} */
+  let paintActions = () => {};
 
   // 只用这份 widget 已经在用的那几种 DOM 动作：createElement / className / dataset /
   // textContent / on / append / replaceChildren(带节点)。零参的 replaceChildren 与
@@ -186,7 +195,22 @@ function mountHookPanel(root, ctx, reportName) {
     // 常驻行的 Agent 名只认宿主给的这一个来源：入口 realm 没有 ctx.host，拿不到 displayName，
     // 插件里再养一份「id → 名字」表迟早和宿主漂移。
     if (name) reportName?.(name);
-    if (files.length === 0) {
+    currentMode = info?.mode === "bridge" ? "bridge" : "hook";
+    const bridge = info?.bridge ?? null;
+    if (currentMode === "bridge") {
+      // DSH 没有配置文本可数，判据换成「桥插件在不在 profile 的 bundles 清单里」
+      if (info?.installed === true) {
+        st.dataset.state = "installed";
+        lines.push(`已接入（${name}）：桥插件挂在 ${Number(bridge?.profiles) || 0} 个 profile 上。`);
+      } else {
+        st.dataset.state = "absent";
+        lines.push(`未接入（${name}）：它没有 hook 文件可装，桥是 DSH 侧的插件。`);
+      }
+      if (bridge?.bundleDir) lines.push(`桥目录：${bridge.bundleDir}`);
+      if (bridge?.dshHome) lines.push(`DSH 数据目录：${bridge.dshHome}`);
+      if (info?.installed !== true)
+        lines.push("安装方法：在 DSH 里让它调用 plugin_manager（action=install_bundle），target 填上面的桥目录。");
+    } else if (files.length === 0) {
       st.dataset.state = "absent";
       lines.push(`未安装：没找到 ${name} 的配置目录。`);
     } else if (info.installed === true) {
@@ -200,13 +224,15 @@ function mountHookPanel(root, ctx, reportName) {
       lines.push(`${name}：未安装。`);
     }
     for (const f of files) lines.push(`· ${f.path} — ${f.error ? `失败：${f.error}` : `${f.managed} 条`}`);
-    if (info.exe) lines.push(`hook 命令指向 ${info.exe}`);
+    // 「hook 命令指向 …」只对文件形态有意义：桥形态下这些条目根本不存在
+    if (currentMode !== "bridge" && info.exe) lines.push(`hook 命令指向 ${info.exe}`);
     if (lastHint) lines.push(`生效条件：${lastHint}`);
     if (lastCheck) lines.push(lastCheck);
     // 面板文本先落地，四选一后画：清单万一为空或形状不对，也不该把状态回显一起冻住
     st.textContent = lines.join("\n");
     st.classList.toggle("warn", st.dataset.state === "repair");
     st.classList.toggle("bad", Boolean(lastCheck) && lastCheck.startsWith("自检"));
+    paintActions(currentMode);
     paintPicker();
   };
 
@@ -306,11 +332,19 @@ function mountHookPanel(root, ctx, reportName) {
     b.on("click", () => void fn());
     return b;
   };
-  actions.append(
-    button("安装", "hk-install", () => run("安装", () => api.install())),
-    button("卸载", "hk-uninstall", () => run("卸载", () => api.uninstall())),
-    button("刷新", "hk-refresh", () => refresh()),
-  );
+  // 两种接入形态的动作是同一对按钮，只是叫法不同：DSH 没有「安装文件」这回事
+  const words = () =>
+    currentMode === "bridge"
+      ? { install: "接入", uninstall: "断开" }
+      : { install: "安装", uninstall: "卸载" };
+  const installBtn = button("安装", "hk-install", () => run(words().install, () => api.install()));
+  const uninstallBtn = button("卸载", "hk-uninstall", () => run(words().uninstall, () => api.uninstall()));
+  actions.append(installBtn, uninstallBtn, button("刷新", "hk-refresh", () => refresh()));
+  paintActions = (mode) => {
+    installBtn.textContent = mode === "bridge" ? "接入" : "安装";
+    uninstallBtn.textContent = mode === "bridge" ? "断开" : "卸载";
+  };
+  paintActions(currentMode);
 
   // 挂载即拉回显：不先渲染模板默认值、也不缓存自己算的数（PLUGIN_SDK §5 第 3 条）
   void refresh();

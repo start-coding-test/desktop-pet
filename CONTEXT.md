@@ -9,12 +9,16 @@
   声明 `agent:hooks`」，不写死插件 id；插件自己不再维持这个状态（它的 `deactivate()` 在崩溃、
   被强杀或卸载时不一定跑得到）。同一时刻**只有一个 Agent 处于联动中**（硬约束，不是偏好）。
 - **Agent 适配器（adapter）** —— 宿主侧一个 Agent 的接入定义：配置目录与文件名、事件名集合、
-  写入的 hook 条目形状、状态词表映射。`qoder` 是唯一已实测的适配器；`zcode` / `codex` / `dsh`
-  是**槽位**（注册表里有 id，但实测前不许接线）。
+  写入的 hook 条目形状、状态词表映射。已接线五家：`qoder` / `zcode` / `codex` / `workbuddy` 写
+  hook 文件；`dsh` 没有 hook 文件可装（`installs_files()` 返回 false），走**桥**形态。
 - **hook 条目（hook entry）** —— 写进 Agent 自己配置文件里、指向本程序 `--pet-hook <phase>` 的那一段。
   只按 `--pet-hook` 标记识别，**只删我们自己写的行**，绝不整段覆盖别人的配置。
-- **收件目录（inbox）** —— `<app_data>/agent/inbox/<phase>.jsonl`。hook 进程落一行就退出，
-  宿主 watcher 增量消费并归一化成会话状态。事件里没有来源标识，因为设计上只有一个来源。
+- **桥（bridge）** —— 没有 hook 文件的 Agent 的另一种投递形态：由跑在对方进程里的插件（DSH 的
+  `integrations/dsh-bridge/` cordis 插件）把事件写成同样的收件行，宿主只负责检测桥装没装、记录选择、
+  摘旧 hook，**不代装**（对方只认自己的 `plugin_manager install_bundle`，见 [ADR-0016](docs/adr/0016-dsh-agent-bridge-is-a-plugin-not-hook-files.md)）。
+- **收件目录（inbox）** —— `<app_data>/agent/inbox/<phase>.jsonl`。投递方（hook 进程或桥）落一行就退出，
+  宿主 watcher 增量消费并归一化成会话状态。每行带 `agent`，watcher 只上报与当前联动来源一致的行
+  （`dsh` 必须同时出现在 `AGENT_IDS` 里，否则整条链路静默丢弃）。
 
 ## 生命周期（四个不同的动作，别混用）
 
@@ -27,6 +31,9 @@
   「要不要装」的意图由上面那份显式选择决定：**停用或删插件会摘掉 hook，重新启用则按记录自动装回来**
   （前提是该能力已在同意框里同意过）；应用启动只摘残余、**绝不重装**（用户可能就是在 Agent 那边
   故意删掉的，每次开机把他刚做的事恢复回去是跟用户较劲）。
+- **接入 / 断开（attach / detach）** —— 桥形态对应的两个动作（设置页按钮文案也用这两个词）：
+  接入 = 检测桥已装 + 记下显式选择；断开 = 摘掉旧 hook + 把选择清成 `null`。**不改对方的 profile**，
+  装桥永远是对方应用里的一次性手动动作。
 - **撤销授权（revoke）** —— 撤掉插件的全部能力，并弹一次确认：默认连带卸载 hook，用户可选只撤能力。
 
 ## 显示

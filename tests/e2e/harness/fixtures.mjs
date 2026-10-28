@@ -341,20 +341,26 @@ export function cleanAgentTempState({ tempRoot, configFiles, agentHome }) {
 }
 
 // ==== Agent 隔离 env 的统一口径（Bug1）====
-// 四家适配器的候选文件全从 env 解析，而变量不止一个：Qoder 认 `PET_AGENT_CONFIG_FILES`、
+// 写文件的四家适配器候选文件全从 env 解析，而变量不止一个：Qoder 认 `PET_AGENT_CONFIG_FILES`、
 // Codex 认 `PET_AGENT_CODEX_FILES`、WorkBuddy 认 `PET_AGENT_WORKBUDDY_FILES`，ZCode 只认
 // `PET_AGENT_HOME`（zcode.rs:140-153，它没有逐文件变量）。逐文件变量缺省时也退到
 // `PET_AGENT_HOME` 整体换根，两者都没有才用真实 home（claude_style.rs:170-191）。
 // 所以「只设 PET_AGENT_CONFIG_FILES」只隔离了一家：凡是起一个会改配置的子进程
-//（`--pet-hook-cleanup` → `uninstall_everywhere` 扫 `adapters::wired()` 四家），
+//（`--pet-hook-cleanup` → `uninstall_everywhere` 扫 `adapters::wired()`），
 // 都会顺着真实 home 去探测并摘掉另外三家用户自己的条目。
 // 各套件不要再各拼一份 env —— 拼漏一个就是事故。
+//
+// DSH 是第五家但不在「跨 home 改写」这条风险里：它 `installs_files() == false`，
+// 没有 hook 配置文件，卸载路径也不会碰真实 home（桥是 DSH 侧插件，见 integrations/dsh-bridge）。
+// 它仍然进表（好让「JS 表 = Rust WIRED」的跨语言判据继续满员），但 `realHomeFiles` 为空、
+// `filesEnv` 为 null，隔离缺口判定会跳过它。
 
 /** 与 `adapters::WIRED` 一一对应。`filesEnv` 为 null = 这家没有逐文件变量，只能靠换根隔离。
  * `realHomeFiles` 是它在**真实 home** 下的候选文件（相对 home，正斜杠）——
  * 抄自 `claude_style.rs:271-274`（Qoder 两个目录 / settings.json）、`zcode.rs:42-44`
  * 与 `:140-153`、`codex.rs:41-47`、`workbuddy.rs:38-43`。适配器改了落点就要跟着改这里，
- * 判据靠它钉住「没隔离的子进程到底会改写哪些用户文件」。 */
+ * 判据靠它钉住「没隔离的子进程到底会改写哪些用户文件」。
+ * `realHomeFiles` 为空 = 这家没有可改写的配置文件（DSH），隔离缺口判定跳过。 */
 export const AGENT_ISOLATION_ADAPTERS = [
   {
     id: "qoder",
@@ -364,6 +370,8 @@ export const AGENT_ISOLATION_ADAPTERS = [
   { id: "zcode", filesEnv: null, realHomeFiles: [".zcode/cli/config.json", ".zcode/cli/setting.json"] },
   { id: "codex", filesEnv: "PET_AGENT_CODEX_FILES", realHomeFiles: [".codex/hooks.json"] },
   { id: "workbuddy", filesEnv: "PET_AGENT_WORKBUDDY_FILES", realHomeFiles: [".workbuddy/settings.json"] },
+  // 桥插件路线：没有 hook 文件可装，卸载也不碰 home（dsh.rs 的 installs_files() 返回 false）
+  { id: "dsh", filesEnv: null, realHomeFiles: [] },
 ];
 
 /** 会随子进程一起带过去的隔离变量全集。收件目录也算：不设的话本机全局 hook 的真实会话
@@ -392,19 +400,20 @@ export function agentIsolationEnv(source = {}) {
 
 /**
  * 给定 env 下**仍会退到真实 home** 的适配器 id 列表；返回空数组才允许起一个会改
- * agent 配置的子进程。`PET_AGENT_HOME` 指到真实 home 本身与没设是同一件事（四家的
+ * agent 配置的子进程。`PET_AGENT_HOME` 指到真实 home 本身与没设是同一件事（写文件那几家的
  * 目录都建在它下面），所以那种值按未隔离判 —— 与 verify-release.mjs 的 `isHomeRoot` 同口径。
+ * 没有 `realHomeFiles` 的适配器（DSH）不参与：它没有可改写的文件，天然不构成跨 home 风险。
  */
 export function unisolatedAgentAdapters(source = {}, realHome = "") {
   const root = source.PET_AGENT_HOME;
   const rootIsolated =
     !isBlankEnv(root) && (isBlankEnv(realHome) ? true : resolve(root) !== resolve(realHome));
-  return AGENT_ISOLATION_ADAPTERS.filter((a) => !(rootIsolated || !isBlankEnv(source[a.filesEnv]))).map(
-    (a) => a.id,
-  );
+  return AGENT_ISOLATION_ADAPTERS.filter(
+    (a) => a.realHomeFiles.length > 0 && !(rootIsolated || !isBlankEnv(source[a.filesEnv])),
+  ).map((a) => a.id);
 }
 
-/** 真实 home 下四家的候选文件（绝对路径）。文件在不在由调用方判，这里只拼路径 ——
+/** 真实 home 下会写文件的几家的候选文件（绝对路径）。文件在不在由调用方判，这里只拼路径 ——
  * 一个都没有也是合法结果（那台机器没装这些客户端）。 */
 export function realHomeAgentFiles(realHome) {
   return AGENT_ISOLATION_ADAPTERS.flatMap((a) => a.realHomeFiles.map((rel) => join(realHome, ...rel.split("/"))));

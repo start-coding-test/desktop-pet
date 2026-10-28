@@ -10,6 +10,7 @@
 
 pub mod adapters;
 pub mod backups;
+pub mod dsh_bridge;
 pub mod inbox;
 pub mod linkage;
 pub mod phases;
