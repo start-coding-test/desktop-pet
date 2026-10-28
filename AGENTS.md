@@ -4,9 +4,9 @@
 
 ## 当前状态
 
-- **阶段**：**0.2.2 已发布（2026-10-27）**；0.2.3 增量包已出（2026-10-28，Agent 桥接第五家 DSH），发版口径按实况记：两笔提交（`7448b3f` / `02e5102`）**直接推了 main**，0.2.3 安装包在 CI 之前就打好了；**E2E 只在本地跑过**（`verify:agent` 298/0、`verify` 482/0，离线门 `npm run unit` 2037/0、`cargo test` 384/0，见 B5 卡），E2E 门（`.github/workflows/e2e.yml`，`workflow_dispatch`）那一轮没有触发、**CI 侧未见绿**，main 分支保护也未开启 —— 四步发版前置与开启命令见 [约定与验收明细](docs/process/CONVENTIONS.md)「发版前置」。历史评审修复见 [docs/process/CODE-REVIEW.md](docs/process/CODE-REVIEW.md)。
-- **已完成**：宠物窗（Petdex 九状态 + 状态机 + 渲染层 + 点击穿透）、Petdex 桌宠资源安装、插件运行时、Rust 能力服务（ble / store / http / notify / 权限同意框 / Agent hook 收件）、设置窗、按插件分开的 overlay 悬浮窗、五个示例插件（心率蓝牙 / Agent 桥 / 待办 / A股盯盘 / GOAT 用量）、v0.2.2 安装包与便携包、v0.2.3 增量安装包与便携包。
-- **进行中**：DSH Agent 桥（第五家）：`integrations/dsh-bridge/` 桥插件 + 宿主 `mode=bridge` 接入形态，见 [ADR-0016](docs/adr/0016-dsh-agent-bridge-is-a-plugin-not-hook-files.md)；待真机验证「DSH 里 `install_bundle` 一次后桌宠联动」，0.2.3 也还没过 E2E 门（见「阶段」）。llm-token-usage 按用户决定暂缓。
+- **阶段**：**0.2.2 已发布（2026-10-27）**；0.2.4 增量包已出（2026-10-28，Agent 桥接第五家 DSH + 修复轮），发版口径按实况记：提交**直接推了 main**（`7448b3f` / `02e5102` / `4df82f9`），安装包在 CI 之前就打好了；0.2.3 的安装器内嵌的是收件目录修复前的桥，已作废、由 0.2.4 取代；**E2E 只在本地跑过**（`verify:agent` 298/0、`verify` 482/0，离线门 `npm run unit` 2037/0、`cargo test` 384/0，见 B5 卡），E2E 门（`.github/workflows/e2e.yml`，`workflow_dispatch`）那一轮没有触发、**CI 侧未见绿**，main 分支保护也未开启 —— 四步发版前置与开启命令见 [约定与验收明细](docs/process/CONVENTIONS.md)「发版前置」。历史评审修复见 [docs/process/CODE-REVIEW.md](docs/process/CODE-REVIEW.md)。
+- **已完成**：宠物窗（Petdex 九状态 + 状态机 + 渲染层 + 点击穿透）、Petdex 桌宠资源安装、插件运行时、Rust 能力服务（ble / store / http / notify / 权限同意框 / Agent hook 收件）、设置窗、按插件分开的 overlay 悬浮窗、五个示例插件（心率蓝牙 / Agent 桥 / 待办 / A股盯盘 / GOAT 用量）、v0.2.2 安装包与便携包、v0.2.3 增量安装包与便携包（0.2.3 安装器作废）、v0.2.4 修复轮安装包与便携包。
+- **进行中**：DSH Agent 桥（第五家）：`integrations/dsh-bridge/` 桥插件 + 宿主 `mode=bridge` 接入形态，见 [ADR-0016](docs/adr/0016-dsh-agent-bridge-is-a-plugin-not-hook-files.md)；待真机验证「DSH 里 `install_bundle` 一次后桌宠联动」，0.2.4 也还没过 E2E 门（见「阶段」）。llm-token-usage 按用户决定暂缓。
 - 完整设计见 [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md)；插件 API 见 [docs/plugin-dev/PLUGIN_SDK.md](docs/plugin-dev/PLUGIN_SDK.md)。
 
 ## 技术决策（已确认，勿重新选型）
