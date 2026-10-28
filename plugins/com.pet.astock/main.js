@@ -38,6 +38,9 @@ export const DEFAULT_CONFIG = {
   showIndex: true,
   indexSecid: "1.000001",
   mode: "badge", // badge | overlay | off
+  // 后备数据源开关（G5-08）：关掉后只请求东财主源与各自主入口，
+  // 腾讯/新浪（以及腾讯的 web.ifzq / ifzq 后备入口）一次都不碰 —— 免得中途弹出陌生域名的授权框。
+  allowFallback: true,
   // 盯盘卡位置（逻辑像素，插件自己存；ADR-0010 决策 4）。缺省故意非对称：
   // 对称坐标抓不到 x/y 对调的接线错（宿主那轮变异抽查全套件全绿就是这么漏的）
   cardX: 420,
@@ -139,6 +142,8 @@ function restoreConfig(saved) {
     ...restore("config", saved, config),
     cardX: coordOf(s.cardX) ?? DEFAULT_CONFIG.cardX,
     cardY: coordOf(s.cardY) ?? DEFAULT_CONFIG.cardY,
+    // 后备源开关：存储里只有显式 false 才算关（老版本没有这个字段 → 保持开，行为不变）
+    allowFallback: s.allowFallback !== false,
   };
 }
 
@@ -216,6 +221,7 @@ async function handleCmd(cmd) {
         config.indexSecid = c.indexSecid;
       }
       if (c.mode === "badge" || c.mode === "overlay" || c.mode === "off") config.mode = c.mode;
+      if (c.allowFallback !== undefined) config.allowFallback = c.allowFallback === true;
       if (c.cardX !== undefined) {
         const n = coordOf(c.cardX);
         if (n !== null) config.cardX = n;

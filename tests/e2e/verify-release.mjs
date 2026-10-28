@@ -9,7 +9,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { argv, env } from "node:process";
 
 import { attach, createReport, hostInvoke, listPages, openSettingsInvoker, readEnabledIds, reloadAndWait, waitUntil, writeEnabledIds } from "./harness/cdp.mjs";
-import { NET_ID, PROBE_ID, removeFixtures, writeFixtures } from "./harness/fixtures.mjs";
+import { NET_ID, PROBE_ID, restorePluginsDir, writeFixtures } from "./harness/fixtures.mjs";
 import { WIDGET_HOST_REALM_FLAG, waitWidgetRealm } from "./harness/widget-realm.mjs";
 
 // ==== A20-PURE-BEGIN ====
@@ -440,7 +440,9 @@ try {
       { stdio: "ignore", shell: false },
     );
   }
-  removeFixtures(PLUGINS_DIR);
+  // 收尾口径：plugins/ 只剩真实插件（tsconfig.plugins.json 会 typecheck plugins/**，
+  // 残留的 zz.* 探针会让 npm run build 报 TS2339）。
+  restorePluginsDir(PLUGINS_DIR);
   rmSync(L1_DIR, { recursive: true, force: true });
   // C7：Windows 上 app 刚被 kill，隔离根里的文件可能还被占用。这里放最后、包 try/catch（带 maxRetries）：
   // 抛错既不能跳过上面的收口，也不能改变退出码 —— 收不掉就只留一个临时目录，比弄脏判定便宜。

@@ -128,11 +128,14 @@ fn heart_rate_requires_both_characteristic_and_service() {
     assert!(device_lacks_heart_rate(false, false), "两者都没有 → 拒");
 }
 
-/// A04：BLE 五条命令的门禁链 —— 非法 id 的码是 invalid-arg，与「没授权」的 denied 分开
+/// A04：BLE 五条命令的门禁链 —— 非法 id 的码是 invalid-arg，与「没授权」的 denied 分开。
+/// G3-01 之后 `require_granted` 收调用窗（归属判定需要 Window），单测直接钉它包住的
+/// 那把门禁 `plugin_capability_for`（能力表判定与窗口无关的部分）。
 #[test]
 fn require_granted_rejects_unsafe_id_with_invalid_arg() {
     let perms = PermissionState::new();
-    let err = require_granted(&perms, "../evil", crate::plugin_caps::BLE_SCAN).unwrap_err();
+    let err = crate::gate::plugin_capability_for(&perms, "../evil", crate::plugin_caps::BLE_SCAN)
+        .unwrap_err();
     assert_eq!(err.code, INVALID_ARG, "非法 id 不能混进 denied");
     assert_eq!(err.message, "invalid plugin id");
 }
@@ -141,23 +144,31 @@ fn require_granted_rejects_unsafe_id_with_invalid_arg() {
 #[test]
 fn require_granted_rejects_ungranted_scan_with_denied() {
     let perms = PermissionState::new();
-    let err = require_granted(&perms, "zz.probe", crate::plugin_caps::BLE_SCAN).unwrap_err();
+    let err = crate::gate::plugin_capability_for(&perms, "zz.probe", crate::plugin_caps::BLE_SCAN)
+        .unwrap_err();
     assert_eq!(err.code, DENIED);
     assert!(err.message.starts_with("未授权 ble:scan"), "实际: {err}");
     perms.grant("zz.probe", &["ble:scan".to_string()]);
-    assert!(require_granted(&perms, "zz.probe", crate::plugin_caps::BLE_SCAN).is_ok());
+    assert!(
+        crate::gate::plugin_capability_for(&perms, "zz.probe", crate::plugin_caps::BLE_SCAN)
+            .is_ok()
+    );
 }
 
 /// A04：没授权 = denied（connect 面：connect / disconnect / connected_device 的门禁走这一条）
 #[test]
 fn require_granted_rejects_ungranted_connect_with_denied() {
     let perms = PermissionState::new();
-    let err = require_granted(&perms, "zz.probe", crate::plugin_caps::BLE_CONNECT).unwrap_err();
+    let err =
+        crate::gate::plugin_capability_for(&perms, "zz.probe", crate::plugin_caps::BLE_CONNECT)
+            .unwrap_err();
     assert_eq!(err.code, DENIED);
     // 逐项校验：只授权 scan 不连带 connect（同插件也不行）
     let perms2 = PermissionState::new();
     perms2.grant("zz.probe", &["ble:scan".to_string()]);
-    let err2 = require_granted(&perms2, "zz.probe", crate::plugin_caps::BLE_CONNECT).unwrap_err();
+    let err2 =
+        crate::gate::plugin_capability_for(&perms2, "zz.probe", crate::plugin_caps::BLE_CONNECT)
+            .unwrap_err();
     assert_eq!(err2.code, DENIED);
 }
 

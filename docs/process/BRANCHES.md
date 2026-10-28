@@ -99,3 +99,43 @@ git push origin 29f947441d:refs/heads/feat/b04-b3-random-line-det
 
 - `v0.2.3` → `02e5102`（DSH Agent 桥，第五家）
 - `v0.2.4` → `b6d98cd`（DSH 桥收件目录修复与五处验收缺口，B5 修复轮）
+
+## 七、`main` 分支保护命令（G1-04；**需仓库管理员执行**）
+
+发版步骤、每版勾选项与 0.2.x release notes 见 [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md) 与
+[RELEASE-NOTES-0.2.x.md](RELEASE-NOTES-0.2.x.md)。本节命令**本轮未执行**（本机无 `gh` / token）。
+
+这一节替换 [约定与验收明细](CONVENTIONS.md)「发版前置 §2」里那组 `gh api -X PUT … -F …` 命令。原来的写法有三处会出事，照抄只会锁死仓库或直接 422：
+
+1. `-F 'restrictions='` 传的是**空字符串**，不是 JSON 的 `null`；`restrictions` 只接受对象或 null，空串大概率 422。正确形态是 body 里写 `"restrictions": null`。
+2. `required_approving_review_count=1` 再叠 `enforce_admins=true`：本仓库单人维护，自己开的 PR 没人批，开完就没人能合并。只保留「必须走 PR」，审批数设 **0**。
+3. 分支保护是嵌套 body，`-F` 拼出来的混合形态不可靠；要用 `--input` 整段 JSON，字段名和形状照 REST API 文档。
+
+**这一节需要仓库管理员执行**：本机没有 `gh`、也没有仓库 token，本轮只把命令修正到可跑形态，保护**仍是关闭状态**。`<owner>/<repo>` 即 `start-coding-test/desktop-pet`，替换后执行：
+
+```bash
+# 1) body 落盘（restrictions 只能是 JSON null，别写成 -F 'restrictions='）
+cat > protection.json <<'JSON'
+{
+  "required_status_checks": { "strict": true, "contexts": ["windows"] },
+  "enforce_admins": true,
+  "required_pull_request_reviews": { "required_approving_review_count": 0 },
+  "restrictions": null,
+  "allow_force_pushes": false,
+  "allow_deletions": false
+}
+JSON
+
+# 2) 先在临时分支上试 body 能不能过（422 都在这一步暴露，别拿 main 试；临时分支用完就删）
+git push origin HEAD:refs/heads/test/protection-probe
+gh api --method PUT repos/<owner>/<repo>/branches/test/protection-probe/protection --input protection.json
+
+# 3) 通过后对 main 应用
+gh api --method PUT repos/<owner>/<repo>/branches/main/protection --input protection.json
+
+# 4) 回读核对：contexts 含 windows、required_approving_review_count=0、enforce_admins.enabled=true、
+#    restrictions=null、allow_force_pushes.enabled=false、allow_deletions.enabled=false
+gh api repos/<owner>/<repo>/branches/main/protection
+```
+
+判据（开完当天就该成立）：直推 `main` 被拒（必须走 PR）；CI 的 `windows` job 没跑完时 PR 不能合并；管理员也绕不过（`enforce_admins=true`）。`windows` 是 `.github/workflows/ci.yml` 的 job 名，job 改名要同步改 `contexts`。验收记录写进 [本体任务卡](HOST-BACKLOG.md) 的 B5 行，别只在口头说「开了」。

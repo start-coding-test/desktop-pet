@@ -868,7 +868,8 @@ group("store-schema");
     "cost_period",
     sanitizeConfig({ badgeMode: "cost_period" }).badgeMode,
   );
-  check("BADGE_MODES 不再含 cost_today", true, !BADGE_MODES.includes("cost_today"));
+  // A3：判定必须在第二参上（第三参只是失败消息）；塞回 cost_today 时这条必须红。
+  check("BADGE_MODES 不再含 cost_today", !BADGE_MODES.includes("cost_today"), `BADGE_MODES=${JSON.stringify(BADGE_MODES)}`);
 }
 
 {
@@ -1907,4 +1908,73 @@ function c10MountOverlay() {
     "C10 overlay 卡内容高度 <= 168-20",
     overlayContentHeight() <= OVERLAY_LAYOUT.height - OVERLAY_LAYOUT.paddingY * 2,
   );
+}
+
+/* ===================== G5-02 / G5-05 / G5-06 的纯决策 ===================== */
+const { currencyPatch, ratePatch } = await import(
+  new URL("../../plugins/com.pet.goat-gauge/views/settings/apply.js", import.meta.url)
+);
+const { internalFetchGate } = await import(
+  new URL("../../plugins/com.pet.goat-gauge/guards.js", import.meta.url)
+);
+const { splitView } = await import(
+  new URL("../../plugins/com.pet.goat-gauge/view-split.js", import.meta.url)
+);
+const goatMainSrc = readFileSync(new URL("../../plugins/com.pet.goat-gauge/main.js", import.meta.url), "utf8");
+
+group("goat 汇率校验与币种补丁（G5-02）");
+{
+  eq("合法汇率按两位小数入库", ratePatch("13.567"), 13.57);
+  eq("整数也吃", ratePatch(7), 7);
+  eq("非数字给 null", ratePatch("abc"), null);
+  eq("空串给 null", ratePatch(""), null);
+  eq("低于下限给 null", ratePatch("0.99"), null);
+  eq("高于上限给 null", ratePatch("20.01"), null);
+  deep("合法时发币种+汇率，并允许放锁", currencyPatch({ rate: "13.5", currency: "CNY" }), {
+    patch: { currency: "CNY", usdToCny: 13.5 },
+    releaseRate: true,
+  });
+  deep("非法时补丁不发、锁不放（用户能接着改）", currencyPatch({ rate: "abc", currency: "CNY" }), {
+    patch: null,
+    releaseRate: false,
+  });
+  eq("未知币种落回 USD", currencyPatch({ rate: 7, currency: "ZZZ" }).patch.currency, "USD");
+}
+
+group("goat /internal 准入守卫（G5-05）");
+{
+  const ctx = { secrets: {} };
+  eq("停用后 ctx 为空：挡住", internalFetchGate({ ctx: null, cookie: "c" }), "no-ctx");
+  eq("ctx 没有 secrets 能力：挡住", internalFetchGate({ ctx: {}, cookie: "c" }), "no-secret");
+  eq("没有 Cookie：挡住", internalFetchGate({ ctx, cookie: "" }), "no-cookie");
+  eq("演示模式：挡住", internalFetchGate({ ctx, cookie: "c", demo: true }), "demo");
+  eq("摘要刷新在飞：挡住", internalFetchGate({ ctx, cookie: "c", busy: true }), "busy");
+  eq("internal 自己还没收尾：挡住", internalFetchGate({ ctx, cookie: "c", internalBusy: true }), "busy");
+  eq("全部通过才放行", internalFetchGate({ ctx, cookie: "c", demo: false, busy: false }), null);
+
+  // 接线不是空转：refreshInternal 在发 /internal 请求之前过守卫，且 internalBusy 在守卫之后才置位
+  const guardAt = goatMainSrc.indexOf("internalFetchGate({ ctx, cookie");
+  const fetchAt = goatMainSrc.indexOf("await fetchInternalUsage(cookie");
+  check("refreshInternal 先过守卫再发请求", guardAt > 0 && fetchAt > guardAt, `${guardAt} -> ${fetchAt}`);
+  check(
+    "守卫之后才置 internalBusy，收尾在 finally 复位",
+    goatMainSrc.indexOf("internalBusy = true;", guardAt) < fetchAt && /finally \{\s*internalBusy = false;/.test(goatMainSrc),
+  );
+}
+
+group("goat :widget 载荷瘦身（G5-06）");
+{
+  const records = Array.from({ length: 300 }, (_, i) => ({ id: i }));
+  const view = { state: "ok", config: { currency: "USD" }, daily: { days: [] }, charts: { a: [] }, records };
+  const slim = splitView(view);
+  check(":widget 不再带 records", !("records" in slim));
+  eq("records 确实是最多 300 条的那个大头", view.records.length, 300);
+  eq(
+    "daily/charts/config 原样保留",
+    [slim.daily === view.daily, slim.charts === view.charts, slim.config === view.config].join(","),
+    "true,true,true",
+  );
+  check("返回新对象，不改入参（:panel 还要用原视图）", slim !== view && view.records === records);
+  check("publishView 走 splitView 再发 :widget", /ctx\.widget\.update\(splitView\(view\)\)/.test(goatMainSrc));
+  check("没有裸发完整视图给 :widget", !/ctx\.widget\.update\(view\)/.test(goatMainSrc));
 }

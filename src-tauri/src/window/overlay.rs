@@ -296,9 +296,14 @@ fn check_id(plugin_id: &str) -> Result<(), HostError> {
 /// S3：悬浮层是插件的脸面，也得按能力放行。以前只有 JS 桥 `ctx.overlay` 上的 gated
 /// 一层在挡，绕过桥的插件可以凭空开一扇置顶透明窗，既不消耗配额也不留授权记录。
 /// 同 realm 的插件冒名他人 id 仍拦不住（见 gate.rs）。
-fn check_grant(perms: &PermissionState, plugin_id: &str) -> Result<(), HostError> {
+/// G3-01：先过窗口归属 —— 悬浮窗只能替自己那个插件开/收悬浮层，别的 id 一律拒。
+fn check_grant(
+    window: &tauri::Window,
+    perms: &PermissionState,
+    plugin_id: &str,
+) -> Result<(), HostError> {
     check_id(plugin_id)?;
-    crate::gate::plugin_capability(perms, plugin_id, crate::plugin_caps::OVERLAY)
+    crate::gate::plugin_capability(window, perms, plugin_id, crate::plugin_caps::OVERLAY)
 }
 
 /// 收掉某插件的悬浮层（移出注册表 + 关窗）。
@@ -366,7 +371,7 @@ pub async fn overlay_show(
 ) -> Result<(), HostError> {
     // app 从调用窗取：平铺 IPC 参数刚好卡在 clippy 的参数上限内，少注入一个就够
     let app = window.app_handle();
-    check_grant(&perms, &plugin_id)?;
+    check_grant(&window, &perms, &plugin_id)?;
     if !caller_may_act_for(window.label(), &plugin_id) {
         return Err(denied(format!(
             "窗口 {} 不能为插件 {plugin_id} 开悬浮层",
@@ -420,7 +425,7 @@ pub async fn overlay_hide(
     window: tauri::Window,
     plugin_id: String,
 ) -> Result<(), HostError> {
-    check_grant(&perms, &plugin_id)?;
+    check_grant(&window, &perms, &plugin_id)?;
     if !caller_may_act_for(window.label(), &plugin_id) {
         return Err(denied(format!(
             "窗口 {} 不能收起插件 {plugin_id} 的悬浮层",
@@ -442,7 +447,7 @@ pub async fn overlay_destroy(
     window: tauri::Window,
     plugin_id: String,
 ) -> Result<(), HostError> {
-    check_grant(&perms, &plugin_id)?;
+    check_grant(&window, &perms, &plugin_id)?;
     if !caller_may_act_for(window.label(), &plugin_id) {
         return Err(denied(format!(
             "窗口 {} 不能销毁插件 {plugin_id} 的悬浮层",

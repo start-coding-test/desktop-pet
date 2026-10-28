@@ -504,6 +504,26 @@ try {
     JSON.stringify(detailsPanelPayload ?? null).includes(TEST_COOKIE) ||
       JSON.stringify(detailsPanelPayload ?? null).includes(TEST_KEY),
   );
+  // G5-06：records（最多 300 条）只走 :panel，不要随每轮 :widget 广播。
+  // 两条一起看才有意义：同一时刻 panel 里带着明细，widget 里没有 —— 不是两边都空。
+  const widgetNoRecords = await c.ev("window.__seen.widget.at(-1) ?? null");
+  const widgetKeys = Object.keys(widgetNoRecords ?? {});
+  r.check(
+    ":widget 载荷不含 records 明细（G5-06）",
+    false,
+    widgetKeys.includes("records"),
+  );
+  r.check(
+    ":widget 仍带 daily/charts（只切明细，不砍概览与趋势）",
+    true,
+    ["daily", "charts"].every((key) => widgetKeys.includes(key)),
+  );
+  r.check(
+    "同轮 panel 带 records、widget 不带（明细只走 :panel）",
+    true,
+    Array.isArray(detailsPanelPayload?.records) && !("records" in (widgetNoRecords ?? {})),
+  );
+
   await send({ action: "saveConfig", config: { refreshSec: 120 } });
   const firstCfg = await pollUntil(async () => {
     const current = await storeGet("config");

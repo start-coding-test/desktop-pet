@@ -1,6 +1,6 @@
 // tools/check-docs.mjs — 文档与磁盘一致性门禁（优化清单第 32 项；卡 R7 交付物）
 //
-// 八条规则（R-A…R-F 口径见 .dispatch/arch-p2/work/T04/check-docs-rules.md（工作区、不入库）与卡 R7 §3；R-G 见卡 R8 §2；R-H 见清单 R4）：
+// 十条规则（R-A…R-F 口径见 .dispatch/arch-p2/work/T04/check-docs-rules.md（工作区、不入库）与卡 R7 §3；R-G 见卡 R8 §2；R-H 见清单 R4；R-I/R-J 见清单 G8-01）：
 //   R-A 正式文档里的 md 相对链接可达（http(s):/mailto:/纯 #片段 除外）
 //   R-B ARCHITECTURE.md §4 树对 src-tauri/src/services/ 的覆盖双向成立
 //   R-C README「目录速览」的 plugins/ 行点名四个插件 id
@@ -349,6 +349,21 @@ const TOP_EXCLUDED = new Map([
   ['.vscode', '编辑器本地配置（.gitignore 整目录覆盖，不入库）'],
 ]);
 
+// R-G 反向面的显式放行名单：e2e 套件运行时写进 plugins/ 的探针插件（tests/e2e/harness/fixtures.mjs），
+// 正常收尾会自行删除，崩溃/被杀时残留。逐个目录名登记（禁止 zz.* 前缀、禁止通配）：前缀放行等于
+// 把以后误建的 plugins/zz.anything 一起放过——那正是 t22 卡面要求不许发生的放水。
+// 名单外的目录（哪怕只差一个字符）照旧走 `磁盘有、§4 树未点名` 判红。
+const E2E_PROBE_PLUGIN_DIRS = new Map([
+  ['zz.probe', 'verify-isolation / verify-release：writeFixtures() 的权限探针'],
+  ['com.zz.spoof', 'verify-isolation / verify-release：目录名与 manifest.id 不一致的剔除探针'],
+  ['zz.net', 'verify-isolation / verify-release：按域名逐个授权的网络探针'],
+  ['zz.consent', 'writePreseedFixtures()：ADR-0013 同意合流探针'],
+  ['zz.hookprobe', 'writePreseedFixtures()：Agent hook 收件探针'],
+  ['zz.hookundeclared', 'writePreseedFixtures()：未声明 agent.hooks 权限的探针'],
+  ['zz.status', 'writePreseedFixtures()：状态归一化探针 A'],
+  ['zz.status2', 'writePreseedFixtures()：状态归一化探针 B'],
+]);
+
 function ruleG() {
   try {
     const treePaths = parseArchTree();
@@ -408,7 +423,16 @@ function ruleG() {
         .sort();
       for (const m of members) need(`src-tauri/src/${sub}/${m}`, `${sub} 成员`);
     }
-    for (const d of dirNames('plugins')) need(`plugins/${d}`, '插件 id');
+    // e2e 探针目录：按 E2E_PROBE_PLUGIN_DIRS 的**名字精确匹配**跳过（不做前缀匹配），
+    // 名单外的目录照旧判红，见名单定义的注释。
+    let probes = 0;
+    for (const d of dirNames('plugins')) {
+      if (E2E_PROBE_PLUGIN_DIRS.has(d.replace(/\/+$/, ''))) {
+        probes += 1;
+        continue;
+      }
+      need(`plugins/${d}`, '插件 id');
+    }
     for (const d of dirNames('integrations')) need(`integrations/${d}`, '外部集成 id');
     for (const d of dirNames('packages')) need(`packages/${d}`, 'packages 子目录');
     for (const d of dirNames('tests')) need(`tests/${d}`, 'tests 子目录');
@@ -418,7 +442,7 @@ function ruleG() {
       name: 'R-G',
       ok: failures.length === 0,
       failures,
-      detail: `tree=${treePaths.length} checked=${checked} exempted=${exempted} reverse=${reverse} excl=${TOP_EXCLUDED.size} broken=${failures.length}`,
+      detail: `tree=${treePaths.length} checked=${checked} exempted=${exempted} reverse=${reverse} excl=${TOP_EXCLUDED.size} probeSkip=${probes} broken=${failures.length}`,
     };
   } catch (err) {
     return { name: 'R-G', ok: false, failures: [`§4 树解析失败: ${err.message}`], detail: 'parse-error' };
@@ -467,6 +491,90 @@ function ruleH(docs) {
   };
 }
 
+// ---- R-I：正式文档里不许有「本次提交」占位（清单 G8-01）----
+// 提交列只有两种合法写法：真实短哈希，或显式「未提交」（工作树/未入库）。
+// 「本次提交」在下一批人读到时就已过期，属于台账漂移，必须当场拦。
+function ruleI(docs) {
+  const bad = '| B9 | 示例卡 | 回归 | **待排** | — | 本次提交 |';
+  const good = ['| B9 | 示例卡 | 回归 | **待排** | — | `abc1234` |', '| B9 | 示例卡 | 回归 | **待排** | — | 未提交 |'];
+  const hits = (s) => (s.includes('本次提交') ? 1 : 0);
+  if (hits(bad) !== 1 || good.some((g) => hits(g) !== 0)) {
+    return {
+      name: 'R-I',
+      ok: false,
+      failures: ['R-I 自检未通过：正反例判据失效（含占位必须红、真实提交号/未提交必须绿）'],
+      detail: 'selftest-failed',
+    };
+  }
+  const failures = [];
+  let checked = 0;
+  for (const doc of docs) {
+    for (const [i, line] of linesOf(doc).entries()) {
+      if (!line.includes('本次提交')) continue;
+      checked += 1;
+      failures.push(`${doc}:${i + 1} 出现「本次提交」占位（改成真实提交号，或显式写「未提交」）`);
+    }
+  }
+  return { name: 'R-I', ok: failures.length === 0, failures, detail: `checked=${checked} broken=${failures.length}` };
+}
+
+// ---- R-J：HOST-BACKLOG 状态板卡号不许重复（清单 G8-01）----
+// 状态板是「一卡一行」的台账：同一卡号两行会让状态列自相矛盾（2026-10-28 清账前有两行 S3）。
+// 只扫状态板小节，不把卡面正文里的同名引用算进来。
+function boardCardIds(text) {
+  const ids = [];
+  let inBoard = false;
+  for (const line of text.split(/\r?\n/)) {
+    if (/^##\s+/.test(line)) {
+      inBoard = line.includes('状态板');
+      continue;
+    }
+    if (!inBoard) continue;
+    const m = /^\|\s*([A-Z][A-Za-z0-9]*)\s*\|/.exec(line);
+    if (m) ids.push(m[1]);
+  }
+  return ids;
+}
+function duplicateIds(ids) {
+  const seen = new Set();
+  const dup = new Set();
+  for (const id of ids) {
+    if (seen.has(id)) dup.add(id);
+    else seen.add(id);
+  }
+  return [...dup].sort();
+}
+function ruleJ() {
+  const wrap = (rows) => `## 1. 状态板\n\n${rows}\n`;
+  const badRows = [
+    '| S3 | 发布旧版 | 已完成 | — | `abc1234` | — |',
+    '| S3 | Worker 卡 | 已放行 | — | `def5678` | — |',
+  ].join('\n');
+  const goodRows = [
+    '| S3 | 发布旧版 | 已完成 | — | `abc1234` | — |',
+    '| B7 | Worker 卡 | 已放行 | — | `def5678` | — |',
+  ].join('\n');
+  const badDup = duplicateIds(boardCardIds(wrap(badRows)));
+  const goodDup = duplicateIds(boardCardIds(wrap(goodRows)));
+  if (badDup.length !== 1 || badDup[0] !== 'S3' || goodDup.length !== 0) {
+    return {
+      name: 'R-J',
+      ok: false,
+      failures: ['R-J 自检未通过：正反例判据失效（重复卡号必须红、唯一卡号必须绿）'],
+      detail: 'selftest-failed',
+    };
+  }
+  const rel = 'docs/process/HOST-BACKLOG.md';
+  const ids = boardCardIds(read(rel));
+  const dups = duplicateIds(ids);
+  return {
+    name: 'R-J',
+    ok: dups.length === 0,
+    failures: dups.map((id) => `${rel} 状态板卡号重复: ${id}（一卡一行；重号请并入或改号）`),
+    detail: `rows=${ids.length} dups=${dups.length}`,
+  };
+}
+
 // ---- 跑 ----
 function safeRule(name, fn) {
   try {
@@ -486,6 +594,8 @@ const results = [
   safeRule('R-F', () => ruleF()),
   safeRule('R-G', () => ruleG()),
   safeRule('R-H', () => ruleH(docs)),
+  safeRule('R-I', () => ruleI(docs)),
+  safeRule('R-J', () => ruleJ()),
 ];
 const failing = results.filter((r) => !r.ok).length;
 

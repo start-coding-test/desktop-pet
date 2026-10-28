@@ -8,7 +8,6 @@
   "permissions": [
     "bus:publish",
     "bus:subscribe",
-    "storage",
     "widget",
     "pet:react",
     "pet:say",

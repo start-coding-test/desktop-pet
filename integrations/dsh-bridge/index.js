@@ -13,7 +13,7 @@
 // %APPDATA%\com.desktoppet.pet\agent\inbox。与宿主
 // `src-tauri/src/services/agent/inbox.rs::inbox_dir` 的前两级完全一致，第三级是宿主的
 // `app_data_dir_standalone()`（identifier 见 `src-tauri/tauri.conf.json`）。
-import { appendFile, mkdir } from "node:fs/promises";
+import { appendFile, mkdir, stat } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { eventLine, isSubagent, sessionEndLine, sessionStartLine } from "./mapping.js";
 
@@ -22,6 +22,11 @@ export const INBOX_ENV = "PET_AGENT_INBOX";
 
 /** 宿主 `tauri.conf.json` 里的 identifier：改那里就必须改这里，单测钉着。 */
 export const APP_IDENTIFIER = "com.desktoppet.pet";
+
+/** G6-11 写侧上限：一行 32 KiB、每个 phase 文件 8 MiB、每文件最多 256 行在排队。 */
+export const MAX_LINE_BYTES = 32 * 1024;
+export const MAX_FILE_BYTES = 8 * 1024 * 1024;
+export const MAX_PENDING = 256;
 
 // %APPDATA% 本身就是 `C:\Users\<user>\AppData\Roaming`：这里只接 identifier 之后的段，
 // 再写一次 `AppData\Roaming` 就会拼到 `...\Roaming\AppData\Roaming\...`，宿主永远读不到。
@@ -76,7 +81,13 @@ export function apply(ctx, config) {
 
   on("session/event", (session, event) => {
     const id = typeof session?.id === "string" ? session.id : "";
-    if (id === "" || children.has(id)) return;
+    if (id === "") return;
+    // G6-13：桥可能在一轮中途装上 —— 那时子代理的 session/created 已经错过，只靠上面
+    // 那张表会把子代理的每一步当父会话再数一遍。所以每条事件都按它自己的 session 再判一次。
+    if (isSubagent(session) || children.has(id)) {
+      children.add(id);
+      return;
+    }
     emit(eventLine(id, event));
   });
 
@@ -84,7 +95,8 @@ export function apply(ctx, config) {
     const id = typeof session?.id === "string" ? session.id : "";
     // 子代理从头到尾都不进桌宠，收尾也不进：它没有开头的 session-start，
     // 单独发一条 session-end 只会在宿主的会话表里凭空造出一个「刚结束」的会话。
-    if (children.delete(id)) return;
+    // 没登记过的（桥中途装上）同样按 isSubagent 认出来，不能当成父会话收尾。
+    if (children.delete(id) || isSubagent(session)) return;
     emit(sessionEndLine(session));
   });
 
@@ -103,18 +115,22 @@ export function apply(ctx, config) {
 /**
  * 解出收件目录。返回 `{dir}` 或 `{dir: null, source, value}`：后者只用于把
  * 「哪一级配错了」原样写进日志，桥本身不因此抛错。
+ *
+ * `pathApi` 可注入（G7-01）：CI 的 Linux runner 上 `node:path` 的 `isAbsolute` 不认
+ * `C:\...`，单测直接传 Windows 口径的实现 —— 这样断言的是桥自己的顺序与回退，
+ * 而不是宿主平台的路径规则（此前 Windows 夹具在 Linux 上静默全绿，等于没测）。
  */
-export function resolveInbox(config, env = process.env) {
+export function resolveInbox(config, env = process.env, pathApi = { isAbsolute, join }) {
   const candidates = [];
   const configured = typeof config?.inboxDir === "string" ? config.inboxDir.trim() : "";
   if (configured !== "") candidates.push(["config.inboxDir", configured]);
   const fromEnv = (env[INBOX_ENV] ?? "").trim();
   if (fromEnv !== "") candidates.push([INBOX_ENV, fromEnv]);
   const appData = (env.APPDATA ?? "").trim();
-  if (appData !== "") candidates.push(["APPDATA", join(appData, ...APP_DATA_INBOX)]);
+  if (appData !== "") candidates.push(["APPDATA", pathApi.join(appData, ...APP_DATA_INBOX)]);
 
   for (const [source, value] of candidates) {
-    if (isAbsolute(value)) return { dir: value, source, value };
+    if (pathApi.isAbsolute(value)) return { dir: value, source, value };
   }
   const last = candidates.at(-1);
   return { dir: null, source: last?.[0] ?? "（三级都没配）", value: last?.[1] ?? "" };
@@ -123,9 +139,15 @@ export function resolveInbox(config, env = process.env) {
 /**
  * 收件行的落盘队列：每个文件一条 Promise 链，错误吞掉并按种类只报一次
  * （「写不进去」不是一个可以反复刷日志的问题）。
+ *
+ * G6-11 的三道上限都在这一层：桌宠侧没有「拒绝接收」的回执，桥如果无脑追加，
+ * 一次跑飞的事件流就能把磁盘写满；而卸载/断开之后桥仍可能活着（桥住在 DSH 里），
+ * 上限是它最后一道自保。超限只报告一次并丢掉那一条，绝不反过来弄坏会话。
  */
 export function createSink(inbox, report) {
   const chains = new Map();
+  const pending = new Map();
+  const sizes = new Map();
   const reported = new Set();
   let ready = false;
 
@@ -133,6 +155,14 @@ export function createSink(inbox, report) {
     if (ready) return;
     await mkdir(inbox, { recursive: true });
     ready = true;
+  };
+
+  const sizeOf = async (path) => {
+    if (sizes.has(path)) return sizes.get(path);
+    return stat(path).then(
+      (info) => info.size,
+      () => 0,
+    );
   };
 
   const once = (kind, err) => {
@@ -144,13 +174,30 @@ export function createSink(inbox, report) {
   const write = (line) => {
     const path = join(inbox, `${line.phase}.jsonl`);
     const text = `${JSON.stringify(line)}\n`;
+    const bytes = Buffer.byteLength(text, "utf8");
+    if (bytes > MAX_LINE_BYTES) {
+      once("line-limit", new RangeError(`单行 ${bytes} 字节，超过上限 ${MAX_LINE_BYTES}`));
+      return Promise.resolve();
+    }
+    if ((pending.get(path) ?? 0) >= MAX_PENDING) {
+      once("backlog", new Error(`${path} 积压超过 ${MAX_PENDING} 行`));
+      return Promise.resolve();
+    }
     const prev = chains.get(path) ?? Promise.resolve();
+    pending.set(path, (pending.get(path) ?? 0) + 1);
     const next = prev
       .then(async () => {
         await ensureDir();
+        const size = await sizeOf(path);
+        if (size + bytes > MAX_FILE_BYTES) {
+          once("file-limit", new Error(`${path} 已到 ${MAX_FILE_BYTES} 字节上限`));
+          return;
+        }
+        sizes.set(path, size + bytes);
         await appendFile(path, text, "utf8");
       })
-      .catch((err) => once(err?.code ?? "unknown", err));
+      .catch((err) => once(err?.code ?? "unknown", err))
+      .finally(() => pending.set(path, Math.max(0, (pending.get(path) ?? 1) - 1)));
     chains.set(path, next);
     return next;
   };

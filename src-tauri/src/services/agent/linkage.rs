@@ -199,19 +199,55 @@ pub fn recorded_switches(app_data: &Path) -> Value {
         .unwrap_or_else(|| json!({}))
 }
 
-/// 把这次安装真正拨开过的开关抄进状态文件。一条都没拨（Qoder 恒如此）就不写，
-/// 免得给只装 Qoder 的用户多出一个空键。
+/// 把这次安装真正拨开过的开关抄进状态文件。
+///
+/// 两个方向都要写（G2-08）：拨开了就记下原值；**这次安装没拨、但状态文件里还留着旧记录的，
+/// 要按路径删掉**。只加不删的形状是：用户第一次装 ZCode（开关关着，记 `false`）→ 卸载恢复了
+/// `false` 但记录没清 → 用户自己把开关打开 → 再装一次（这次不用拨）→ 状态文件里仍留着
+/// `false`（过期）→ 下次卸载把用户自己打开的开关关回去。
+/// 一条都没拨也没旧记录可清（Qoder 恒如此）就不写，免得给只装 Qoder 的用户多出一个空键。
 pub fn record_switches(app_data: &Path, reports: &[FileReport]) {
     let mut additions = serde_json::Map::new();
+    let mut cleared: Vec<&str> = Vec::new();
     for report in reports {
-        if let Some(value) = &report.switch_before {
-            additions.insert(report.path.clone(), value.clone());
+        if report.error.is_some() {
+            continue;
+        }
+        match &report.switch_before {
+            Some(value) => {
+                additions.insert(report.path.clone(), value.clone());
+            }
+            // 这次装没碰开关：任何旧记录都不再描述这个文件的现状
+            None => cleared.push(report.path.as_str()),
         }
     }
-    if additions.is_empty() {
+    if additions.is_empty() && cleared.is_empty() {
         return;
     }
+    // 只清理时先看一眼现有记录：没有可清的路径就什么都不写。
+    // 否则 update_state 会为一次空清理新建出 `{}` 或空状态文件 —— 用户只装了 Qoder
+    // （永远不拨开关）却多出一个 hooksEnabled 记账键，正是这条判据要拦的形状。
+    if additions.is_empty() {
+        let recorded = recorded_switches(app_data);
+        let table = recorded.as_object().cloned().unwrap_or_default();
+        if !cleared.iter().any(|path| table.contains_key(*path)) {
+            return;
+        }
+    }
     if let Err(e) = update_state(app_data, false, &|map| {
+        // 只清理时：没有 `hooksEnabled` 表就没有可清的东西，别凭空造一个再删掉
+        if additions.is_empty() {
+            let Some(table) = map.get_mut("hooksEnabled").and_then(Value::as_object_mut) else {
+                return;
+            };
+            for path in cleared.iter() {
+                table.remove(*path);
+            }
+            if table.is_empty() {
+                map.remove("hooksEnabled");
+            }
+            return;
+        }
         let table = map.entry("hooksEnabled").or_insert_with(|| json!({}));
         let Some(table) = table.as_object_mut() else {
             return;
@@ -219,16 +255,38 @@ pub fn record_switches(app_data: &Path, reports: &[FileReport]) {
         for (path, value) in additions.iter() {
             table.insert(path.clone(), value.clone());
         }
+        for path in cleared.iter() {
+            table.remove(*path);
+        }
     }) {
         log::warn!("写入总开关记录失败: {e}");
     }
 }
 
-/// 卸载把开关恢复回去之后清掉这份记录：它是**一次性**的，留着下次卸载会照着
-/// 早已不相关的旧值再改一次用户的配置。
-fn clear_switches(app_data: &Path) {
+/// 卸载（或清理）把开关恢复回去之后，按路径删掉这份记录：它是**一次性**的，留着下次卸载
+/// 会照着早已不相关的旧值再改一次用户的配置。
+///
+/// 只删「这次真的摘干净了」（`managed > 0` 且没报错）的路径：摘失败的文件还得留着旧值，
+/// 下次卸载/清理才有东西可恢复。删空之后整个键一起去掉。
+fn forget_restored_switches(app_data: &Path, reports: &[FileReport]) {
+    let restored: Vec<&str> = reports
+        .iter()
+        .filter(|r| r.error.is_none() && r.switch_before.is_some())
+        .map(|r| r.path.as_str())
+        .collect();
+    if restored.is_empty() {
+        return;
+    }
     if let Err(e) = update_state(app_data, false, &|map| {
-        map.remove("hooksEnabled");
+        let Some(table) = map.get_mut("hooksEnabled").and_then(Value::as_object_mut) else {
+            return;
+        };
+        for path in restored.iter() {
+            table.remove(*path);
+        }
+        if table.is_empty() {
+            map.remove("hooksEnabled");
+        }
     }) {
         log::warn!("清理总开关记录失败: {e}");
     }
@@ -263,6 +321,48 @@ pub fn note_attached(app: &AppHandle, agent: &str) {
     note_choice(app, Some(agent));
 }
 
+/// G6-10 + G6-15：桥到底装没装（**只读**，一个文件都不写）。
+///
+/// `attach_bridge` 与 `switch_agent` 曾各写一份 `detect` + `not_detected` —— 措辞分家过一次，
+/// 判据也会跟着分家。更要紧的是切换那一侧原来**先摘旧 hook、后检测桥**：没装桥时用户机器上
+/// 别家的 hook 已经被摘没了，报错说的却是「没检测到桥」。所以这份检测被抽出来，
+/// 由调用方**排在摘旧之前**；单测正是按「检测在前、摘旧在后」钉这条顺序。
+pub fn bridge_presence(
+    adapter: &dyn adapters::AgentAdapter,
+    home: &Path,
+    bundle_dir: PathBuf,
+) -> Result<dsh_bridge::Bridge, HostError> {
+    let bridge = dsh_bridge::detect(home, &bundle_dir);
+    if bridge.detected {
+        Ok(bridge)
+    } else {
+        Err(HostError::new(
+            NOT_FOUND,
+            dsh_bridge::not_detected(adapter.display_name(), Path::new(&bridge.bundle_dir)),
+        ))
+    }
+}
+
+/// G6-11：离开桥形态（DSH）时的一句实话 —— 桥住在对方进程里，宿主摘不到它。
+///
+/// `agent_hooks_uninstall` 只摘得掉四家的 hook 文本；桥是 DSH profile 里的一个 bundle，
+/// 必须由用户在 DSH 里用 plugin_manager 卸。不写这句，用户会以为卸载把 DSH 也摘干净了，
+/// 桥却还挂在对方进程里继续写收件箱。返回 `None` = 没检测到桥，没什么可提醒的。
+pub fn bridge_residue_hint(app: &AppHandle, home: &Path) -> Option<String> {
+    let bridge = dsh_bridge::detect(home, &dsh_bridge::bundle_dir(app).ok()?);
+    bridge_residue_message(&bridge)
+}
+
+/// 提示文案的纯函数部分：命令体要过 AppHandle，单测只钉「检测到 → 有话、点明 profile 数」。
+fn bridge_residue_message(bridge: &dsh_bridge::Bridge) -> Option<String> {
+    bridge.detected.then(|| {
+        format!(
+            "桥插件仍挂在 DSH 的 {} 个 profile 里：宿主只摘掉四家 Agent 的 hook，桥要到 DSH 里用 plugin_manager 卸载（宿主不代卸）。",
+            bridge.profiles
+        )
+    })
+}
+
 /// bridge 形态的「接入」：没有文件可写，只校验桥在不在 + 记下选择。
 ///
 /// 抽到本模块而不是留在命令体里，有两个理由：命令体要过 `check:shape` 的 20 行上限；
@@ -272,13 +372,7 @@ pub fn attach_bridge(
     adapter: &dyn adapters::AgentAdapter,
     home: &Path,
 ) -> Result<Value, HostError> {
-    let bridge = dsh_bridge::detect(home, &dsh_bridge::bundle_dir(app)?);
-    if !bridge.detected {
-        return Err(HostError::new(
-            NOT_FOUND,
-            dsh_bridge::not_detected(adapter.display_name(), Path::new(&bridge.bundle_dir)),
-        ));
-    }
+    let bridge = bridge_presence(adapter, home, dsh_bridge::bundle_dir(app)?)?;
     note_attached(app, adapter.id());
     Ok(json!({
         "files": [],
@@ -287,12 +381,12 @@ pub fn attach_bridge(
     }))
 }
 
-/// 设置页主动卸载，或「撤销授权」连带的宿主卸载：都算用户明确退出，记成 null。
-pub fn note_uninstalled(app: &AppHandle) {
+/// 设置页主动卸载（带逐文件报告）：选择记成 null，但只忘掉**真的恢复成功**的开关记录。
+/// 有的文件摘失败时，它的旧值还得留着 —— 否则下次卸载会照着错的现状再改一次用户配置。
+pub fn note_uninstalled_with(app: &AppHandle, reports: &[FileReport]) {
     note_choice(app, None);
-    // 恢复已经发生（或本来就没记过），这份一次性凭证就不该留着
     if let Some(data) = app_data(app) {
-        clear_switches(&data);
+        forget_restored_switches(&data, reports);
     }
 }
 
@@ -321,21 +415,19 @@ pub fn consent_gate(consent: Option<usize>, confirm: bool) -> bool {
     consent.is_some() && !confirm
 }
 
-/// 「要先问用户」那条拒绝的机器可读前缀。为什么塞在 message 里而不是加字段：
-/// IPC 错误的形状被 ADR-0007 钉成 `{code, message}`，而 `invalid-state` 这个码同时也被
-/// 「卸旧失败」用 —— 让设置页去猜中文字串，猜错的表现是把一次真失败显示成确认框。
-/// 前缀是 ASCII 的固定串，界面显示前会剥掉，用户看不到它。
-pub const NEED_CONFIRM: &str = "[need-confirm]";
+// 「要先问用户」那条拒绝的机器可读前缀（`agent_hooks::NEED_CONFIRM`）。为什么塞在 message 里
+// 而不是加字段：IPC 错误的形状被 ADR-0007 钉成 `{code, message}`，而 `invalid-state` 这个码
+// 同时也被「卸旧失败」用 —— 让设置页去猜中文字串，猜错的表现是把一次真失败显示成确认框。
+// 前缀是 ASCII 的固定串，界面显示前会剥掉，用户看不到它。
+//
+// 定义搬到了 `agent_hooks`：确认门下沉到 `install_files`（G2-09），装的那一层也要造这个前缀。
 
 /// 确认框那句话。抽成函数是为了让「前缀在、条数在」这条契约能被离线钉住
 /// （`switch_agent` 那层要 AppHandle 与真文件，跑不了）。
 /// 正文交给适配器（`AgentAdapter::consent_prompt`）：ZCode 的开关是我们去打开的，
 /// WorkBuddy 的 `disableAllHooks` 我们**不动**，两句话不能共用一个模板，否则界面会在骗用户。
 pub fn confirm_prompt(adapter: &dyn AgentAdapter, user_hooks: usize) -> HostError {
-    HostError::new(
-        INVALID_STATE,
-        format!("{NEED_CONFIRM} {}", adapter.consent_prompt(user_hooks)),
-    )
+    HostError::new(INVALID_STATE, agent_hooks::need_confirm(adapter, user_hooks))
 }
 
 /// 卸完旧的了：该装、该停、还是没地方装。三个分支都可达，所以没有兜底分支。
@@ -381,33 +473,41 @@ pub fn switch_agent(
     if consent_gate(consent, confirm) {
         return Err(confirm_prompt(adapter, consent.unwrap_or_default()));
     }
-    let removed = agent_hooks::uninstall_everywhere(home, &recorded_switches(&data));
+    // G6-10：桥的检测是只读的，必须排在摘旧之前 —— 没装桥就到此为止，机器上别家的 hook
+    // 一条都不该动。此前这里是先 strip 再 detect，等报「没检测到桥」时旧 hook 已经被摘掉了。
+    let bridge = if adapter.installs_files() {
+        None
+    } else {
+        Some(bridge_presence(adapter, home, dsh_bridge::bundle_dir(app)?)?)
+    };
+    // 回滚要用（G2-10）：切换前联动的那个适配器与它的候选文件。必须在摘旧之前取，
+    // 之后状态文件里记的可能已经变了。
+    let previous = adapter_for(agent_choice(&data).as_deref());
+    let previous_files = previous.targets(home);
+    let switches = recorded_switches(&data);
+    // 摘全部家庭（G2-07），旧的那份开关记录已一次性用掉，顺手按路径删（G2-08）
+    let removed = strip_everywhere(&data, home, &switches);
     let first_error = removed
         .iter()
         .filter_map(|r| r.error.as_ref())
         .next()
         .cloned()
         .unwrap_or_default();
+    // G6-11：从 DSH 断开时桥仍留在对方 profile 里 —— 结果里要说清，别让用户以为全卸干净了。
+    let bridge_hint = if !previous.installs_files() && adapter.id() != previous.id() {
+        bridge_residue_hint(app, home)
+    } else {
+        None
+    };
     // 没有文件可装的 Agent（DSH）：桥住在对方进程里，宠物这边只做两件事 ——
-    // 校验桥确实装上了，再记下用户的选择。这里**不能**走 install_files：
-    // 「装 0 个文件成功」既骗用户也骗 note_installed（它在 any_installed 为假时直接 return，
-    // 选择记不下来，桌宠会一直盯着上一个 Agent）。
-    if !adapter.installs_files() {
+    // 校验桥确实装上了（`bridge` 已在摘旧之前核过），再记下用户的选择。这里**不能**走
+    // install_files：「装 0 个文件成功」既骗用户也骗 note_installed（它在 any_installed
+    // 为假时直接 return，选择记不下来，桌宠会一直盯着上一个 Agent）。
+    if let Some(bundle) = bridge {
         if !first_error.is_empty() {
             return Err(HostError::new(
                 INVALID_STATE,
                 format!("卸下旧的 hook 失败，未接上新的: {first_error}"),
-            ));
-        }
-        let bundle = dsh_bridge::detect(home, &dsh_bridge::bundle_dir(app)?);
-        if !bundle.detected {
-            return Err(HostError::new(
-                NOT_FOUND,
-                format!(
-                    "{}；旧的 hook 已卸下（{} 条），新的未接上",
-                    dsh_bridge::not_detected(adapter.display_name(), Path::new(&bundle.bundle_dir)),
-                    removed.iter().map(|r| r.managed).sum::<usize>()
-                ),
             ));
         }
         note_attached(app, adapter.id());
@@ -418,24 +518,29 @@ pub fn switch_agent(
             "files": [],
             "hint": adapter.post_install_hint(),
             "bridge": bundle,
+            "bridgeHint": bridge_hint,
             // null = 这家没有「装后读日志自检」这回事，不是「查过且干净」
             "selfCheck": null,
         }));
     }
     match plan_install(!first_error.is_empty(), !targets.is_empty()) {
-        // 停在原状态：不装新的，但要把「哪些文件没摘干净」如实说清（已经摘掉的部分不假装没发生）
-        SwitchPlan::StopAfterRemoveFailure => Err(HostError::new(
-            INVALID_STATE,
-            format!("卸下旧的 hook 失败，未安装新的: {first_error}"),
-        )),
-        SwitchPlan::NothingToInstall => Err(HostError::new(
-            NOT_FOUND,
-            format!(
-                "没找到 {} 的配置目录；旧的 hook 已卸下（{} 条），新的未安装",
-                adapter.display_name(),
-                removed.iter().map(|r| r.managed).sum::<usize>()
-            ),
-        )),
+        // 卸旧只成功了一部分：把旧的装回去（装回是幂等的：已摘的补上、还在的原样），
+        // 不让用户停在「旧 hook 缺几条、新 hook 没装」的半装态（G2-10）
+        SwitchPlan::StopAfterRemoveFailure => {
+            let back = rollback_to(app, &data, previous, &previous_files);
+            Err(HostError::new(
+                INVALID_STATE,
+                format!("卸下旧的 hook 失败（{first_error}），未安装新的；{back}"),
+            ))
+        }
+        SwitchPlan::NothingToInstall => {
+            // 没地方装也是切换失败：旧的已经摘了，同样要回滚，否则用户点完「切换」谁都不联动
+            let back = rollback_to(app, &data, previous, &previous_files);
+            Err(HostError::new(
+                NOT_FOUND,
+                format!("没找到 {} 的配置目录；{back}", adapter.display_name()),
+            ))
+        }
         SwitchPlan::Install => {
             let exe = std::env::current_exe()
                 .map_err(|e| HostError::new(INTERNAL, format!("取不到自身路径: {e}")))?;
@@ -443,9 +548,29 @@ pub fn switch_agent(
             // 「这家有没有可查的日志」由适配器自己答（`log_watch`），不在这里按 id 分派：
             // 接线第三家时那种 `if id == zcode` 会静默沿用 ZCode 的日志路径。
             let mark = agent_hooks::mark_log(adapter, home);
-            let reports = agent_hooks::install_files(adapter, &targets, &exe, Some(&data));
-            let self_check = agent_hooks::log_self_check(
+            // 确认门在 install_files 里也有一道（G2-09）。这里把用户刚才的确认原样传下去：
+            // 确认过就不该被再问一次，没确认又不需要问的（Qoder）照常装。
+            let reports = agent_hooks::install_files(adapter, &targets, &exe, Some(&data), confirm);
+            if !agent_hooks::any_installed(&reports) {
+                // 新的一个文件都没装上 = 切换失败。旧 hook 已被摘掉，必须装回旧 Agent，
+                // 并把「现在是谁在联动」写进错误里 —— 只报失败不报后果，用户没法判断现状（G2-10）
+                let why = reports
+                    .iter()
+                    .filter_map(|r| r.error.as_ref())
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| "没有任何文件装上".into());
+                let back = rollback_to(app, &data, previous, &previous_files);
+                return Err(HostError::new(
+                    INVALID_STATE,
+                    format!("切到 {} 失败：{why}；{back}", adapter.display_name()),
+                ));
+            }
+            // 自检重新读盘：路径 + 条数 + 命令串 + 日志增量，不看上面那份报告（G2-11）
+            let self_check = agent_hooks::self_check(
                 adapter,
+                &targets,
+                &exe,
                 mark.as_ref(),
                 home,
                 &format!("{} {}", AGENT_FLAG, adapter.id()),
@@ -458,11 +583,66 @@ pub fn switch_agent(
                 "removed": removed.iter().map(|r| r.managed).sum::<usize>(),
                 "files": reports,
                 "hint": adapter.post_install_hint(),
-                // null = 这个客户端没有「装后读日志自检」这回事，不是「查过且干净」
+                // G6-11：从 DSH 切走时，桥还在对方 profile 里 —— null 表示本来就没装桥
+                "bridgeHint": bridge_hint,
+                // 永远是一个对象：status 为 ok/pending/unverified/problem，没人能把「没查」说成绿
                 "selfCheck": self_check,
             }))
         }
     }
+}
+
+/// 切换失败的回滚：把刚摘掉的旧 Agent 装回去，让「当前联动」仍然指向它。
+///
+/// 返回一句给人看的话（成功/失败都写清），调用方拼进错误里 —— 用户按完「切换」必须知道
+/// 现在到底是谁在联动，而不是只看到一个泛泛的失败（G2-10）。回滚本身也失败时把选择清成
+/// 「没选过」：状态页不能继续显示一个已经不在联动的 Agent，那比「没有 Agent」更难查。
+fn rollback_to(
+    app: &AppHandle,
+    data: &Path,
+    previous: &dyn AgentAdapter,
+    previous_files: &[PathBuf],
+) -> String {
+    if previous_files.is_empty() {
+        return format!(
+            "旧 Agent（{}）没有候选文件，回滚不了；当前没有 Agent 在联动",
+            previous.display_name()
+        );
+    }
+    match rollback_install(previous, previous_files, data) {
+        Ok(back) => {
+            // 记账与 `switch_agent` 成功路径同口径：选择指回旧的、拨过的开关抄下来
+            note_installed(app, previous.id(), &back);
+            let count: usize = back.iter().map(|r| r.managed).sum();
+            format!("已回滚到 {}（{count} 条）", previous.display_name())
+        }
+        Err(why) => {
+            note_choice(app, None);
+            format!(
+                "回滚到 {} 也失败了（{why}），当前没有 Agent 在联动",
+                previous.display_name()
+            )
+        }
+    }
+}
+
+/// 回滚里「把旧的装回去」那一步。单独成函数是为了能在单测里真的注入失败跑一遍：
+/// `switch_agent` 那层要 AppHandle，而「摘干净了没装回来」正是最该被跑红的形状（G2-10）。
+fn rollback_install(
+    previous: &dyn AgentAdapter,
+    previous_files: &[PathBuf],
+    data: &Path,
+) -> Result<Vec<FileReport>, String> {
+    let back = install(previous, previous_files, Some(data), true);
+    if agent_hooks::any_installed(&back) {
+        return Ok(back);
+    }
+    Err(back
+        .iter()
+        .filter_map(|r| r.error.as_ref())
+        .next()
+        .cloned()
+        .unwrap_or_else(|| "原因未知".into()))
 }
 
 /// 写状态文件。**失败只记日志**：装卸本身已经落到 Agent 的配置里了，
@@ -600,10 +780,31 @@ fn adapter_for(agent: Option<&str>) -> &'static dyn AgentAdapter {
         .unwrap_or(&claude_style::QODER)
 }
 
+/// 联动安装的调用来源（G2-09 / t38-A）。区分它是因为「拨开用户的总开关」是需要同意的动作：
+/// **用户重新勾选启用插件就是对这个动作的同意**，而启动补写、启停清单迁移、插件目录扫描
+/// 都不是用户动作 —— 它们没有确认框可弹，也就没有资格替用户点头。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallMode {
+    /// 用户在设置页主动勾选启用插件（`plugin_enabled_set`）：需要确认的客户端也照装。
+    UserConfirmed,
+    /// 启动补写 / 清单迁移 / 插件目录扫描：走严格确认门，需要确认的客户端保持原样。
+    Strict,
+}
+
+impl InstallMode {
+    /// 往下透传给 `install_files` 的确认门（G2-09）。`true` 只该来自用户动作。
+    fn confirm(self) -> bool {
+        matches!(self, Self::UserConfirmed)
+    }
+}
+
+/// 装。`confirm` 往下透传给 `install_files` 的确认门（G2-09）：自动路径传 `false`，
+/// 遇见要确认的客户端只会拿到 `[need-confirm]` 报告而不会动文件。
 fn install(
     adapter: &dyn AgentAdapter,
     files: &[PathBuf],
     ledger_dir: Option<&Path>,
+    confirm: bool,
 ) -> Vec<FileReport> {
     if files.is_empty() {
         log::info!("没有 {} 的配置目录，跳过安装", adapter.display_name());
@@ -620,11 +821,22 @@ fn install(
             }]
         }
     };
-    agent_hooks::install_files(adapter, files, &exe, ledger_dir)
+    agent_hooks::install_files(adapter, files, &exe, ledger_dir, confirm)
 }
 
 fn uninstall(adapter: &dyn AgentAdapter, files: &[PathBuf], switches: &Value) -> Vec<FileReport> {
     agent_hooks::uninstall_files(adapter, files, switches)
+}
+
+/// 摘**全部家庭**的自家条目（G2-07），并只忘掉真的恢复成功的开关记录（G2-08）。
+///
+/// 停用/删除插件、启动清理、切换 Agent 三条路径共用这一条：分别写三份「扫哪几家 + 忘哪些记录」
+/// 必然漂，而漂错的表现分别是「另外三家的 --pet-hook 永远留在磁盘上」与「过期旧值下次关掉
+/// 用户自己打开的开关」。抽成函数也让「停用摘四家」能在没有 AppHandle 的单测里真的跑一遍。
+fn strip_everywhere(app_data: &Path, home: &Path, switches: &Value) -> Vec<FileReport> {
+    let reports = agent_hooks::uninstall_everywhere(home, switches);
+    forget_restored_switches(app_data, &reports);
+    reports
 }
 
 /// 装卸结果广播给设置页（PR-1 只发不接：agent 桥设置页的消费端在 PR-2）。
@@ -637,7 +849,7 @@ fn report(app: &AppHandle, action: &str, files: &[FileReport]) {
 
 /// 算出该做的动作、执行并广播。`prev_on` 是差异基线：启停路径取旧清单算出的值，
 /// 磁盘重算路径取「宿主上一次认定的联动状态」。
-fn apply(app: &AppHandle, prev_on: Option<bool>, now_on: bool, ids: &[String]) {
+fn apply(app: &AppHandle, prev_on: Option<bool>, now_on: bool, ids: &[String], mode: InstallMode) {
     // 广播闸门先按现状拨过去：卸载失败也不该让 watcher 继续把事件推给宠物
     set_broadcast(now_on);
     let Some(data) = app_data(app) else { return };
@@ -654,19 +866,29 @@ fn apply(app: &AppHandle, prev_on: Option<bool>, now_on: bool, ids: &[String]) {
     let adapter = adapter_for(agent.as_deref());
     let name = action.report_name();
     let files = targets(app, adapter);
+    let switches = recorded_switches(&data);
     let reports = match action {
         Action::Install => {
-            let reports = install(adapter, &files, Some(data.as_path()));
-            // 拨过的总开关要立刻记下来：这条路径是「停用→再启用」自动装的，没有设置页
-            // 帮忙记，漏记就等于卸载时把用户的开关留在开着的状态
+            // 确认门住在 `install_files` 里（G2-09），这里只透传调用来源：用户在设置页
+            // 主动启用（`InstallMode::UserConfirmed`）算对「恢复总开关」的同意；启动补写、
+            // 清单迁移、目录扫描都不是用户动作，需要确认的客户端只会拿到 `[need-confirm]`
+            // 报告，配置文件一个字都不动，也不记选择
+            let reports = install(adapter, &files, Some(data.as_path()), mode.confirm());
+            // 拨过的总开关要立刻记下来：这条路径是自动装的，没有设置页帮忙记，
+            // 漏记就等于卸载时把用户的开关留在开着的状态
             record_switches(&data, &reports);
             reports
         }
         _ => {
-            let reports = uninstall(adapter, &files, &recorded_switches(&data));
-            if reports.iter().any(|r| r.managed > 0) {
-                clear_switches(&data);
-            }
+            // G2-07：停用/删除插件要摘**全部家庭**，不能只摘「状态文件里当前那一家」——
+            // 用户切换过 Agent、或状态文件缺失时，其余几家的 `--pet-hook` 会永远留在磁盘上
+            let reports = match app.path().home_dir() {
+                Ok(home) => strip_everywhere(&data, &home, &switches),
+                Err(e) => {
+                    log::warn!("拿不到用户主目录，本次只摘 {} 的文件: {e}", adapter.id());
+                    uninstall(adapter, &files, &switches)
+                }
+            };
             reports
         }
     };
@@ -682,9 +904,23 @@ fn apply(app: &AppHandle, prev_on: Option<bool>, now_on: bool, ids: &[String]) {
 ///
 /// 调用方（`plugin_enabled_set` / `plugin_enabled_migrate`）都已把清单落盘才走到这里，
 /// 而且这个函数没有 Result —— **装卸失败绝不拦启停**是构造出来的，不是靠调用方记得忽略错误。
-pub fn reconcile(app: &AppHandle, previous: Option<&[String]>, next: &[String]) {
+///
+/// `mode` 只说「这次是不是用户动作」：设置页主动勾选启用传 [`InstallMode::UserConfirmed`]，
+/// 迁移/启动/目录扫描传 [`InstallMode::Strict`]。确认门的语义仍在 `install_files` 里。
+pub fn reconcile(
+    app: &AppHandle,
+    previous: Option<&[String]>,
+    next: &[String],
+    mode: InstallMode,
+) {
     let now_on = linkage_on(app, next);
-    apply(app, previous.map(|ids| linkage_on(app, ids)), now_on, next);
+    apply(
+        app,
+        previous.map(|ids| linkage_on(app, ids)),
+        now_on,
+        next,
+        mode,
+    );
 }
 
 /// 插件目录被改动（含整目录删除）后的重算。运行期没有「卸载插件」命令，
@@ -695,7 +931,8 @@ pub fn resync(app: &AppHandle) {
         return;
     };
     let now_on = linkage_on(app, &ids);
-    apply(app, Some(broadcast_allowed()), now_on, &ids);
+    // 插件目录扫描不是用户动作：严格确认门（t38-A）
+    apply(app, Some(broadcast_allowed()), now_on, &ids, InstallMode::Strict);
 }
 
 /// 启动阶段广播闸门该拨到哪；返回 `None` 表示**不拨**，保持默认（开）。
@@ -722,6 +959,15 @@ fn apply_startup_broadcast(ids: Option<&[String]>, linkage_on: bool) {
 /// AppHandle，单测能真的把顺序跑红；这里只负责把路径与现状凑出来。
 pub fn startup(app: &AppHandle) {
     let Some(data) = app_data(app) else { return };
+    // G2-05：隔离变量在发布构建里照样生效，所以命中时必须显式说出来 —— 启动日志是
+    // 用户与支持人员唯一能看到「这次读的不是默认路径」的地方，静默换根是最难查的失败。
+    let overrides = adapters::active_overrides();
+    if !overrides.is_empty() {
+        log::warn!(
+            "hook 路径被环境变量改写: override={}（发布构建里同样生效）",
+            overrides.join(",")
+        );
+    }
     let ids = crate::services::enabled::list_ids(app);
     // 清单还不存在（尚未迁移）= 说不出现状：既不拨广播闸门，也不动手清理
     let on = ids.as_ref().is_some_and(|v| linkage_on(app, v));
@@ -739,7 +985,8 @@ pub fn startup(app: &AppHandle) {
                     }
                 }
                 if reports.iter().any(|r| r.managed > 0) {
-                    clear_switches(&data);
+                    // 只忘掉真的恢复了的路径：启动清理失败的那份下次还得靠旧值恢复（G2-08）
+                    forget_restored_switches(&data, &reports);
                 }
                 report(app, "startup-cleanup", &reports);
             }
@@ -816,16 +1063,24 @@ pub fn run_cleanup_cli() {
         crate::services::agent::backups::remove_backups_everywhere(&home, app_data.as_deref());
     let stripped: usize = reports.iter().map(|r| r.managed).sum();
     let failed = reports.iter().filter(|r| r.error.is_some()).count();
+    // G2-05：清理也要把「路径被环境变量改写」说出来。清理分支拿不到日志系统，
+    // 唯一能被 NSIS / e2e 看见的出口就是这行 stdout。
+    let overrides = adapters::active_overrides();
+    let override_note = if overrides.is_empty() {
+        "none".to_string()
+    } else {
+        overrides.join(",")
+    };
     // 只剩备份也要继续往下走：上一版在 reports 为空时提前 return，会把「hook 已摘干净、
     // 只剩我们抄的备份」这种最常见的情形整段跳过。
     if reports.is_empty() && backups.removed == 0 && backups.failed == 0 && backups.skipped == 0 {
         println!(
-            "desktop-pet: hook cleanup result=nothing-to-do files=0 stripped=0 backups=0 backups_failed=0 backups_skipped=0"
+            "desktop-pet: hook cleanup result=nothing-to-do files=0 stripped=0 backups=0 backups_failed=0 backups_skipped=0 override={override_note}"
         );
         return;
     }
     println!(
-        "desktop-pet: hook cleanup result=done files={} stripped={stripped} failed={failed} backups={} backups_failed={} backups_skipped={}",
+        "desktop-pet: hook cleanup result=done files={} stripped={stripped} failed={failed} backups={} backups_failed={} backups_skipped={} override={override_note}",
         reports.len(),
         backups.removed,
         backups.failed,
@@ -886,6 +1141,37 @@ mod tests {
 
     fn foreign_entry() -> Value {
         json!({ "type": "command", "command": "other-tool --notify", "timeout": 5 })
+    }
+
+    /// 进程级 env 是共享的：手写 set_var/remove_var 一旦断言 panic，remove 就被跳过，
+    /// 假 home 会漏给同进程的其它用例（cargo test 默认多线程）。RAII 收口后不管怎么退场
+    /// 都清干净（G7-10）。只给测试用，生产代码不读它。
+    struct EnvScope {
+        names: Vec<&'static str>,
+    }
+
+    impl EnvScope {
+        /// 设 `set`、清 `clear`；两类名字都进 Drop 清单。
+        fn new(set: &[(&'static str, &Path)], clear: &[&'static str]) -> Self {
+            let mut names: Vec<&'static str> = Vec::new();
+            for (name, value) in set {
+                std::env::set_var(name, value);
+                names.push(name);
+            }
+            for name in clear {
+                std::env::remove_var(name);
+                names.push(name);
+            }
+            Self { names }
+        }
+    }
+
+    impl Drop for EnvScope {
+        fn drop(&mut self) {
+            for name in &self.names {
+                std::env::remove_var(name);
+            }
+        }
     }
 
     #[test]
@@ -1078,8 +1364,9 @@ mod tests {
             "记录选择之后开关凭证还在"
         );
 
-        // 恢复完就清掉：它是**一次性**的，留着下次卸载会照着早已不相关的旧值再改一次配置
-        clear_switches(&dir);
+        // 恢复完就清掉：它是**一次性**的，留着下次卸载会照着早已不相关的旧值再改一次配置。
+        // 走带报告的那条（`forget_restored_switches`），摘失败的文件才不会被一起忘掉。
+        forget_restored_switches(&dir, &[report(r"C:\cfg\config.json", Some(json!(false)))]);
         assert_eq!(recorded_switches(&dir), json!({}));
         assert_eq!(
             agent_choice(&dir).as_deref(),
@@ -1130,7 +1417,12 @@ mod tests {
     fn the_confirm_prompt_carries_the_machine_token_and_the_count() {
         let e = confirm_prompt(&adapters::zcode::ZCODE, 3);
         assert_eq!(e.code, INVALID_STATE);
-        assert!(e.message.starts_with(NEED_CONFIRM), "{}", e.message);
+        assert!(
+            e.message
+                .starts_with(crate::services::agent_hooks::NEED_CONFIRM),
+            "{}",
+            e.message
+        );
         assert!(
             e.message.contains("3 条"),
             "条数是确认的依据：{}",
@@ -1260,23 +1552,33 @@ mod tests {
         let agent_cmd = include_str!("../../commands/agent.rs");
 
         let install = function_body(agent_cmd, "pub fn agent_hooks_install(");
+        assert!(
+            install.contains("install_and_note("),
+            "安装命令必须走带确认门的安装路径（G2-09），不能在命令体里自己装"
+        );
+        // 真正的写入点在 install_and_note 里（命令体只留一行，见 check:shape 的 S2）。
         // 不钉整串：rustfmt 会把多参数调用折行。钉「调用点在」+「账本目录确实传进去了」。
+        let install = function_body(agent_cmd, "fn install_and_note(");
         let written = install.find("install_files(").expect("找不到安装调用点");
         assert!(
-            install.contains("agent_hooks::ledger_dir(&app).as_deref()"),
+            install.contains("agent_hooks::ledger_dir(app).as_deref()"),
             "安装路径必须把账本目录传进去（A23：备份要可证明归属）"
         );
+        let refused = install
+            .find("NEED_CONFIRM")
+            .expect("确认门拒绝必须翻成可读错误（G2-09）");
         let noted = install
-            .find("linkage::note_installed(&app, adapter.id(), &reports)")
+            .find("linkage::note_installed(")
             .expect("安装成功后没记录用户的选择");
         assert!(written < noted, "记录必须晚于真的装完");
+        assert!(refused < noted, "被确认门拒掉的那次不能记账");
 
         let uninstall = function_body(agent_cmd, "pub fn agent_hooks_uninstall(");
         let removed = uninstall
             .find("uninstall_everywhere(")
             .expect("找不到卸载调用点");
         let cleared = uninstall
-            .find("linkage::note_uninstalled(&app)")
+            .find("linkage::note_uninstalled_with(&app, &reports)")
             .expect("卸载没把 agent 记成 null");
         assert!(removed < cleared, "记录必须晚于摘完");
 
@@ -1314,8 +1616,7 @@ mod tests {
         )
         .unwrap();
         // 证据与残留都按 home 推：不换根就是去读开发机真 home，用例会在别人的文件上跑
-        std::env::set_var("PET_AGENT_HOME", &home);
-        std::env::remove_var("PET_AGENT_CONFIG_FILES");
+        let _scope = EnvScope::new(&[("PET_AGENT_HOME", &home)], &["PET_AGENT_CONFIG_FILES"]);
         // 插件已停用（清单里不包括它）→ 该摘残余
         let outcome = startup_sequence(&dir, &home, Some(&[]), false, &json!({}));
         assert_eq!(outcome.migrated, Migrate::Wrote(Some(QODER.to_string())));
@@ -1333,7 +1634,6 @@ mod tests {
         let after = fs::read_to_string(&cfg).unwrap();
         assert_eq!(after.matches("--pet-hook").count(), 0);
         assert!(after.contains("other-tool --notify"), "别人条目不受影响");
-        std::env::remove_var("PET_AGENT_HOME");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1396,8 +1696,8 @@ mod tests {
                     .to_string(),
             )
             .unwrap();
-            std::env::set_var("PET_AGENT_HOME", &home);
-            std::env::remove_var("PET_AGENT_CONFIG_FILES");
+            let _scope =
+                EnvScope::new(&[("PET_AGENT_HOME", &home)], &["PET_AGENT_CONFIG_FILES"]);
             let outcome = startup_sequence(&dir, &home, ids.as_deref(), on, &json!({}));
             assert!(outcome.cleaned.is_none(), "{why}：还是去摘了条目");
             assert_eq!(
@@ -1408,7 +1708,6 @@ mod tests {
                 1,
                 "{why}：配置文件被动过了"
             );
-            std::env::remove_var("PET_AGENT_HOME");
             let _ = fs::remove_dir_all(&dir);
         }
     }
@@ -1439,10 +1738,14 @@ mod tests {
         )
         .unwrap();
         // 候选文件全从假 home 推：逐项覆盖变量会把它指到别处，一个都不留
-        std::env::set_var("PET_AGENT_HOME", &home);
-        std::env::remove_var("PET_AGENT_CONFIG_FILES");
-        std::env::remove_var("PET_AGENT_CODEX_FILES");
-        std::env::remove_var("PET_AGENT_WORKBUDDY_FILES");
+        let _scope = EnvScope::new(
+            &[("PET_AGENT_HOME", &home)],
+            &[
+                "PET_AGENT_CONFIG_FILES",
+                "PET_AGENT_CODEX_FILES",
+                "PET_AGENT_WORKBUDDY_FILES",
+            ],
+        );
 
         // 「不写文件」现在恰好只有一家（DSH）。哪天多出一家，本用例要一起改 ——
         // 静默把它过滤掉就没人记得清理逻辑要不要跟着变。
@@ -1461,7 +1764,7 @@ mod tests {
         for adapter in &file_writers {
             let files = adapter.targets(&home);
             assert!(!files.is_empty(), "{} 的夹具没建对", adapter.id());
-            let reports = agent_hooks::install_files(*adapter, &files, exe, Some(dir.as_path()));
+            let reports = agent_hooks::install_files(*adapter, &files, exe, Some(dir.as_path()), true);
             assert!(
                 agent_hooks::any_installed(&reports),
                 "{} 没装上，用例前提不成立",
@@ -1497,7 +1800,243 @@ mod tests {
             }
         }
 
-        std::env::remove_var("PET_AGENT_HOME");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+
+    /// G7-10：env 作用域退场（包括断言 panic 展开）必须把变量全清掉 —— 手写
+    /// set_var/remove_var 时漏一句就可能把假 home 泄漏给同进程的其它用例。
+    #[test]
+    fn env_scope_clears_every_name_it_touched_on_drop() {
+        let _env = adapters::lock_test_env();
+        let fake = Path::new(r"C:\pet-test\home");
+        {
+            let _scope = EnvScope::new(
+                &[("PET_AGENT_HOME", fake)],
+                &["PET_AGENT_CONFIG_FILES", "PET_AGENT_CODEX_FILES"],
+            );
+            assert_eq!(std::env::var("PET_AGENT_HOME").unwrap(), r"C:\pet-test\home");
+            assert!(std::env::var("PET_AGENT_CONFIG_FILES").is_err());
+        }
+        assert!(
+            std::env::var("PET_AGENT_HOME").is_err(),
+            "退场后不许留在环境里：假 home 漏出去就是别人的用例读错文件"
+        );
+        assert!(std::env::var("PET_AGENT_CODEX_FILES").is_err());
+    }
+
+    /// G2-07：停用/删除插件要摘**全部家庭**。旧实现只摘状态文件里当前那一家，用户切换过
+    /// Agent 之后（或被删过状态文件），其余几家的 `--pet-hook` 会永远留在磁盘上。
+    #[test]
+    fn disabling_clears_every_wired_family_not_only_the_recorded_one() {
+        let _env = adapters::lock_test_env();
+        let dir = tmp_dir("strip-all-families");
+        let home = dir.join("home");
+        for (sub, leaf) in [
+            (".qoder", "settings.json"),
+            (".codex", "hooks.json"),
+            (".workbuddy", "settings.json"),
+            (".zcode/cli", "config.json"),
+        ] {
+            let file = home.join(sub).join(leaf);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(&file, "{}").unwrap();
+        }
+        let _scope = EnvScope::new(
+            &[("PET_AGENT_HOME", &home)],
+            &[
+                "PET_AGENT_CONFIG_FILES",
+                "PET_AGENT_CODEX_FILES",
+                "PET_AGENT_WORKBUDDY_FILES",
+            ],
+        );
+        let exe = Path::new(r"C:\app\desktop-pet.exe");
+        let writers: Vec<&dyn AgentAdapter> = adapters::wired()
+            .iter()
+            .copied()
+            .filter(|a| a.installs_files() && a.id() != "dsh")
+            .collect();
+        for adapter in &writers {
+            let files = adapter.targets(&home);
+            assert!(!files.is_empty(), "{} 的夹具没建对", adapter.id());
+            let reports =
+                agent_hooks::install_files(*adapter, &files, exe, Some(dir.as_path()), true);
+            assert!(
+                agent_hooks::any_installed(&reports),
+                "{} 没装上，用例前提不成立",
+                adapter.id()
+            );
+        }
+        // 状态文件里只写着「用户当前选的是 Qoder」—— 旧逻辑就只清这一个文件
+        record_choice(&dir, Some(QODER)).unwrap();
+        let switches = recorded_switches(&dir);
+        let reports = strip_everywhere(&dir, &home, &switches);
+        assert!(
+            reports.iter().any(|r| r.managed > 0),
+            "四家都装过，停用至少要摘掉一条: {:?}",
+            reports
+                .iter()
+                .map(|r| (r.path.clone(), r.managed))
+                .collect::<Vec<_>>()
+        );
+        for adapter in &writers {
+            for file in adapter.targets(&home) {
+                let text = fs::read_to_string(&file).unwrap();
+                assert!(
+                    !text.contains(agent_hooks::HOOK_MARKER),
+                    "{} 的条目没摘净: {}",
+                    adapter.id(),
+                    file.display()
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// G2-08（装侧）：这次安装没拨开关 → 该文件在状态文件里的旧值必须删掉。
+    /// 只加不删的形状会真的改错用户的配置：装（记 false）→ 卸载恢复 → 用户自己打开开关 →
+    /// 再装（这次不拨）→ 记录还是 false → 下次卸载把用户打开的开关关回去。
+    #[test]
+    fn a_new_install_drops_a_switch_record_it_did_not_touch() {
+        let dir = tmp_dir("switch-stale");
+        let file = r"C:\z\config.json";
+        record_switches(
+            &dir,
+            &[FileReport {
+                path: file.to_string(),
+                managed: 1,
+                error: None,
+                switch_before: Some(json!(false)),
+            }],
+        );
+        assert!(recorded_switches(&dir).get(file).is_some());
+        // 再装一次：开关已经是开的（用户自己打开过），适配器读不到 switch_before
+        record_switches(
+            &dir,
+            &[FileReport {
+                path: file.to_string(),
+                managed: 7,
+                error: None,
+                switch_before: None,
+            }],
+        );
+        assert!(
+            recorded_switches(&dir).get(file).is_none(),
+            "这次没拨开关，旧记录不再描述现状，必须删"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// G2-08（卸侧）：只忘掉**真的恢复成功**的路径；摘失败的那份旧值还得留着下次恢复。
+    #[test]
+    fn only_restored_switch_records_are_forgotten() {
+        let dir = tmp_dir("switch-forget");
+        let restored = r"C:\ok.json";
+        let failed = r"C:\failed.json";
+        record_switches(
+            &dir,
+            &[
+                FileReport {
+                    path: restored.to_string(),
+                    managed: 1,
+                    error: None,
+                    switch_before: Some(json!(false)),
+                },
+                FileReport {
+                    path: failed.to_string(),
+                    managed: 1,
+                    error: None,
+                    switch_before: Some(json!(false)),
+                },
+            ],
+        );
+        forget_restored_switches(
+            &dir,
+            &[
+                FileReport {
+                    path: restored.to_string(),
+                    managed: 1,
+                    error: None,
+                    switch_before: Some(json!(false)),
+                },
+                FileReport {
+                    path: failed.to_string(),
+                    managed: 0,
+                    error: Some("permission denied".into()),
+                    switch_before: Some(json!(false)),
+                },
+            ],
+        );
+        let left = recorded_switches(&dir);
+        assert!(left.get(restored).is_none(), "恢复成功的记录是一次性的");
+        assert!(
+            left.get(failed).is_some(),
+            "摘失败的旧值留着，下次才有东西可恢复"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// G2-10：切换失败必须回滚。这里注入**真实的安装失败**（目标落在一个普通文件下面，
+    /// 写不进去）并真的跑回滚那一步：旧 Agent 的条目必须重新出现，而不是停在
+    /// 「旧的摘了、新的没装」的半装态；回滚本身失败时也要给出可读原因。
+    #[test]
+    fn a_failed_switch_puts_the_old_agent_back() {
+        let _env = adapters::lock_test_env();
+        let dir = tmp_dir("rollback");
+        let home = dir.join("home");
+        let cfg = home.join(".zcode").join("cli").join("config.json");
+        fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        fs::write(
+            &cfg,
+            json!({ "hooks": { "enabled": true, "events": {} } }).to_string(),
+        )
+        .unwrap();
+        let _scope = EnvScope::new(&[("PET_AGENT_HOME", &home)], &[]);
+        let zcode = adapters::by_id("zcode").expect("zcode 已接线");
+        let old_files = zcode.targets(&home);
+        assert!(!old_files.is_empty(), "夹具没建对");
+        let exe = Path::new(r"C:\app\desktop-pet.exe");
+        let first = agent_hooks::install_files(zcode, &old_files, exe, Some(dir.as_path()), true);
+        assert!(agent_hooks::any_installed(&first), "用例前提：旧的先装上");
+        // 切走：旧 hook 先被摘掉（switch_agent 在装新的之前就是这么做的）
+        agent_hooks::uninstall_files(zcode, &old_files, &json!({}));
+        assert_eq!(
+            fs::read_to_string(&cfg)
+                .unwrap()
+                .matches("--pet-hook")
+                .count(),
+            0,
+            "切换的第一步确实把旧的摘了"
+        );
+        // 注入失败：新 Agent 的目标写不进去（父路径是普通文件）
+        let blocker = dir.join("not-a-dir");
+        fs::write(&blocker, "x").unwrap();
+        let broken = vec![blocker.join("config.json")];
+        let codex = adapters::by_id("codex").expect("codex 已接线");
+        let failed = agent_hooks::install_files(codex, &broken, exe, Some(dir.as_path()), true);
+        assert!(
+            !agent_hooks::any_installed(&failed),
+            "失败注入必须真的失败，否则这条用例什么都没证明"
+        );
+        // 回滚：真的把旧 Agent 装回去
+        let back = rollback_install(zcode, &old_files, &dir).expect("回滚必须成功");
+        assert!(agent_hooks::any_installed(&back), "回滚后旧的必须在盘上");
+        let text = fs::read_to_string(&cfg).unwrap();
+        assert_eq!(
+            text.matches("--pet-hook").count(),
+            zcode.events().len(),
+            "回滚要把旧 Agent 的每一条都装回来"
+        );
+        assert!(
+            text.contains("\"enabled\": true"),
+            "回滚不许把总开关拨乱"
+        );
+        // 回滚也失败时：可读原因，不是 panic 也不是空串
+        let why = match rollback_install(codex, &broken, &dir) {
+            Ok(back) => panic!("写不进去必须报错，却报成功（{} 条）", back.len()),
+            Err(why) => why,
+        };
+        assert!(!why.trim().is_empty(), "回滚失败必须给出可读原因");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1597,5 +2136,220 @@ mod tests {
             !reconcile.contains("remove_backups_everywhere"),
             "停用插件触发的 reconcile 也不得删备份"
         );
+    }
+
+    /// G6-10：切到 DSH 时「检测桥」必须排在「摘旧 hook」之前 —— 没装桥就到此为止，
+    /// 机器上别家的 hook 一条都不许动（此前先 strip 再 detect，报「没检测到桥」时旧 hook 已经没了）。
+    /// 这里用源码顺序钉住：AppHandle 构造不出来，行为分支跑不进单测，但顺序就是修复本身。
+    #[test]
+    fn bridge_is_detected_before_any_hook_is_stripped() {
+        let src = include_str!("linkage.rs");
+        let switch = function_body(src, "pub fn switch_agent(");
+        let detect_at = switch
+            .find("bridge_presence(")
+            .expect("switch_agent 里必须检测桥（bridge_presence）");
+        let strip_at = switch
+            .find("strip_everywhere(")
+            .expect("switch_agent 里必须摘旧 hook（strip_everywhere）");
+        assert!(
+            detect_at < strip_at,
+            "桥的检测必须先于摘旧 hook：否则没装桥时别家 hook 已被摘掉（G6-10）"
+        );
+        assert!(
+            !switch[detect_at..strip_at].contains("return Ok("),
+            "检测失败必须直接返回错误"
+        );
+    }
+
+    /// G6-11：卸载响应里的「桥还在」提示 —— 检测到才给话，且要能点出 profile 数；
+    /// 没检测到就闭嘴（不能每次都吓唬「桥还挂着」）。
+    #[test]
+    fn bridge_residue_message_speaks_only_when_the_bridge_is_present() {
+        let present = dsh_bridge::Bridge {
+            package: crate::services::agent::adapters::dsh::BRIDGE_PACKAGE,
+            detected: true,
+            profiles: 2,
+            bundle_dir: "C:\\app\\integrations\\dsh-bridge".to_string(),
+            dsh_home: "C:\\Users\\me\\.dsh".to_string(),
+        };
+        let message = bridge_residue_message(&present).expect("检测到桥时必须给提示");
+        assert!(message.contains("2 个 profile"), "{message}");
+        assert!(message.contains("plugin_manager"), "{message}");
+        let absent = dsh_bridge::Bridge {
+            detected: false,
+            profiles: 0,
+            ..present
+        };
+        assert_eq!(bridge_residue_message(&absent), None);
+    }
+
+    /// R4-F1：没检测到桥必须**拒绝** —— 只钉顺序不够。M3 变异（把拒绝分支删成无条件
+    /// `Ok(bridge)`）曾能全绿存活，说明当时没有行为断言兜底。这里用临时 `PET_DSH_HOME`
+    /// 造出「profiles 里没有桥」的真实盘上状态：返回 Err、码 NOT_FOUND、文案点明桥与
+    /// install_bundle；再补一条「列了桥就放行」的正例对照，证明拒绝不是把所有情况都拒了。
+    #[test]
+    fn bridge_presence_rejects_when_no_bridge_detected() {
+        let _env = adapters::lock_test_env();
+        let root = tmp_dir("bridge-presence");
+        let dsh_home = root.join("dsh-home");
+        // profile 目录存在但没有 package.json：跟真机上「装过 DSH、没装桥」同形
+        fs::create_dir_all(dsh_home.join("profiles").join("e2e")).expect("建 profile 目录");
+        // 清掉 PET_AGENT_HOME：回退链若命中真实家目录，这台机器上装过桥就会把反例带偏
+        let _scope = EnvScope::new(&[(dsh_bridge::HOME_ENV, &dsh_home)], &["PET_AGENT_HOME"]);
+        let bundle_dir = root.join("integrations").join("dsh-bridge");
+
+        let err = bridge_presence(&adapters::dsh::DSH, &root, bundle_dir.clone())
+            .expect_err("profiles 里没有桥时 bridge_presence 必须拒绝");
+        assert_eq!(
+            err.code,
+            crate::host_error::NOT_FOUND,
+            "没检测到桥是 not-found 码，实际: {err}"
+        );
+        let text = err.message.to_lowercase();
+        assert!(text.contains("bridge"), "文案要点明桥（bridge）：{err}");
+        assert!(
+            text.contains("install_bundle"),
+            "文案要给出 install_bundle 的装法：{err}"
+        );
+
+        // 正例对照：同一个临时 dsh home，写一个列了桥的 profile，就必须放行
+        fs::write(
+            dsh_home.join("profiles").join("e2e").join("package.json"),
+            json!({
+                "dsh": {
+                    "profile": {
+                        "bundles": [crate::services::agent::adapters::dsh::BRIDGE_PACKAGE]
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect("写 profile 的 package.json");
+        let bridge = bridge_presence(&adapters::dsh::DSH, &root, bundle_dir)
+            .expect("profile 的 bundles 里列了桥就必须放行");
+        assert!(bridge.detected);
+        assert_eq!(bridge.profiles, 1);
+    }
+
+    /// G2-09 / t38-A：确认门只允许「用户在设置页主动启用」这一条路径代用户同意。
+    /// 启动补写、启停清单迁移、插件目录扫描都不是用户动作，需要确认的客户端必须保持原样。
+    #[test]
+    fn only_the_user_action_clears_the_install_confirm_gate() {
+        assert!(
+            InstallMode::UserConfirmed.confirm(),
+            "主动启用就是对恢复总开关的同意"
+        );
+        assert!(
+            !InstallMode::Strict.confirm(),
+            "自动路径不许代用户同意拨开总开关"
+        );
+
+        let enabled = include_str!("../enabled.rs");
+        let set = function_body(enabled, "pub fn plugin_enabled_set(");
+        assert!(
+            set.contains("InstallMode::UserConfirmed"),
+            "设置页主动启用必须按已确认装（否则停用时还原的总开关装不回来）"
+        );
+        let migrate = function_body(enabled, "pub fn plugin_enabled_migrate(");
+        assert!(
+            migrate.contains("InstallMode::Strict"),
+            "清单迁移不是用户动作，必须走严格确认门"
+        );
+
+        let myself = include_str!("linkage.rs");
+        let resync = function_body(myself, "pub fn resync(");
+        assert!(
+            resync.contains("InstallMode::Strict"),
+            "插件目录扫描不是用户动作，必须走严格确认门"
+        );
+        // 启动路径压根没有安装能力（只清不装）：这条钉住「启动不越过确认门」的事实。
+        // 用「没有安装调用点」判，避免把 `uninstall_*` 里的 install 子串当成安装。
+        let startup = function_body(myself, "pub fn startup_sequence(");
+        assert!(
+            !startup.contains("install_files") && !startup.contains("InstallMode"),
+            "启动只会清残留，不许装 hook"
+        );
+    }
+
+    /// G2-09 / t38-A：同一份用户配置，`Strict` 拿不到同意就一个字节都不写；
+    /// `UserConfirmed`（用户重新勾选启用插件）要真的装回去，并把停用时还原成 false 的
+    /// 总开关一并拨开。ZCode 的夹具正是 `switch_needs_consent` 的形状：总开关关着，
+    /// 但用户自己配过 hook。
+    #[test]
+    fn a_user_confirmed_install_restores_the_switch_a_strict_one_does_not() {
+        let _env = adapters::lock_test_env();
+        let dir = tmp_dir("user-confirmed");
+        let home = dir.join("home");
+        let cfg = home.join(".zcode").join("cli").join("config.json");
+        fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        let raw = json!({
+            "hooks": {
+                "enabled": false,
+                "events": {
+                    "Stop": [{ "hooks": [
+                        { "type": "command", "command": "user-hook.sh", "timeoutMs": 2000 }
+                    ] }]
+                }
+            }
+        })
+        .to_string();
+        fs::write(&cfg, &raw).unwrap();
+        let _scope = EnvScope::new(&[("PET_AGENT_HOME", &home)], &["PET_AGENT_CONFIG_FILES"]);
+        let zcode = adapters::by_id("zcode").expect("zcode 已接线");
+        let files = zcode.targets(&home);
+        assert!(!files.is_empty(), "夹具没建对");
+        let ledger = dir.join("ledger");
+        fs::create_dir_all(&ledger).unwrap();
+
+        // 自动路径（迁移/启动/目录扫描）：确认门先问，配置一个字都不许动
+        let strict = install(
+            zcode,
+            &files,
+            Some(ledger.as_path()),
+            InstallMode::Strict.confirm(),
+        );
+        assert!(
+            !agent_hooks::any_installed(&strict),
+            "严格路径不许动用户配置"
+        );
+        assert!(
+            strict.iter().all(|r| r
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with(agent_hooks::NEED_CONFIRM))),
+            "每个没写的文件都要带 [need-confirm] 标记"
+        );
+        assert_eq!(
+            fs::read_to_string(&cfg).unwrap(),
+            raw,
+            "没确认就一个字节都不写"
+        );
+
+        // 用户主动再启用：同意随这次点击给出，装回去并恢复总开关
+        let confirmed = install(
+            zcode,
+            &files,
+            Some(ledger.as_path()),
+            InstallMode::UserConfirmed.confirm(),
+        );
+        assert!(
+            agent_hooks::any_installed(&confirmed),
+            "主动再启用必须真的装上"
+        );
+        let text = fs::read_to_string(&cfg).unwrap();
+        assert_eq!(
+            text.matches("--pet-hook").count(),
+            zcode.events().len(),
+            "再启用要把 7 条事件装回来"
+        );
+        assert!(
+            text.contains("\"enabled\": true"),
+            "停用时还原的总开关要一并恢复：{text}"
+        );
+        assert!(
+            text.contains("user-hook.sh"),
+            "用户自己那条一个字都不许动：{text}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 }

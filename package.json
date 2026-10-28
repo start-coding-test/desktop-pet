@@ -2,6 +2,9 @@
   "name": "desktop-pet",
   "private": true,
   "version": "0.2.4",
+  "engines": {
+    "node": ">=24 <25"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -34,9 +37,11 @@
     "verify:http": "node tests/e2e/verify-http.mjs",
     "verify:goat-gauge": "node tests/e2e/verify-goat-gauge.mjs",
     "verify:drag": "node tests/e2e/verify-pet-drag.mjs",
+    "verify:dsh": "node tests/e2e/verify-dsh-bridge.mjs",
     "unit:widget": "node --import ./tests/unit/ts-loader.mjs --test --test-concurrency=1 tests/unit/unit-widget-protocol.mjs tests/unit/unit-widget-worker.mjs tests/unit/unit-widget-migrations.mjs tests/unit/unit-badge-arbiter.mjs",
     "unit:migrate": "node --import ./tests/unit/ts-loader.mjs --test --test-concurrency=1 tests/unit/unit-widget-migrations.mjs",
-    "unit:echo": "node --import ./tests/unit/ts-loader.mjs --test --test-concurrency=1 tests/unit/unit-settings-echo.mjs"
+    "unit:echo": "node --import ./tests/unit/ts-loader.mjs --test --test-concurrency=1 tests/unit/unit-settings-echo.mjs",
+    "e2e": "node tools/e2e-run.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.0"

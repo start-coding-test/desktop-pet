@@ -397,59 +397,94 @@ fn b64_decode(text: &str) -> Result<Vec<u8>, HostError> {
     Ok(out)
 }
 
-/// 凭据命令的统一入口：先过能力门禁（复用 storage），再解析落点。
-fn resolve(perms: &PermissionState, root: &Path, plugin_id: &str) -> Result<PathBuf, HostError> {
-    crate::gate::plugin_capability(perms, plugin_id, crate::plugin_caps::STORAGE)?;
+/// 凭据命令的统一入口：先过窗口归属 + 能力门禁（复用 storage），再解析落点。
+fn resolve(
+    window: &tauri::Window,
+    perms: &PermissionState,
+    root: &Path,
+    plugin_id: &str,
+) -> Result<PathBuf, HostError> {
+    crate::gate::plugin_capability(window, perms, plugin_id, crate::plugin_caps::STORAGE)?;
+    plugin_path(root, plugin_id)
+}
+
+/// 单测专用：不造 AppHandle/Window，只钉「能力门禁 + 落点」；窗口归属由 gate 单测覆盖。
+#[cfg(test)]
+fn resolve_for_test(
+    perms: &PermissionState,
+    root: &Path,
+    plugin_id: &str,
+) -> Result<PathBuf, HostError> {
+    crate::gate::plugin_capability_for(perms, plugin_id, crate::plugin_caps::STORAGE)?;
     plugin_path(root, plugin_id)
 }
 
 #[tauri::command]
-pub fn secrets_get(
+pub async fn secrets_get(
+    window: tauri::Window,
     app: AppHandle,
-    perms: tauri::State<PermissionState>,
+    perms: tauri::State<'_, PermissionState>,
     plugin_id: String,
     key: String,
 ) -> Result<Option<String>, HostError> {
     let root = app_plugins_dir(&app)?;
-    let store = SecretsStore::at(resolve(&perms, &root, &plugin_id)?, &plugin_id);
-    let value = store.get(&key)?;
-    log::debug!(
-        "{}",
-        audit_line("secrets_get", &plugin_id, &key, value.as_deref())
-    );
-    Ok(value)
+    let path = resolve(&window, &perms, &root, &plugin_id)?;
+    // G3-05：DPAPI 加解密与落盘都是阻塞 IO，移到阻塞线程池
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = SecretsStore::at(path, &plugin_id);
+        let value = store.get(&key)?;
+        log::debug!(
+            "{}",
+            audit_line("secrets_get", &plugin_id, &key, value.as_deref())
+        );
+        Ok(value)
+    })
+    .await
+    .map_err(|e| HostError::new(INTERNAL, format!("凭据任务失败: {e}")))?
 }
 
 #[tauri::command]
-pub fn secrets_set(
+pub async fn secrets_set(
+    window: tauri::Window,
     app: AppHandle,
-    perms: tauri::State<PermissionState>,
+    perms: tauri::State<'_, PermissionState>,
     plugin_id: String,
     key: String,
     value: String,
 ) -> Result<(), HostError> {
     let root = app_plugins_dir(&app)?;
-    let store = SecretsStore::at(resolve(&perms, &root, &plugin_id)?, &plugin_id);
-    store.set(&key, &value)?;
-    log::info!(
-        "{}",
-        audit_line("secrets_set", &plugin_id, &key, Some(&value))
-    );
-    Ok(())
+    let path = resolve(&window, &perms, &root, &plugin_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = SecretsStore::at(path, &plugin_id);
+        store.set(&key, &value)?;
+        log::info!(
+            "{}",
+            audit_line("secrets_set", &plugin_id, &key, Some(&value))
+        );
+        Ok(())
+    })
+    .await
+    .map_err(|e| HostError::new(INTERNAL, format!("凭据任务失败: {e}")))?
 }
 
 #[tauri::command]
-pub fn secrets_delete(
+pub async fn secrets_delete(
+    window: tauri::Window,
     app: AppHandle,
-    perms: tauri::State<PermissionState>,
+    perms: tauri::State<'_, PermissionState>,
     plugin_id: String,
     key: String,
 ) -> Result<(), HostError> {
     let root = app_plugins_dir(&app)?;
-    let store = SecretsStore::at(resolve(&perms, &root, &plugin_id)?, &plugin_id);
-    store.delete(&key)?;
-    log::info!("{}", audit_line("secrets_delete", &plugin_id, &key, None));
-    Ok(())
+    let path = resolve(&window, &perms, &root, &plugin_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = SecretsStore::at(path, &plugin_id);
+        store.delete(&key)?;
+        log::info!("{}", audit_line("secrets_delete", &plugin_id, &key, None));
+        Ok(())
+    })
+    .await
+    .map_err(|e| HostError::new(INTERNAL, format!("凭据任务失败: {e}")))?
 }
 
 #[cfg(test)]
@@ -619,12 +654,15 @@ mod tests {
     fn resolve_denies_without_storage_grant_and_rejects_bad_ids() {
         let root = tmp_dir("resolve");
         let perms = PermissionState::new();
-        let err = resolve(&perms, &root, "todo").unwrap_err();
+        let err = resolve_for_test(&perms, &root, "todo").unwrap_err();
         assert_eq!(err.code, crate::host_error::DENIED);
         grant_storage(&perms, "todo");
-        let path = resolve(&perms, &root, "todo").unwrap();
+        let path = resolve_for_test(&perms, &root, "todo").unwrap();
         assert_eq!(path, root.join("todo").join("secrets.json"));
-        assert_eq!(resolve(&perms, &root, "C:").unwrap_err().code, INVALID_ARG);
+        assert_eq!(
+            resolve_for_test(&perms, &root, "C:").unwrap_err().code,
+            INVALID_ARG
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

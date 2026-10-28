@@ -3,6 +3,7 @@
 // 清单变化 → 广播标准 topic `com.pet.todo:changed`；界面数据一律经 ctx.widget.update
 // 推到 `<id>:widget`，面板重新挂载时由宿主回灌，所以设置面板能显示当前状态。
 import { TOPIC_CHANGED, TOPIC_CMD, TOPIC_STATUS } from "./topics.js";
+import { commitDone } from "./order.js";
 import { formatLine, parseLine, sortOpen, today } from "./todo-txt.js";
 
 let ctx = null;
@@ -115,14 +116,22 @@ async function handleCmd(cmd) {
     case "toggle": {
       const task = tasks.find((t) => t.id === cmd.id);
       if (!task) return;
-      task.done = cmd.done === true;
-      task.completed = task.done ? today() : null;
-      if (task.done) {
-        delete notified[task.id];
-        await ctx.pet.react("jumping");
-        await ctx.pet.say(`「${task.text}」搞定！🎉`);
-      }
-      await afterChange(task.done ? `已完成：${task.text}` : `重新打开：${task.text}`);
+      const done = cmd.done === true;
+      const wasNotified = notified[task.id];
+      if (done) delete notified[task.id];
+      // 先落盘、再 await 宠物调用（G5-09）：宠物 reject 时状态已经存下了，不会被丢
+      await commitDone(task, done, {
+        completed: today(),
+        save: persist,
+        rollback: (err) => {
+          if (wasNotified !== undefined) notified[task.id] = wasNotified;
+          ctx?.log?.("完成状态落盘失败，已回滚", err);
+        },
+        react: (level) => ctx.pet.react(level),
+        say: (text) => ctx.pet.say(text),
+        note: (err) => ctx?.log?.("宠物反应失败（状态已落盘）", err),
+      });
+      await afterChange(done ? `已完成：${task.text}` : `重新打开：${task.text}`);
       break;
     }
     case "remove": {
@@ -169,7 +178,10 @@ export async function activate(context) {
   // 重复激活不叠定时器（宿主已把启停排进同一串行链，这里再兜一层）
   if (timer) clearInterval(timer);
   ctx = context;
-  ctx.bus.subscribe(TOPIC_CMD, (p) => void handleCmd(p));
+  // 指令链的异常不能变成未处理的 rejection（停用中、存储/宠物调用失败都走这里）
+  ctx.bus.subscribe(TOPIC_CMD, (p) => {
+    void handleCmd(p).catch((err) => ctx?.log?.("待办指令失败", err));
+  });
 
   for (const key of ["tasks", "config", "notified"]) {
     try {

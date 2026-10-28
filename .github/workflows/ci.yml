@@ -16,8 +16,10 @@ on:
   workflow_dispatch:
 
 concurrency:
+  # G1-02：main 的 push 不许被下一次 push 取消 —— 取消一次就少一个完整的 CI run，
+  # 而发版口径要求「tag 指向的提交在 main 上 CI 绿」。取消只在 PR 上是安全的（同一支反复推）。
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   windows:

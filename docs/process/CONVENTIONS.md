@@ -78,10 +78,29 @@ gh api repos/<owner>/<repo>/branches/main/protection
 - 全局快捷键唤出插件页、开机自启 ✅（非法组合键被拒、`CommandOrControl` 这类跨平台 token 可用、改键成功并归一化、自启与快捷键只认设置窗）
 - **点击穿透的原点缓存必须跟着窗口走**：`click-through.ts` 用 `tauri://move` 的**载荷位置**刷新原点（不要再回一趟 `outerPosition`，那会在页面重载时制造在飞 IPC），并保留穿透态下的定期重读兜底。系统拖拽会吞掉 `mouseup`，所以 `main.ts` 以「按键已松开」的 mousemove 认定拖完并复位 `dragEngaged` —— 少了这一步，穿透再也不会上开，宠物整块挡鼠标。真鼠标回归见 `temp` 期手工跑过的 SendInput 三步（第一次能拖、拖完仍可点、能连第二次）
 - 拖动宠物移动时按窗口真实水平位移切 `running-right` / `running-left`，松手复原拖动前的状态（起拖前是 `waiting` 就回 `waiting`，被插件插播过的姿势不抢回）✅（`npm run verify:drag`，t2 卡实跑 41 passed / 0 failed）。**真实鼠标按住拖动的 OS 拖拽循环未覆盖**，属人工验证项，步骤见「其余约定」里 `verify:drag` 那条
+- `npm run verify:dsh` 单跑 DSH 第五家（桥插件检测/接入/分离：profile 播种、空候选拒绝、`install_bundle` 指路、联动文件往返；2026-10-28 t37 实跑 43 passed / 0 failed，基线 43；一套件一实例）
+- `npm run e2e` 串行编排（`tools/e2e-run.mjs`：一套件一实例、跑完杀实例并汇总读数；实例被重建/中断时 **退出码 2 = INTERRUPTED**；**跑期禁改 `src-tauri`**，否则 dev 热重载会重编 `desktop-pet` 把套件挂起）
 - 未授权能力调用被拒绝且触发同意框 ✅；SDK 文档 ✅
 - 宠物按 petdex 九状态播放真序列帧（图集 8×9 / 8×11、单元格 192×208）✅（`npm run verify` 的「petdex 图集几何与九状态切片」组）
 - 设置窗输入 Petdex 名字（如 `deepseek`）即从公开画廊下载并换装，默认形象 `deepseek`，切换不必重启 ✅（`npm run verify:skin` 28 条：真网络安装 boba、目录穿越被拒、安装类命令只认设置窗、换装后宠物窗不重启就解码新图集、删掉当前形象回落默认）。**它钉的是「当前形象必须是已安装列表里的某一个」，不是钉死 `deepseek`** —— 后者把用户状态当宿主不变量，用户换过一次装就整片红（2026-10-15 实测：换成 qwen 后红 3 条）；随包默认形象仍在列表里单独钉一条。收尾也从此不再替用户做选择：跑完把形象还回用户原来挑的那个（旧写法走宠物窗发 `pet_skin_use`，而那条命令自己被第 2 组断言钉着「宠物窗必被拒」，所以它一直是个静默空操作）。画廊安装要下图集 + zip 各 2.4 MB，实测 2026-10-15 上午整条链路 > 20s，套件的 CDP 求值默认上限会把红写成「调试端点失去响应」，故这两次调用单独给 90s。已用真实截图确认宠物窗里播的就是画廊下载的默认形象
 - 上述大部分由 `npm run verify` 的运行时断言把守（见「约定」），不是靠人工回归
+
+### 当前离线门与 e2e 基线（2026-10-28，t37 实测）
+
+| 门 | 读数 |
+|---|---|
+| `cargo test` | 416 passed / 0 failed |
+| `npm run unit` | 2238 passed / 0 failed |
+| `check:shape` | commands=52，failing=0 |
+| `check:docs` | rules=10，failing=0 |
+| `npm run lint` | 200 files，无修 |
+| `verify` | 485 passed / 0 failed（262s） |
+| `verify:agent` | 307 passed / 0 failed（61s） |
+| `verify:drag` | 41 passed / 0 failed（11s） |
+| `verify:dsh` | 43 passed / 0 failed（2s） |
+| `npm run e2e` | 四套件串行，总 336s，0 rebuild |
+
+历史读数保留在下方段落与各卡卡面；换数字时按同一张表整行替换。
 
 ## 数据源口径
 
@@ -169,7 +188,7 @@ gh api repos/<owner>/<repo>/branches/main/protection
   那套件的 `PROBE_ID=zz.agentconsent` 是**跑起来才写进 `plugins/`、收尾删掉**的（`verify-agent-bridge.mjs:128` 与 `:809`），
   所以与它并发跑 `npm run check:docs` 会得到 `tree=102 … broken=1` 的红。判据本身没错，是并发窗口撞上了夹具 ——
   要么等套件跑完再跑文档门，要么把它排进互斥清单。**这条与「一套件一实例」是同一条纪律的两侧**：并发不只抢 CDP 端口，也抢磁盘上的插件目录。
-- **CDP 运行时套件的 CI 通路是 `.github/workflows/e2e.yml`：`workflow_dispatch` 手动触发，白名单是 `verify` / `verify:agent` / `verify:worker` / `verify:todo` / `verify:game`（清单 A3，2026-10-15 写；`verify:game` 于 2026-10-16 `ee533f8` 加入，只在点名时跑，不进默认清单）**。其余套件各有一条不能进默认清单的理由：`verify:game` 是全屏置顶窗 + 定时器（桌面堆风险，见上面那条）、`verify:release` 自占 9224 还要再编一次、`verify:astock|http|skin` 出网且数据形态随时段漂。两条形状要求：起实例前先 `npx tauri build --debug --no-bundle` 编一遍，**把编译时间挡在 `tools/wait-cdp.mjs` 的就绪等待之外**（否则那个超时看着像「webview 起不来」，其实根本没轮到它）；`verify:agent` 的写盘组要求实例带 `PET_AGENT_CONFIG_FILES`（`;` 分隔的两个路径，落在 `<仓库>/temp/a9a/`，**文件由套件自己写**），不带就是 `54 passed / 1 failed` 那种假红。本机按那几步原样复演过：等待脚本正负两支都实测（活实例上 `READY` 退 0；对着空端口 `TIMEOUT` 退 1）、`verify` **270/0**、`verify:agent` **77/0**（就是上面那条并发坑——发出去之后别再碰任何东西）。
+- **CDP 运行时套件的 CI 通路是 `.github/workflows/e2e.yml`：`workflow_dispatch` 手动触发，白名单是 `verify` / `verify:agent` / `verify:worker` / `verify:todo` / `verify:game` / `verify:goat-gauge` / `verify:drag` / `verify:dsh`（按 2026-10-28 现状对齐；`verify:game` 于 2026-10-16 `ee533f8` 加入、后四套 2026-10-28 补齐；这些点名套件仍只在点名时跑）**。其余套件各有一条不能进默认清单的理由：`verify:game` 是全屏置顶窗 + 定时器（桌面堆风险，见上面那条）、`verify:release` 自占 9224 还要再编一次、`verify:astock|http|skin` 出网且数据形态随时段漂。两条形状要求：起实例前先 `npx tauri build --debug --no-bundle` 编一遍，**把编译时间挡在 `tools/wait-cdp.mjs` 的就绪等待之外**（否则那个超时看着像「webview 起不来」，其实根本没轮到它）；`verify:agent` 的写盘组要求实例带 `PET_AGENT_CONFIG_FILES`（`;` 分隔的两个路径，落在 `<仓库>/temp/a9a/`，**文件由套件自己写**），不带就是 `54 passed / 1 failed` 那种假红。本机按那几步原样复演过：等待脚本正负两支都实测（活实例上 `READY` 退 0；对着空端口 `TIMEOUT` 退 1）、`verify` **270/0**、`verify:agent` **77/0**（就是上面那条并发坑——发出去之后别再碰任何东西）。
 **同一条环境教训在 2026-10-16 U01 复测时又踩了一次**：只给实例带 `PET_AGENT_INBOX`、漏掉 `PET_AGENT_CONFIG_FILES`，
 `verify` 不会报红而是**少跑 15 条**（当场读数 256/0，看着像"回归缩了"）—— 两套件的假红形态不一样，
 `verify:agent` 的写盘组是 `54/1`，`verify` 的 `agent:hooks` 组是静默跳过。带全两个变量冷启动复测：

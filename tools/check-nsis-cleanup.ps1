@@ -51,7 +51,10 @@
 [CmdletBinding()]
 param(
   [string] $InstallRoot = "",
-  [switch] $SkipBuild
+  [switch] $SkipBuild,
+  # Guard self-test only: run the counterexamples and exit. This file must stay ASCII --
+  # tools/unit-nsis-hook.mjs greps it and pwsh 5.1 decodes no-BOM scripts as ANSI.
+  [switch] $GuardSelfTest
 )
 
 $ErrorActionPreference = "Stop"
@@ -136,43 +139,212 @@ function Get-StaleVerdict {
   return 'fresh'
 }
 
-# --- 0. Guard rails -----------------------------------------------------------
-Step "guard: PET_AGENT_CONFIG_FILES"
-$cfgRaw = $env:PET_AGENT_CONFIG_FILES
-if ([string]::IsNullOrWhiteSpace($cfgRaw)) {
-  Write-Host "REFUSED: PET_AGENT_CONFIG_FILES is not set." -ForegroundColor Red
-  Write-Host "This script installs and uninstalls a real package. Without that"
-  Write-Host "variable the cleanup would edit the agent configuration you are"
-  Write-Host "using right now. Point it at throwaway json files and re-run."
-  exit 2
-}
-$cfgFiles = @($cfgRaw -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
-if ($cfgFiles.Count -lt 1) { Write-Host "REFUSED: the list is empty." -ForegroundColor Red; exit 2 }
-# The danger is a real agent home, not "somewhere inside the profile" -- TEMP lives
-# in the profile too and is fine.
-$blocked = @('.qoder\', '.qoder-cn\', '.zcode\', '.codex\', '.workbuddy\', '.codebuddy\')
-foreach ($f in $cfgFiles) {
-  $full = [System.IO.Path]::GetFullPath($f).ToLowerInvariant()
-  foreach ($b in $blocked) {
-    if ($full.Contains($b)) {
-      Write-Host ("REFUSED: " + $f + " points inside a real agent directory (" + $b + ").") -ForegroundColor Red
-      exit 2
-    }
+# --- 0. Guard rails: fail-closed isolation whitelist ---------------------------
+# G2-04: validating only PET_AGENT_CONFIG_FILES is not enough -- every family that
+# uninstall_everywhere touches (adapters::wired()) needs its own override checked:
+# Qoder uses PET_AGENT_CONFIG_FILES, Codex PET_AGENT_CODEX_FILES,
+# WorkBuddy PET_AGENT_WORKBUDDY_FILES, ZCode reads PET_AGENT_HOME (zcode.rs:140-153).
+# A var the guard does not validate is a var whose install/uninstall writes the real home.
+# Every path must sit under TEMP, never the real profile or a real agent directory.
+$script:GuardLookup = $null
+function Get-GuardEnv([string] $Name) {
+  if ($null -ne $script:GuardLookup) {
+    if ($script:GuardLookup.ContainsKey($Name)) { return [string]$script:GuardLookup[$Name] }
+    return ""
   }
-  $parent = Split-Path -Parent $f
-  if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+  return [string][System.Environment]::GetEnvironmentVariable($Name)
 }
-Pass ("target configs: " + ($cfgFiles -join ", "))
+function ConvertTo-NormalPath([string] $PathValue) {
+  if ([string]::IsNullOrWhiteSpace($PathValue)) { return "" }
+  $p = $PathValue.Trim().Trim('"')
+  try { $p = [System.IO.Path]::GetFullPath($p) } catch { return "" }
+  return $p.TrimEnd('\', '/').ToLowerInvariant()
+}
+function Test-PathUnderRoot([string] $Candidate, [string[]] $Roots) {
+  $c = ConvertTo-NormalPath $Candidate
+  if ($c -eq "") { return $false }
+  foreach ($r in $Roots) {
+    $n = ConvertTo-NormalPath $r
+    if ($n -ne "" -and ($c -eq $n -or $c.StartsWith($n + '\'))) { return $true }
+  }
+  return $false
+}
+$script:RealAgentDirMarkers = @('.qoder\', '.qoder-cn\', '.zcode\', '.codex\', '.workbuddy\', '.codebuddy\')
+function Test-RealAgentPath([string] $Candidate) {
+  $c = ConvertTo-NormalPath $Candidate
+  if ($c -eq "") { return $false }
+  foreach ($b in $script:RealAgentDirMarkers) { if ($c.Contains($b)) { return $true } }
+  return $false
+}
+function Get-AgentTempRoots([string] $Extra = "") {
+  $roots = @()
+  if (-not [string]::IsNullOrWhiteSpace($Extra)) { $roots += $Extra }
+  $roots += [System.IO.Path]::GetTempPath()
+  if ($env:TEMP) { $roots += $env:TEMP }
+  if ($env:TMP) { $roots += $env:TMP }
+  return @($roots | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+}
+function Get-RealAgentFiles {
+  $p = $env:USERPROFILE
+  if ([string]::IsNullOrWhiteSpace($p)) { return @() }
+  return @(
+    (Join-Path $p '.qoder\settings.json'),
+    (Join-Path $p '.qoder-cn\settings.json'),
+    (Join-Path $p '.zcode\cli\config.json'),
+    (Join-Path $p '.zcode\cli\setting.json'),
+    (Join-Path $p '.codex\hooks.json'),
+    (Join-Path $p '.workbuddy\settings.json')
+  )
+}
+function Count-PetHookIn([string[]] $Files) {
+  $n = 0
+  foreach ($f in $Files) { if (Test-Path $f) { $n += ([regex]::Matches((Read-Text $f), "--pet-hook")).Count } }
+  return $n
+}
+# G7-09: the guard is a pure function of the env (Lookup is injectable) so the counter-
+# examples are behavior-level: return Problems, the caller refuses on any hit.
+function Test-AgentEnvIsolation {
+  param(
+    [hashtable] $Lookup = $null,
+    [string] $TempRoot = "",
+    [string] $Profile = "",
+    [string] $DefaultHome = ""
+  )
+  $previous = $script:GuardLookup
+  $script:GuardLookup = $Lookup
+  $problems = New-Object System.Collections.Generic.List[string]
+  try {
+    $roots = Get-AgentTempRoots -Extra $TempRoot
+    $profileFull = ""
+    if ([string]::IsNullOrWhiteSpace($Profile)) { $profileFull = ConvertTo-NormalPath $env:USERPROFILE } else { $profileFull = ConvertTo-NormalPath $Profile }
 
-# --- 0b. Guard rails: the home root the other three adapters fall back to ------
-# PET_AGENT_CONFIG_FILES alone does NOT isolate the uninstall sweep. The cleanup branch
-# runs uninstall_everywhere over EVERY wired adapter: Qoder honours PET_AGENT_CONFIG_FILES,
-# ZCode reads PET_AGENT_HOME and nothing else, Codex and WorkBuddy prefer their own
-# *_FILES lists but fall back to PET_AGENT_HOME -- and only then to the real home
-# (src-tauri\src\services\agent\adapters\claude_style.rs:170-191, zcode.rs:140-153).
-# With the variable unset, the uninstaller's child strips --pet-hook entries out of the
-# .zcode / .codex / .workbuddy configurations belonging to whoever runs this script.
-Step "guard: PET_AGENT_HOME"
+    # A var that is set is a var whose paths must pass the guard (G2-04: CODEX / WORKBUDDY too).
+    $fileVars = @('PET_AGENT_CONFIG_FILES', 'PET_AGENT_CODEX_FILES', 'PET_AGENT_WORKBUDDY_FILES')
+    $cfgSeen = 0
+    foreach ($name in $fileVars) {
+      $raw = Get-GuardEnv $name
+      if ($name -eq 'PET_AGENT_CONFIG_FILES' -and [string]::IsNullOrWhiteSpace($raw)) {
+        $problems.Add('REFUSED: PET_AGENT_CONFIG_FILES is not set.')
+        continue
+      }
+      if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+      $paths = @($raw -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+      if ($paths.Count -eq 0) { $problems.Add("REFUSED: $name is set but empty."); continue }
+      foreach ($f in $paths) {
+        if ($name -eq 'PET_AGENT_CONFIG_FILES') { $cfgSeen++ }
+        if (-not (Test-PathUnderRoot $f $roots)) {
+          $problems.Add("REFUSED: $name entry $f is outside the TEMP whitelist.")
+        }
+        if (Test-RealAgentPath $f) {
+          $problems.Add("REFUSED: $f is or sits inside a real agent directory.")
+        }
+        if ($profileFull -ne "" -and (ConvertTo-NormalPath $f) -eq $profileFull) {
+          $problems.Add("REFUSED: $name points at the real user profile.")
+        }
+      }
+    }
+    if ($cfgSeen -eq 0 -and $problems.Count -eq 0) { $problems.Add('REFUSED: PET_AGENT_CONFIG_FILES is not set.') }
+
+    # ZCode has a single root override, so it must point into TEMP or it is refused.
+    $agentHome = Get-GuardEnv 'PET_AGENT_HOME'
+    if ([string]::IsNullOrWhiteSpace($agentHome)) { $agentHome = $DefaultHome }
+    if ([string]::IsNullOrWhiteSpace($agentHome)) {
+      $problems.Add('REFUSED: PET_AGENT_HOME is not set (ZCode reads it and nothing else).')
+    } else {
+      $homeNorm = ConvertTo-NormalPath $agentHome
+      if (-not (Test-PathUnderRoot $agentHome $roots)) {
+        $problems.Add("REFUSED: PET_AGENT_HOME $agentHome is outside the TEMP whitelist.")
+      }
+      if ($profileFull -ne "" -and $homeNorm -eq $profileFull) {
+        $problems.Add('REFUSED: PET_AGENT_HOME is the real user home.')
+      }
+      if (Test-RealAgentPath $agentHome) {
+        $problems.Add("REFUSED: PET_AGENT_HOME $agentHome is or sits inside a real agent directory.")
+      }
+    }
+
+    # The inbox dir: cleanup children inherit it, so an unguarded inbox writes the real session dir.
+    $inbox = Get-GuardEnv 'PET_AGENT_INBOX'
+    if (-not [string]::IsNullOrWhiteSpace($inbox)) {
+      if (-not (Test-PathUnderRoot $inbox $roots)) { $problems.Add("REFUSED: PET_AGENT_INBOX $inbox is outside the TEMP whitelist.") }
+      if (Test-RealAgentPath $inbox) { $problems.Add("REFUSED: PET_AGENT_INBOX $inbox is or sits inside a real agent directory.") }
+    }
+
+    # G2-06: the DSH bridge detects its bundle from <dsh_home>/profiles; an unguarded
+    # PET_DSH_HOME reads (and later attaches into) the real DSH profile.
+    $dshHome = Get-GuardEnv 'PET_DSH_HOME'
+    if (-not [string]::IsNullOrWhiteSpace($dshHome)) {
+      if (-not (Test-PathUnderRoot $dshHome $roots)) { $problems.Add("REFUSED: PET_DSH_HOME $dshHome is outside the TEMP whitelist.") }
+      if (Test-RealAgentPath $dshHome) { $problems.Add("REFUSED: PET_DSH_HOME $dshHome is or sits inside a real agent directory.") }
+      if ($profileFull -ne "" -and (ConvertTo-NormalPath $dshHome) -eq $profileFull) {
+        $problems.Add('REFUSED: PET_DSH_HOME is the real user home.')
+      }
+    }
+  } finally {
+    $script:GuardLookup = $previous
+  }
+  return [pscustomobject]@{ Ok = ($problems.Count -eq 0); Problems = @($problems) }
+}
+
+if ($GuardSelfTest) {
+  # Counterexamples: any whitelist violation must be refused, whatever the stated reason.
+  $t = [System.IO.Path]::GetTempPath().TrimEnd('\', '/')
+  $cases = @(
+    @{ Name = 'all-temp-is-ok'; Env = @{
+        PET_AGENT_CONFIG_FILES = "$t\a.json;$t\b.json"; PET_AGENT_HOME = "$t\agent-home"
+        PET_AGENT_CODEX_FILES = "$t\codex.json"; PET_AGENT_WORKBUDDY_FILES = "$t\wb.json"; PET_AGENT_INBOX = "$t\inbox" }; Ok = $true },
+    @{ Name = 'config-only-leaves-home-unset'; Env = @{ PET_AGENT_CONFIG_FILES = "$t\a.json;$t\b.json" }; Ok = $false },
+    @{ Name = 'home-is-the-real-profile'; Env = @{ PET_AGENT_CONFIG_FILES = "$t\a.json;$t\b.json"; PET_AGENT_HOME = $env:USERPROFILE }; Ok = $false },
+    @{ Name = 'home-outside-temp'; Env = @{ PET_AGENT_CONFIG_FILES = "$t\a.json;$t\b.json"; PET_AGENT_HOME = 'C:\pet-nsis-home' }; Ok = $false },
+    @{ Name = 'home-sits-in-a-real-agent-dir'; Env = @{ PET_AGENT_CONFIG_FILES = "$t\a.json;$t\b.json"; PET_AGENT_HOME = "$t\.codex\home" }; Ok = $false },
+    @{ Name = 'codex-files-point-at-real-home'; Env = @{
+        PET_AGENT_CONFIG_FILES = "$t\a.json;$t\b.json"; PET_AGENT_HOME = "$t\agent-home"
+        PET_AGENT_CODEX_FILES = "$env:USERPROFILE\.codex\hooks.json" }; Ok = $false },
+    @{ Name = 'workbuddy-files-outside-temp'; Env = @{
+        PET_AGENT_CONFIG_FILES = "$t\a.json;$t\b.json"; PET_AGENT_HOME = "$t\agent-home"
+        PET_AGENT_WORKBUDDY_FILES = 'C:\elsewhere\settings.json' }; Ok = $false },
+    @{ Name = 'workbuddy-files-relative-path'; Env = @{
+        PET_AGENT_CONFIG_FILES = "$t\a.json;$t\b.json"; PET_AGENT_HOME = "$t\agent-home"
+        PET_AGENT_WORKBUDDY_FILES = 'relative\settings.json' }; Ok = $false },
+    @{ Name = 'workbuddy-files-one-entry-outside-temp'; Env = @{
+        PET_AGENT_CONFIG_FILES = "$t\a.json;$t\b.json"; PET_AGENT_HOME = "$t\agent-home"
+        PET_AGENT_WORKBUDDY_FILES = "$t\ok.json;C:\elsewhere\settings.json" }; Ok = $false },
+    @{ Name = 'workbuddy-files-blank-means-unset'; Env = @{
+        PET_AGENT_CONFIG_FILES = "$t\a.json;$t\b.json"; PET_AGENT_HOME = "$t\agent-home"
+        PET_AGENT_WORKBUDDY_FILES = '   ' }; Ok = $true },
+    # A3 (R4): the mandatory CONFIG_FILES rule and the real-agent-dir rule for the file vars
+    # were mutation survivors. These two cases pin them: (1) no CONFIG_FILES at all is refused;
+    # (2) a temp-INNER path that still sits in .codex\ is refused by Test-RealAgentPath -- the
+    # TEMP whitelist passing must not hide it.
+    @{ Name = 'config-files-missing'; Env = @{
+        PET_AGENT_HOME = "$t\agent-home"; PET_AGENT_CODEX_FILES = "$t\codex.json" }; Ok = $false },
+    @{ Name = 'codex-files-sit-in-a-real-agent-dir-inside-temp'; Env = @{
+        PET_AGENT_CONFIG_FILES = "$t\a.json;$t\b.json"; PET_AGENT_HOME = "$t\agent-home"
+        PET_AGENT_CODEX_FILES = "$t\.codex\hooks.json" }; Ok = $false },
+    @{ Name = 'inbox-outside-temp'; Env = @{
+        PET_AGENT_CONFIG_FILES = "$t\a.json;$t\b.json"; PET_AGENT_HOME = "$t\agent-home"; PET_AGENT_INBOX = 'C:\inbox' }; Ok = $false },
+    @{ Name = 'dsh-home-temp-is-ok'; Env = @{
+        PET_AGENT_CONFIG_FILES = "$t\a.json;$t\b.json"; PET_AGENT_HOME = "$t\agent-home"; PET_DSH_HOME = "$t\dsh-home" }; Ok = $true },
+    @{ Name = 'dsh-home-outside-temp'; Env = @{
+        PET_AGENT_CONFIG_FILES = "$t\a.json;$t\b.json"; PET_AGENT_HOME = "$t\agent-home"; PET_DSH_HOME = 'C:\elsewhere\.dsh' }; Ok = $false },
+    @{ Name = 'dsh-home-is-the-real-profile'; Env = @{
+        PET_AGENT_CONFIG_FILES = "$t\a.json;$t\b.json"; PET_AGENT_HOME = "$t\agent-home"; PET_DSH_HOME = "$env:USERPROFILE\.dsh" }; Ok = $false }
+  )
+  $mismatches = 0
+  foreach ($case in $cases) {
+    $verdict = Test-AgentEnvIsolation -Lookup $case.Env
+    $actual = [bool]$verdict.Ok
+    $match = ($actual -eq [bool]$case.Ok)
+    if (-not $match) { $mismatches++ }
+    Write-Host ("guard-case name=" + $case.Name + " expected=" + $case.Ok + " actual=" + $actual + " match=" + $match + " problems=" + $verdict.Problems.Count)
+    foreach ($p in $verdict.Problems) { Write-Host ("  - " + $p) }
+  }
+  if ($mismatches -eq 0) { Write-Host "GUARD-SELFTEST ok cases=$($cases.Count)"; exit 0 }
+  Write-Host "GUARD-SELFTEST failing=$mismatches"
+  exit 1
+}
+
+Step "guard: agent isolation (fail-closed TEMP whitelist)"
 $agentHome = $env:PET_AGENT_HOME
 if ([string]::IsNullOrWhiteSpace($agentHome)) {
   # Default to a throwaway root and deliberately do NOT create it: an absent .zcode /
@@ -181,27 +353,36 @@ if ([string]::IsNullOrWhiteSpace($agentHome)) {
   $env:PET_AGENT_HOME = $agentHome
   Note ("PET_AGENT_HOME was not set; defaulted to a throwaway root: " + $agentHome)
 }
-$homeFull = [System.IO.Path]::GetFullPath($agentHome).TrimEnd('\', '/').ToLowerInvariant()
-$profileHome = ""
-if ($env:USERPROFILE) {
-  $profileHome = [System.IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd('\', '/').ToLowerInvariant()
-}
-# A home root equal to the real profile is the same exposure as leaving it unset --
-# every agent directory is created underneath it (same rule as isHomeRoot in verify-release.mjs).
-if ($profileHome -ne "" -and $homeFull -eq $profileHome) {
-  Write-Host "REFUSED: PET_AGENT_HOME is the real user home." -ForegroundColor Red
-  Write-Host "Every agent directory (.zcode / .codex / .workbuddy) resolves under it,"
-  Write-Host "which is exactly what an unset variable would have done. Point it at a"
-  Write-Host "throwaway folder under TEMP and re-run."
+$guard = Test-AgentEnvIsolation -DefaultHome $agentHome
+if (-not $guard.Ok) {
+  Write-Host "REFUSED: the agent isolation guard failed (nothing was installed)." -ForegroundColor Red
+  foreach ($p in $guard.Problems) { Write-Host ("  " + $p) -ForegroundColor Red }
+  Write-Host "This script installs and uninstalls a real package; a cleanup child that is"
+  Write-Host "not fully isolated would edit the agent configuration you are using right now."
+  Write-Host "Point every PET_AGENT_* variable at throwaway paths under TEMP and re-run."
   exit 2
 }
-foreach ($b in $blocked) {
-  if (($homeFull + '\').Contains($b)) {
-    Write-Host ("REFUSED: PET_AGENT_HOME " + $agentHome + " is or sits inside a real agent directory (" + $b + ").") -ForegroundColor Red
-    exit 2
-  }
+$cfgRaw = $env:PET_AGENT_CONFIG_FILES
+$cfgFiles = @($cfgRaw -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+foreach ($f in $cfgFiles) {
+  $parent = Split-Path -Parent $f
+  if (-not (Test-Path $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
 }
-Pass ("isolated agent home root: " + $homeFull)
+Pass ("target configs: " + ($cfgFiles -join ", "))
+# The file vars are the other half: each one is validated (not just read), so an unguarded
+foreach ($name in @('PET_AGENT_CODEX_FILES', 'PET_AGENT_WORKBUDDY_FILES')) {
+  $value = [System.Environment]::GetEnvironmentVariable($name)
+  if ([string]::IsNullOrWhiteSpace($value)) { Pass ("$name not set (verified: temp root covers the fallback)") } else { Pass ("$name isolated: " + $value) }
+}
+Pass ("isolated agent home root: " + $agentHome)
+Pass ("isolated inbox: " + $(if ($env:PET_AGENT_INBOX) { $env:PET_AGENT_INBOX } else { "(unset; suite-scoped runs set it)" }))
+
+# G2-04: count the real home's 6 files BEFORE install/uninstall and check they do not move.
+# The manual script is the only step a human runs by hand; one missed override
+# means an install/uninstall that rewrites the real configs. Before/after counts are the proof.
+$realAgentFiles = @(Get-RealAgentFiles)
+$realBefore = Count-PetHookIn $realAgentFiles
+Note ("real-home --pet-hook count BEFORE: " + $realBefore + " across " + $realAgentFiles.Count + " candidate files")
 
 $conf = Get-Content -Raw (Join-Path $Repo "src-tauri\tauri.conf.json") | ConvertFrom-Json
 $identifier = $conf.identifier
@@ -441,6 +622,11 @@ if (-not (Test-Path $exeC)) {
 
 Step "final state"
 Check ((Count-Ours) -eq 0) "temp configs carry no managed entries at exit" ("leftovers: " + (Count-Ours) + " entries")
+# G2-04: after install+uninstall, the real home's 6 files must carry the same count.
+# The guard proves every override points into TEMP; this proves nothing was written anyway.
+$realAfter = Count-PetHookIn $realAgentFiles
+Note ("real-home --pet-hook count AFTER: " + $realAfter + " (before: " + $realBefore + ")")
+Check ($realAfter -eq $realBefore) ("real-home agent configs untouched (" + $realBefore + " -> " + $realAfter + ")") ("REAL HOME WAS MODIFIED: --pet-hook count " + $realBefore + " -> " + $realAfter)
 
 # --- summary -----------------------------------------------------------------
 Step "summary"

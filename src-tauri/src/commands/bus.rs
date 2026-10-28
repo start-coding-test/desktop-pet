@@ -62,6 +62,8 @@ fn resolve_owner(
 }
 
 /// 已安装插件 id 的集合。读磁盘这件事收在这里，命令体只拿结果。
+/// G3-05：`installed_plugin_ids` 自带缓存、由插件 watcher 失效 ——
+/// 每条总线消息不再全量扫一遍插件目录。
 fn installed_id_set(app: &AppHandle) -> HashSet<String> {
     crate::commands::plugins::installed_plugin_ids(app)
         .map(|ids| ids.into_iter().collect())

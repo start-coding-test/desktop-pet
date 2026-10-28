@@ -1,7 +1,9 @@
 // 验证用临时插件 fixture：由脚本写入 plugins/、跑完删除（.gitignore 已忽略这两个名字，
 // 中途崩溃也不会被误提交）。前缀 zz. 便于人工识别残留。
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export const PROBE_ID = "zz.probe";
 export const NET_ID = "zz.net"; // 只声明 http：用于验证「按域名逐个授权」这条规则
@@ -98,6 +100,19 @@ export function writeFixtures(pluginsDir) {
   writePlugin(pluginsDir, NET_ID, NET_MANIFEST, { "index.js": PROBE_INDEX });
   // 冒名目录只放 manifest 与空入口：它应当在 plugins_list 阶段就被剔除，根本轮不到加载
   writePlugin(pluginsDir, SPOOF_DIR, SPOOF_MANIFEST, { "index.js": "export function activate() {}\n" });
+}
+
+/**
+ * 只写 zz.probe 一个探针（热安装组用）。
+ *
+ * 为什么不用 writeFixtures：热安装组要断言「页面没被热重载」，而宿主的 dev 热重载是
+ * 「覆盖了承载中插件的模块文件 → 本窗整页换茬」（src/runtime/hot-reload.ts，产品行为）。
+ * zz.net 在更早的分组里已被启用并保持 active，此时若顺手重写它的 index.js，就会触发一次
+ * 合法的热重载、掀掉本组刚埋的哨兵与广播探针 —— 那是套件自己制造的干扰，不是产品缺陷。
+ * 所以热安装组只碰「此刻不承载」的 zz.probe。
+ */
+export function writeProbeFixtures(pluginsDir) {
+  writePlugin(pluginsDir, PROBE_ID, PROBE_MANIFEST, { "index.js": PROBE_INDEX, "widget.js": PROBE_WIDGET });
 }
 
 export function removeFixtures(pluginsDir) {
@@ -275,6 +290,15 @@ export function removePreseedFixtures(pluginsDir) {
   clearPreseedFixtures(pluginsDir);
 }
 
+/**
+ * 套件收尾的统一口径：把 `plugins/` 恢复成「只有真实插件」的样子（清掉所有 zz.* / com.zz.*）。
+ * 成功、失败、中断都要走到这一步 —— `tsconfig.plugins.json` 会 typecheck `plugins/**`，
+ * 残留的探针目录会让 `npm run build` 报一堆 TS2339、`npm run lint` 的文件数也会漂。
+ */
+export function restorePluginsDir(pluginsDir) {
+  clearPreseedFixtures(pluginsDir);
+}
+
 function findPrePetBackups(dir, out = []) {
   let entries;
   try {
@@ -375,22 +399,121 @@ export const AGENT_ISOLATION_ADAPTERS = [
 ];
 
 /** 会随子进程一起带过去的隔离变量全集。收件目录也算：不设的话本机全局 hook 的真实会话
- * 会混进套件读的那份 inbox（口径同 verify-agent-bridge.mjs 顶部的 INBOX 注释）。 */
+ * 会混进套件读的那份 inbox（口径同 verify-agent-bridge.mjs 顶部的 INBOX 注释）。
+ * `PET_DSH_HOME` 也算（G2-06）：桥读的是 `~/.dsh` 里的 profile，不隔离就会读到开发机真实
+ * 的 DSH profile（fixtures 只做变量名单与转发校验；e2e.yml 的同一行改动在 F04′ 的 CI 卡里）。 */
 export const AGENT_ISOLATION_ENV_NAMES = [
   "PET_AGENT_CONFIG_FILES",
   "PET_AGENT_HOME",
   "PET_AGENT_CODEX_FILES",
   "PET_AGENT_WORKBUDDY_FILES",
   "PET_AGENT_INBOX",
+  "PET_DSH_HOME",
 ];
+
+/** 本表认识的 agent id 白名单。宿主回报的 `everywhere` 里出现表外的 id 时，
+ * 套件**不能**当作「它没有配置文件、跳过」—— 那正是「新接了一家、隔离判据静默变松」的形状，
+ * 必须判红让人把落点补进表里（G2-03 的 fail-closed 口径）。 */
+export const AGENT_ISOLATION_AGENT_IDS = AGENT_ISOLATION_ADAPTERS.map((a) => a.id);
+
+/** 表外的 agent id（空数组才放行）。 */
+export function unknownAgentIsolationAdapters(ids = []) {
+  const known = new Set(AGENT_ISOLATION_AGENT_IDS);
+  return [...new Set(ids)].filter((id) => !known.has(id));
+}
+
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+
+/** 允许写 agent 配置的临时根白名单。只有落在这些根下面的路径才算「已隔离」——
+ * 判不出（空值、相对路径、真实 home、盘符根）一律按未隔离算，不再「设了变量就信」。 */
+export function agentIsolationRoots(extra = []) {
+  return [tmpdir(), join(REPO_ROOT, "temp"), ...extra.filter(Boolean)];
+}
 
 const isBlankEnv = (value) => typeof value !== "string" || value.trim() === "";
 
+/** 路径归一化：绝对化 + 反斜杠转正斜杠 + 小写（Windows 上大小写不敏感，
+ * 原来的 `startsWith` 区分大小写，`C:\Users\X` 与 `c:\users\x` 会被判成两处）。 */
+const normalizeAgentPath = (value) => resolve(String(value)).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+
+/** `candidate` 是否就是 `root` 或在它内部（都按归一化后比较）。`root` 空 = 不构成包含关系。 */
+export function isAgentPathInside(candidate, root) {
+  if (isBlankEnv(candidate) || isBlankEnv(root)) return false;
+  const c = normalizeAgentPath(candidate);
+  const r = normalizeAgentPath(root);
+  return c === r || c.startsWith(`${r}/`);
+}
+
+/** 一个路径是否落在白名单临时根内。**只信落点**，不看它来自哪个变量：
+ * `PET_AGENT_CONFIG_FILES=C:\Users\me\.qoder\settings.json` 与没设同样危险。 */
+export function isIsolatedAgentPath(candidate, roots = agentIsolationRoots()) {
+  return roots.some((root) => isAgentPathInside(candidate, root));
+}
+
+/** `PET_AGENT_CONFIG_FILES` 这类「分号分隔多路径」的变量：每一项都要在 temp 下才算隔离。 */
+function agentEnvPaths(value) {
+  return String(value)
+    .split(";")
+    .map((p) => p.trim())
+    .filter((p) => p !== "");
+}
+
+/** 隔离变量的问题清单（空数组 = 可以转发给子进程）。值落在真实 home 或白名单之外时
+ * 直接列出来 —— 「设了但没隔离」是这次的根因，不能静默丢值。 */
+export function agentIsolationEnvProblems(source = {}, { roots = agentIsolationRoots(), realHome = "" } = {}) {
+  const problems = [];
+  for (const name of AGENT_ISOLATION_ENV_NAMES) {
+    // 空白值在 Rust 侧等于「没设」（`!v.trim().is_empty()`），不构成隔离也不构成风险；
+    // 这种情形由 unisolatedAgentAdapters 按「换根没成功」兜住。
+    if (isBlankEnv(source[name])) continue;
+    const values = agentEnvPaths(source[name]);
+    if (values.length === 0) {
+      problems.push(`${name} 是空白值`);
+      continue;
+    }
+    for (const value of values) {
+      if (!isIsolatedAgentPath(value, roots)) problems.push(`${name}=${value} 不在 temp 下`);
+      else if (isAgentPathInside(value, realHome)) problems.push(`${name}=${value} 落在真实 home`);
+    }
+  }
+  return problems;
+}
+
+/** G2-02：`tools/dev-debug.mjs` 用的 agent home 缺省值。
+ * 没设 `PET_AGENT_HOME` 时落到 `<仓库>/temp/agent-home`（dev 实例一启动就会按这个变量扫配置，
+ * 留空等于去读真实 home）；设了但不在白名单临时根下（典型：真实 home）直接抛 ——
+ * dev 里点一次「安装」就会改到用户自己的 `~/.zcode`，宁可拒绝启动。 */
+export function devAgentHomeDefault(source = {}, { roots = agentIsolationRoots(), tempRoot = join(REPO_ROOT, "temp") } = {}) {
+  const raw = typeof source.PET_AGENT_HOME === "string" ? source.PET_AGENT_HOME.trim() : "";
+  if (raw === "") return join(tempRoot, "agent-home");
+  if (!isIsolatedAgentPath(raw, roots)) {
+    throw new Error(`PET_AGENT_HOME=${raw} 不在 temp 白名单根下，拒绝启动（G2-02 fail-closed）`);
+  }
+  return resolve(raw);
+}
+
+/** G2-06：`tools/dev-debug.mjs` 用的 DSH home 缺省值。
+ * 桥的检测读 `~/.dsh`（`PET_DSH_HOME` → `PET_AGENT_HOME/.dsh` → 真实 home）；dev 实例不设时
+ * 会落到真实 home 下的 profile，所以缺省给 `<仓库>/temp/dsh-home`，并沿用同一套白名单校验。 */
+export function devDshHomeDefault(source = {}, { roots = agentIsolationRoots(), tempRoot = join(REPO_ROOT, "temp") } = {}) {
+  const raw = typeof source.PET_DSH_HOME === "string" ? source.PET_DSH_HOME.trim() : "";
+  if (raw === "") return join(tempRoot, "dsh-home");
+  if (!isIsolatedAgentPath(raw, roots)) {
+    throw new Error(`PET_DSH_HOME=${raw} 不在 temp 白名单根下，拒绝启动（G2-06 fail-closed）`);
+  }
+  return resolve(raw);
+}
+
 /**
- * 从给定 env 里挑出没空白的隔离变量，返回可直接展开进 spawn `env:` 的补丁对象。
- * 只返回已设置的键，不会把外部值覆盖成空串（Rust 侧 `!v.trim().is_empty()` 同口径）。
+ * 从给定 env 里挑出**已通过白名单校验**的隔离变量，返回可直接展开进 spawn `env:` 的补丁对象。
+ * 与旧版最大的不同：不是「设了就转发」—— 设了却在 temp 之外（典型是真实 home）时直接抛错。
+ * 静默丢弃会让子进程退回真实 home，等于把最危险的配置当默认值用。
  */
-export function agentIsolationEnv(source = {}) {
+export function agentIsolationEnv(source = {}, options = {}) {
+  const problems = agentIsolationEnvProblems(source, options);
+  if (problems.length > 0) {
+    throw new Error(`拒绝转发未隔离的 agent 变量: ${problems.join("；")}`);
+  }
   const out = {};
   for (const name of AGENT_ISOLATION_ENV_NAMES) {
     if (!isBlankEnv(source[name])) out[name] = source[name];
@@ -399,24 +522,96 @@ export function agentIsolationEnv(source = {}) {
 }
 
 /**
- * 给定 env 下**仍会退到真实 home** 的适配器 id 列表；返回空数组才允许起一个会改
- * agent 配置的子进程。`PET_AGENT_HOME` 指到真实 home 本身与没设是同一件事（写文件那几家的
- * 目录都建在它下面），所以那种值按未隔离判 —— 与 verify-release.mjs 的 `isHomeRoot` 同口径。
+ * 给定 env 下**仍会退到真实 home / 写到真实目录**的适配器 id 列表；返回空数组才允许起一个
+ * 会改 agent 配置的子进程。
+ *
+ * fail-closed 三条（G2-03）：
+ * 1. 逐文件变量设了也要看落点：值不在白名单 temp 根下（或落在真实 home）仍判未隔离；
+ * 2. 没有逐文件变量的那家（ZCode）只认 `PET_AGENT_HOME`，换根不成功就判未隔离；
+ * 3. 判不出（空值/空白）与「等于真实 home」同判未隔离。
  * 没有 `realHomeFiles` 的适配器（DSH）不参与：它没有可改写的文件，天然不构成跨 home 风险。
  */
-export function unisolatedAgentAdapters(source = {}, realHome = "") {
-  const root = source.PET_AGENT_HOME;
-  const rootIsolated =
-    !isBlankEnv(root) && (isBlankEnv(realHome) ? true : resolve(root) !== resolve(realHome));
-  return AGENT_ISOLATION_ADAPTERS.filter(
-    (a) => a.realHomeFiles.length > 0 && !(rootIsolated || !isBlankEnv(source[a.filesEnv])),
-  ).map((a) => a.id);
+export function unisolatedAgentAdapters(source = {}, realHome = "", options = {}) {
+  const roots = options.tempRoots ?? agentIsolationRoots();
+  const out = [];
+  for (const adapter of AGENT_ISOLATION_ADAPTERS) {
+    if (adapter.realHomeFiles.length === 0) continue;
+    if (adapter.filesEnv) {
+      const raw = source[adapter.filesEnv];
+      if (!isBlankEnv(raw)) {
+        const paths = agentEnvPaths(raw);
+        const ok =
+          paths.length > 0 &&
+          paths.every((p) => isIsolatedAgentPath(p, roots) && !isAgentPathInside(p, realHome));
+        if (!ok) out.push(adapter.id);
+        continue;
+      }
+    }
+    const home = source.PET_AGENT_HOME;
+    if (isBlankEnv(home) || !isIsolatedAgentPath(home, roots) || isAgentPathInside(home, realHome)) {
+      out.push(adapter.id);
+    }
+  }
+  return out;
 }
 
 /** 真实 home 下会写文件的几家的候选文件（绝对路径）。文件在不在由调用方判，这里只拼路径 ——
  * 一个都没有也是合法结果（那台机器没装这些客户端）。 */
 export function realHomeAgentFiles(realHome) {
   return AGENT_ISOLATION_ADAPTERS.flatMap((a) => a.realHomeFiles.map((rel) => join(realHome, ...rel.split("/"))));
+}
+
+/**
+ * G2-01：宿主 `agent_hooks_status` 回报的 `everywhere` 里，哪些路径**不在 temp 下**。
+ * 返回空数组才允许起会改写 agent 配置的子进程。
+ *
+ * 这是套件唯一可信的隔离判据：宿主按自己的 env 解析出「实际生效的候选路径」，
+ * 套件不用再猜宿主认哪个变量。fail-closed —— 任何判不出来的形状都返回问题：
+ * - 没回报 `everywhere`（旧宿主 / 字段被删）→ 判红；
+ * - `everywhere.home` 不在 temp 下 → 判红；
+ * - 适配器 id 不在白名单（表外的 agent 说明隔离判据没人维护）→ 判红；
+ * - 表里的适配器没回报（少一家 = 少一处检查）→ 判红；
+ * - 任何一条候选路径不在 temp 下 / 落在真实 home → 判红。
+ *
+ * @param {unknown} everywhere `agent_hooks_status` 返回对象里的 `everywhere`
+ * @param {{roots?: string[], realHome?: string}} [options]
+ */
+export function hostIsolationProblems(everywhere, { roots = agentIsolationRoots(), realHome = "" } = {}) {
+  const record = everywhere !== null && typeof everywhere === "object" ? everywhere : null;
+  const adapters = Array.isArray(record?.adapters) ? record.adapters : null;
+  if (!adapters) return ["宿主没有回报 everywhere.adapters（判不出就判红）"];
+  const problems = [];
+  if (!isIsolatedAgentPath(record.home, roots) || isAgentPathInside(record.home, realHome)) {
+    problems.push(`宿主实际生效 home=${String(record.home)} 不在 temp 下`);
+  }
+  const specs = new Map(AGENT_ISOLATION_ADAPTERS.map((spec) => [spec.id, spec]));
+  const seen = new Set();
+  for (const item of adapters) {
+    const id = typeof item?.agent === "string" ? item.agent : "";
+    const spec = specs.get(id);
+    if (!spec) {
+      problems.push(`表外 agent id=${id || "<空>"}（隔离白名单里没有，判不出就判红）`);
+      continue;
+    }
+    seen.add(id);
+    const files = Array.isArray(item.files) ? item.files : null;
+    if (!files) {
+      problems.push(`${id}: 没回报文件列表（判不出就判红）`);
+      continue;
+    }
+    for (const file of files) {
+      if (!isIsolatedAgentPath(file, roots) || isAgentPathInside(file, realHome)) {
+        problems.push(`${id}: ${String(file)} 不在 temp 下`);
+      }
+    }
+    if (item.installsFiles !== false && spec.realHomeFiles.length > 0 && files.length === 0) {
+      problems.push(`${id}: 装文件型适配器却回报了空候选路径`);
+    }
+  }
+  for (const id of specs.keys()) {
+    if (!seen.has(id)) problems.push(`${id}: 宿主没回报（少一家 = 少一处检查，判红）`);
+  }
+  return problems;
 }
 
 /**

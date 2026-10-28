@@ -7,6 +7,8 @@ import { argv, env, platform } from "node:process";
 import {
   cleanAgentTempState,
   clearPreseedFixtures,
+  devAgentHomeDefault,
+  devDshHomeDefault,
   prunePreseedEnabledIds,
   removePreseedFixtures,
   writePreseedFixtures,
@@ -19,6 +21,37 @@ const tempRoot = fileURLToPath(new URL("../temp", import.meta.url));
 const appDataDir = env.APPDATA
   ? join(env.APPDATA, JSON.parse(readFileSync(fileURLToPath(new URL("../src-tauri/tauri.conf.json", import.meta.url)), "utf8")).identifier)
   : null;
+
+/**
+ * G2-02：dev 实例一启动就会按 `PET_AGENT_HOME` 扫各家配置；没设时必须给 temp 下的缺省值，
+ * 设成白名单之外（典型是真实 home）时直接拒绝启动 —— 否则 dev 里点一次「安装」
+ * 就把用户自己的 `~/.zcode` / `~/.codex` 改了。缺省值同时写回 env，子进程一并继承。
+ */
+function prepareAgentHome() {
+  const home = devAgentHomeDefault(env, { tempRoot });
+  if (env.PET_AGENT_HOME !== home) {
+    if (env.PET_AGENT_HOME) console.log(`[dev-debug] PET_AGENT_HOME 在 temp 白名单内: ${home}`);
+    else console.log(`[dev-debug] PET_AGENT_HOME 未设，缺省隔离到: ${home}`);
+    env.PET_AGENT_HOME = home;
+  }
+  mkdirSync(home, { recursive: true });
+  return home;
+}
+
+/**
+ * G2-06：桥检测读 `~/.dsh` 的 profile；dev 实例缺省要落到 temp，否则会读到开发机真实的
+ * DSH profile（在 dev 里点一次「连接 DSH」就会去改真实 profile 的 bundles）。
+ */
+function prepareDshHome() {
+  const dshHome = devDshHomeDefault(env, { tempRoot });
+  if (env.PET_DSH_HOME !== dshHome) {
+    if (env.PET_DSH_HOME) console.log(`[dev-debug] PET_DSH_HOME 在 temp 白名单内: ${dshHome}`);
+    else console.log(`[dev-debug] PET_DSH_HOME 未设，缺省隔离到: ${dshHome}`);
+    env.PET_DSH_HOME = dshHome;
+  }
+  mkdirSync(dshHome, { recursive: true });
+  return dshHome;
+}
 
 /**
  * A31：GATE 下把热键设置的落盘目录挪进隔离目录。
@@ -72,7 +105,7 @@ function preseed() {
     cleanAgentTempState({
       tempRoot,
       configFiles,
-      agentHome: env.PET_AGENT_HOME ?? "",
+      agentHome: env.PET_AGENT_HOME ?? agentHome,
     });
   } else if (env.GITHUB_ACTIONS === "true") {
     throw new Error("GITHUB_ACTIONS 下缺 PET_AGENT_CONFIG_FILES，拒绝在脏 agent 状态下启动");
@@ -80,6 +113,9 @@ function preseed() {
 }
 
 let settingsDir = env.PET_SETTINGS_DIR || null;
+// 无论 GATE 与否都要先定隔离 home：本地 dev 与 CI 一样不该读真实 home。
+const agentHome = prepareAgentHome();
+prepareDshHome();
 
 if (GATE) {
   try {

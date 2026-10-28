@@ -104,62 +104,92 @@ impl StoreState {
     }
 }
 
-/// 存储命令的统一入口检查：先过能力门禁，再解析落点。
+/// 存储命令的统一入口检查：先过窗口归属 + 能力门禁，再解析落点。
 ///
 /// JS 桥按 manifest 逐项 gated（`ctx.storage`），但绕过桥直接 `invoke('store_get')`
 /// 的插件以前不受任何约束 —— 与 BLE / http 同类问题，收在 Rust 侧（见 gate.rs）。
-/// 同 realm 的插件冒名他人 id 仍拦不住，那条要等 Web Worker 宿主。
+/// 同 realm 的插件冒名他人 id 仍拦不住，那条要等 Web Worker 宿主；
+/// 但「插件自己的悬浮窗冒用别的 id」由 gate::window_owns_plugin 挡住（G3-01）。
 fn resolve(
+    window: &tauri::Window,
     perms: &PermissionState,
     store: &StoreState,
     plugin_id: &str,
 ) -> Result<PathBuf, HostError> {
-    crate::gate::plugin_capability(perms, plugin_id, crate::plugin_caps::STORAGE)?;
+    crate::gate::plugin_capability(window, perms, plugin_id, crate::plugin_caps::STORAGE)?;
+    store.plugin_file(plugin_id)
+}
+
+/// 单测专用：不造 AppHandle/Window，只钉「能力门禁 + 落点」这两段；
+/// 窗口归属由 gate.rs 自己的单测覆盖。
+#[cfg(test)]
+fn resolve_for_test(
+    perms: &PermissionState,
+    store: &StoreState,
+    plugin_id: &str,
+) -> Result<PathBuf, HostError> {
+    crate::gate::plugin_capability_for(perms, plugin_id, crate::plugin_caps::STORAGE)?;
     store.plugin_file(plugin_id)
 }
 
 #[tauri::command]
-pub fn store_get(
-    state: tauri::State<StoreState>,
-    perms: tauri::State<PermissionState>,
+pub async fn store_get(
+    window: tauri::Window,
+    state: tauri::State<'_, StoreState>,
+    perms: tauri::State<'_, PermissionState>,
     plugin_id: String,
     key: String,
 ) -> Result<Option<Value>, HostError> {
-    let path = resolve(&perms, &state, &plugin_id)?;
+    let path = resolve(&window, &perms, &state, &plugin_id)?;
     let lock = plugin_lock(&plugin_id);
-    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-    Ok(StoreState::read_map(&path)?.get(&key).cloned())
+    // G3-05：读盘移到阻塞线程池，别让文件 IO 卡住主线程 / IPC 线程
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(StoreState::read_map(&path)?.get(&key).cloned())
+    })
+    .await
+    .map_err(|e| HostError::new(INTERNAL, format!("存储任务失败: {e}")))?
 }
 
 #[tauri::command]
-pub fn store_set(
-    state: tauri::State<StoreState>,
-    perms: tauri::State<PermissionState>,
+pub async fn store_set(
+    window: tauri::Window,
+    state: tauri::State<'_, StoreState>,
+    perms: tauri::State<'_, PermissionState>,
     plugin_id: String,
     key: String,
     value: Value,
 ) -> Result<(), HostError> {
-    let path = resolve(&perms, &state, &plugin_id)?;
+    let path = resolve(&window, &perms, &state, &plugin_id)?;
     let lock = plugin_lock(&plugin_id);
-    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-    let mut map = StoreState::read_map(&path)?;
-    map.insert(key, value);
-    StoreState::write_map(&path, &map)
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut map = StoreState::read_map(&path)?;
+        map.insert(key, value);
+        StoreState::write_map(&path, &map)
+    })
+    .await
+    .map_err(|e| HostError::new(INTERNAL, format!("存储任务失败: {e}")))?
 }
 
 #[tauri::command]
-pub fn store_delete(
-    state: tauri::State<StoreState>,
-    perms: tauri::State<PermissionState>,
+pub async fn store_delete(
+    window: tauri::Window,
+    state: tauri::State<'_, StoreState>,
+    perms: tauri::State<'_, PermissionState>,
     plugin_id: String,
     key: String,
 ) -> Result<(), HostError> {
-    let path = resolve(&perms, &state, &plugin_id)?;
+    let path = resolve(&window, &perms, &state, &plugin_id)?;
     let lock = plugin_lock(&plugin_id);
-    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-    let mut map = StoreState::read_map(&path)?;
-    map.remove(&key);
-    StoreState::write_map(&path, &map)
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut map = StoreState::read_map(&path)?;
+        map.remove(&key);
+        StoreState::write_map(&path, &map)
+    })
+    .await
+    .map_err(|e| HostError::new(INTERNAL, format!("存储任务失败: {e}")))?
 }
 
 #[cfg(test)]
@@ -183,13 +213,13 @@ mod tests {
     fn resolve_denies_without_storage_grant() {
         let store = store_rooted_at(tmp_store(&format!("grant-{}", std::process::id())));
         let perms = PermissionState::new();
-        let err = resolve(&perms, &store, "todo").unwrap_err();
+        let err = resolve_for_test(&perms, &store, "todo").unwrap_err();
         assert!(err.message.contains("未授权 storage"), "实际: {err}");
         assert_eq!(err.code, crate::host_error::DENIED, "没授权 = denied 码");
         perms.grant("todo", &["storage".to_string()]);
-        assert!(resolve(&perms, &store, "todo").is_ok());
+        assert!(resolve_for_test(&perms, &store, "todo").is_ok());
         // 授权按插件分开：别的插件不跟着沾光
-        assert!(resolve(&perms, &store, "todo.other").is_err());
+        assert!(resolve_for_test(&perms, &store, "todo.other").is_err());
     }
 
     /// 盘符式 id（`C:`）、穿越、分隔符、过短一律按非法 id 拒 —— 与 is_safe_id 同口径。
@@ -200,7 +230,7 @@ mod tests {
         let store = store_rooted_at(tmp_store(&format!("vocab-{}", std::process::id())));
         let perms = PermissionState::new();
         for id in ["C:", "../evil", "a/b", r"a\b", "", "ab", "a b", "Todo/../x"] {
-            let err = resolve(&perms, &store, id).unwrap_err();
+            let err = resolve_for_test(&perms, &store, id).unwrap_err();
             assert_eq!(
                 err.message, "invalid plugin id",
                 "{id} 应按非法 id 被拒，实际: {err}"
@@ -209,7 +239,7 @@ mod tests {
         }
         // 就算授权表里真有这么一条也不会放行：id 合法性排在授权之前
         perms.grant("C:", &["storage".to_string()]);
-        assert!(resolve(&perms, &store, "C:").is_err());
+        assert!(resolve_for_test(&perms, &store, "C:").is_err());
     }
 
     /// 合法 id 的落点必须仍在 `plugins/<id>/store.json` 之内
@@ -219,7 +249,7 @@ mod tests {
         let store = store_rooted_at(root.clone());
         let perms = PermissionState::new();
         perms.grant("com.pet.astock", &["storage".to_string()]);
-        let path = resolve(&perms, &store, "com.pet.astock").unwrap();
+        let path = resolve_for_test(&perms, &store, "com.pet.astock").unwrap();
         assert_eq!(path, root.join("com.pet.astock").join("store.json"));
         let _ = fs::remove_dir_all(&root);
     }

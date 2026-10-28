@@ -33,9 +33,13 @@ function rustList(src, marker) {
   return [...src.slice(open, close).matchAll(/"([^"]+)"/g)].map((m) => m[1]);
 }
 
-/** 取 Rust 顶层 `fn name` 的函数体原文（到下一个行首 `}` 为止）。 */
+/** 取 Rust 顶层 `fn name` 的函数体原文（到下一个行首 `}` 为止）。
+ *
+ * G7-02：此前用 `indexOf("fn name")` 前缀匹配 —— `fn inbox_dir_idle` 也会命中
+ * `inbox_dir`，对读的其实是另一个函数（或者根本不存在）。这里要求词边界 + 紧跟 `(`。
+ */
 function rustFn(src, name) {
-  const at = src.indexOf(`fn ${name}`);
+  const at = src.search(new RegExp(`\\bfn\\s+${name}\\s*\\(`));
   if (at < 0) throw new Error(`找不到 fn ${name}`);
   const end = src.indexOf("\n}", at);
   if (end < 0) throw new Error(`找不到 fn ${name} 的结尾`);
@@ -146,6 +150,33 @@ eq(
   line("s1", { type: "tool/result", time: at, data: { error: { code: "transport" } } }).phase,
   "tool-failure",
 );
+// G6-12：DSH 的 transport 结果里 `error` 键常在，但「没有错误」是 null。
+// 此前用 `!== undefined` 把 error:null 也判成失败，桌宠会凭空红一下。
+eq(
+  "error:null 不是失败（G6-12）",
+  line("s1", { type: "tool/result", time: at, data: { message: { isError: false }, error: null } }).phase,
+  "post",
+);
+eq(
+  "error:false 不是失败",
+  line("s1", { type: "tool/result", time: at, data: { error: false } }).phase,
+  "post",
+);
+eq(
+  "空白字符串 error 不是失败",
+  line("s1", { type: "tool/result", time: at, data: { error: "   " } }).phase,
+  "post",
+);
+eq(
+  "字符串错误仍判失败",
+  line("s1", { type: "tool/result", time: at, data: { error: "transport closed" } }).phase,
+  "tool-failure",
+);
+eq(
+  "工具自身 isError 时即使 error:null 也判失败",
+  line("s1", { type: "tool/result", time: at, data: { message: { isError: true }, error: null } }).phase,
+  "tool-failure",
+);
 
 {
   const got = line("s1", { type: "approval/asked", time: at, data: { id: "a1", toolName: "pwsh" } });
@@ -227,31 +258,38 @@ eq("自定义上限", mapping.clip("x".repeat(10), 4), "xxxx");
 /* ============================ 收件目录解析 ============================ */
 group("resolveInbox 的三级顺序");
 
+// G7-01：桥只负责「顺序 + 绝对路径判定 + 回退拼法」，路径规则属于平台。
+// 这里注入 Windows 口径（真实用户环境），不依赖跑测试的机器 —— 此前用宿主 node:path
+// 的 isAbsolute，Linux runner 上 `C:\…` 夹具全判相对：要么红，要么在失败路径上绿。
+const winPaths = {
+  isAbsolute: (p) => /^[A-Za-z]:[\\/]/.test(p) || p.startsWith("\\\\"),
+  join: (...parts) => parts.join("\\"),
+};
+
 {
   const abs = "C:\\pet-inbox";
-  eq(
-    "config.inboxDir 优先于环境变量",
-    bridge.resolveInbox({ inboxDir: abs }, { PET_AGENT_INBOX: "C:\\env" }).dir,
-    abs,
-  );
+  const got = bridge.resolveInbox({ inboxDir: abs }, { PET_AGENT_INBOX: "C:\\env" }, winPaths);
+  eq("config.inboxDir 优先于环境变量", got.dir, abs);
+  eq("命中时 dir 不是 null（失败路径不许绿）", got.dir === null, false);
+  eq("命中的来源是 config.inboxDir", got.source, "config.inboxDir");
   eq(
     "config 里是相对路径就跳过（只接受绝对路径）",
-    bridge.resolveInbox({ inboxDir: "relative/dir" }, { PET_AGENT_INBOX: "C:\\env" }).dir,
+    bridge.resolveInbox({ inboxDir: "relative/dir" }, { PET_AGENT_INBOX: "C:\\env" }, winPaths).dir,
     "C:\\env",
   );
   eq(
     "环境变量也必须是绝对路径",
-    bridge.resolveInbox({}, { PET_AGENT_INBOX: "rel", APPDATA: "C:\\Users\\x\\AppData\\Roaming" }).dir,
+    bridge.resolveInbox({}, { PET_AGENT_INBOX: "rel", APPDATA: "C:\\Users\\x\\AppData\\Roaming" }, winPaths).dir,
     // APPDATA 本身已是 …\AppData\Roaming，第三级只接 identifier\agent\inbox
-    join("C:\\Users\\x\\AppData\\Roaming", bridge.APP_IDENTIFIER, "agent", "inbox"),
+    winPaths.join("C:\\Users\\x\\AppData\\Roaming", bridge.APP_IDENTIFIER, "agent", "inbox"),
   );
 }
 
 {
-  const miss = bridge.resolveInbox({}, {});
+  const miss = bridge.resolveInbox({}, {}, winPaths);
   eq("三级都没配时不给目录", miss.dir, null);
   check("miss 结果里带最后一试的来源（日志要能说清哪一级配错了）", typeof miss.source === "string" && miss.source !== "");
-  const rel = bridge.resolveInbox({}, { PET_AGENT_INBOX: "rel", APPDATA: "" });
+  const rel = bridge.resolveInbox({}, { PET_AGENT_INBOX: "rel", APPDATA: "" }, winPaths);
   eq("有值但不是绝对路径时同样判 null", rel.dir, null);
   eq("来源指向最后一个候选", rel.source, "PET_AGENT_INBOX");
 }
@@ -271,6 +309,64 @@ const appDataFn = rustFn(inboxSrc, "app_data_dir_standalone");
 const inboxFn = rustFn(inboxSrc, "inbox_dir");
 /** 函数体里 `.join("字面量")` 的段（按出现顺序）；`join(标识符)` 不算，另由断言钉。 */
 const literalJoins = (body) => [...body.matchAll(/\.join\(\s*"([^"]+)"\s*\)/g)].map((m) => m[1]);
+
+/** G7-02：`.join(...)` 的实参必须是字符串字面量或标识符/`identifier()` 这类调用。
+ *  出现 `.join(a + b)`、`.join([…].join(""))` 之类拼接时判红 —— 否则路径拼错了，
+ *  对读（只认字面量）会静默通过，等于没测。
+ *  取实参要按括号配对找收尾：`join(identifier())` 里第一个 `)` 是内层调用的，不能当收尾。 */
+function joinArgs(body) {
+  const args = [];
+  let from = 0;
+  for (let at = body.indexOf(".join(", from); at >= 0; at = body.indexOf(".join(", from)) {
+    let depth = 0;
+    let end = -1;
+    for (let i = at + ".join".length; i < body.length; i += 1) {
+      if (body[i] === "(") depth += 1;
+      else if (body[i] === ")") {
+        depth -= 1;
+        if (depth === 0) {
+          end = i;
+          break;
+        }
+      }
+    }
+    if (end < 0) break;
+    args.push(body.slice(at + ".join(".length, end).trim());
+    from = end + 1;
+  }
+  return args;
+}
+
+function assertJoinArgs(body, where) {
+  for (const text of joinArgs(body)) {
+    check(
+      `${where} 的 join 实参可静态读出: ${text}`,
+      /^"[^"]*"$|^[A-Za-z_][A-Za-z0-9_:]*(\(\))?$/.test(text),
+    );
+  }
+}
+assertJoinArgs(appDataFn, "app_data_dir_standalone");
+assertJoinArgs(inboxFn, "inbox_dir");
+
+// 判据自身的正/反例（G7-02）：扫描器要认得出 `.join(identifier())` 这种调用式，
+// 又不能让「把 identifier 写死成字面量」混过去 —— 否则去掉宿主函数只留早绿，等于没测。
+deep("join 实参扫描：嵌套调用不被内层括号截断", joinArgs("x.join(identifier())"), ["identifier()"]);
+check(
+  "join 实参扫描：拼接式实参判红",
+  !joinArgs("x.join(a + b)")
+    .concat(joinArgs("x.join([a, b].join(''))"))
+    .every((text) => /^"[^"]*"$|^[A-Za-z_][A-Za-z0-9_:]*(\(\))?$/.test(text)),
+);
+/** 宿主 appData 目录必须由 `identifier()` 拼出来；把 identifier 写死成字符串不算。 */
+function appDataUsesHostIdentifier(body) {
+  return /\.join\(\s*identifier\(\)\s*\)/.test(body) && literalJoins(body).length === 0;
+}
+check("正例：`.join(identifier())` 认作宿主拼法", appDataUsesHostIdentifier("fn x() { base.join(identifier()) }"));
+check(
+  "反例：凭空写死的 identifier 字面量判红",
+  !appDataUsesHostIdentifier('fn x() { base.join("com.desktoppet.pet") }'),
+);
+check("宿主 app_data_dir_standalone 走的就是宿主拼法", appDataUsesHostIdentifier(appDataFn));
 
 deep("宿主 app_data_dir_standalone 不自己加 AppData\\Roaming（只按 identifier 拼一层）", literalJoins(appDataFn), []);
 check(
@@ -297,10 +393,24 @@ eq("identifier() 读到的那份配置与上面比对的一致", embedded.identi
   // 真实 Windows 上 %APPDATA% 的取值形状；宿主与桥都必须只往后接 identifier\agent\inbox。
   const appData = "C:\\Users\\x\\AppData\\Roaming";
   const hostSubpath = [tauriConf.identifier, ...literalJoins(inboxFn)];
-  const resolved = bridge.resolveInbox({}, { APPDATA: appData });
+  const resolved = bridge.resolveInbox({}, { APPDATA: appData }, winPaths);
   eq("回退命中的来源就是 APPDATA（不是别的级）", resolved.source, "APPDATA");
-  eq("收件目录回退值与宿主拼法逐字一致", resolved.dir, join(appData, ...hostSubpath));
+  eq("回退命中时 dir 不是 null", resolved.dir === null, false);
+  eq("收件目录回退值与宿主拼法逐字一致", resolved.dir, winPaths.join(appData, ...hostSubpath));
 }
+
+/* ================== watcher 读取侧 ↔ 桥写入侧（G7-02） ================== */
+// 上面只对读了「hook 写入侧 / 桥的回退拼法」；真正读收件目录的是 watcher：
+//   watcher.rs::spawn_agent_watcher  → inbox_dir(app_data_dir)
+//   watcher.rs::start_agent_ticker   → inbox_dir(app_data_dir)
+// 两处都必须走同一个解析器（再拼一次 AppData 就会永远读不到桥写的行）。
+const watcherSrc = rust("src-tauri/src/services/agent/watcher.rs");
+for (const name of ["spawn_agent_watcher", "start_agent_ticker"]) {
+  const body = rustFn(watcherSrc, name);
+  check(`${name} 用宿主同一个 inbox_dir 解析器`, body.includes("inbox_dir("));
+  assertJoinArgs(body, name);
+}
+check("watcher 不自己拼 AppData 路径（目录解析只有一处）", !watcherSrc.includes("AppData"));
 
 /* ============================ 真写盘：createSink / apply ============================ */
 group("createSink：一行一条、每个 phase 一个文件");
@@ -325,6 +435,21 @@ try {
     (await readFile(join(dir, "pre.jsonl"), "utf8")).trim().split("\n").length,
     2,
   );
+
+  // G6-11：写侧上限。桥住在 DSH 里，卸载/断开之后仍可能活着 —— 无界追加能把磁盘写满，
+  // 所以在落盘前就按「单行字节 / 文件总字节 / 排队行数」三道闸拦住，超限只报告一次。
+  eq("上限常量都已导出（单行 32KiB）", bridge.MAX_LINE_BYTES, 32 * 1024);
+  eq("上限常量都已导出（单文件 8MiB）", bridge.MAX_FILE_BYTES, 8 * 1024 * 1024);
+  eq("上限常量都已导出（排队 256 行）", bridge.MAX_PENDING, 256);
+  const capped = [];
+  const finite = bridge.createSink(dir, (message) => capped.push(message));
+  const huge = mapping.sessionStartLine({ id: "s" }, 1);
+  huge.payload.prompt = "x".repeat(bridge.MAX_LINE_BYTES + 1);
+  finite.write(huge);
+  await finite.idle();
+  eq("超过单行上限的那条不落盘", (await readdir(dir)).includes("session-start.jsonl"), false);
+  eq("超限只报告一次", capped.length, 1);
+  check("报告点明是单行超限", capped[0].includes("上限") && capped[0].includes(String(bridge.MAX_LINE_BYTES)));
 
   // 写不进去：只报一次，且报告里点明收件目录（写不进去要能定位，不能安静吞掉）
   const blocker = join(dir, "blocker");
@@ -371,6 +496,13 @@ try {
   // 子代理收尾同样不转发：它没有开头的 session-start，单独一条 session-end 会在
   // 宿主的会话表里凭空造出一个「刚结束」的会话（父会话的状态会被它带偏）。
   handlers.get("session/disposed")({ id: "child", header: { delegationDepth: 1 } });
+  // G6-13：桥在一轮中途装上时，子代理的 session/created 已经错过 —— 只看登记表会把
+  // 子代理的每一步算成父会话的一步（步数翻倍）。事件/收尾各自按 session 再判一次。
+  handlers.get("session/event")(
+    { id: "late-child", header: { delegationDepth: 2 } },
+    { type: "tool/call", time: 12, data: { name: "grep" } },
+  );
+  handlers.get("session/disposed")({ id: "late-child", header: { delegationDepth: 2 } });
 
   eq("注册了停用时的冲刷钩子", effects.length, 1);
   // cordis 的 effect 收的是「返回 cleanup 的工厂」：先取到 cleanup 再调它。

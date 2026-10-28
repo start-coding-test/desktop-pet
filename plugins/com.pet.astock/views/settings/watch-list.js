@@ -17,6 +17,40 @@ const HEADS = ["名称", "现价 / 涨跌", "涨到", "跌到", "±%", "停", ""
 const EMPTY_ROW = "\u0000empty";
 
 /**
+ * 回显一步的纯决策（G5-01）：DOM 在 Worker 里拿不到，锁的行为只能拆成纯函数钉住。
+ * 结局：
+ *   - force（刚点过「存」）→ 无条件按宿主的值重画一次并记台账：存进去的非法值被钳成空时，
+ *     这一步就是把框里那串没生效的草稿清掉的地方；合法值时也只是把同一串写回，幂等。
+ *   - 编辑中且宿主已追上用户填的串 → 放开锁、把台账记成这串、不写；
+ *   - 编辑中且还没追上 → 不写，草稿留着；
+ *   - 没在编辑 → 台账与目标不同才写，避免每帧重发同一个 op。
+ * @param {{editing?: boolean, value?: string, want?: string, ledger?: string|null, force?: boolean}} input
+ * @returns {{release: boolean, write: boolean, ledger: string}}
+ */
+export function echoStep({ editing = false, value = "", want = "", ledger = null, force = false } = {}) {
+  // 「存」之后强制对齐一次：不信任框里的草稿，也不信任台账
+  if (force) return { release: false, write: true, ledger: want };
+  if (editing) {
+    // 追上即放开：这时写回的就是用户自己填的那串，冲不掉任何东西
+    if (value === want) return { release: true, write: false, ledger: want };
+    return { release: false, write: false, ledger };
+  }
+  if (ledger === want) return { release: false, write: false, ledger: want };
+  return { release: false, write: true, ledger: want };
+}
+
+/**
+ * 点「存」要记进台账的串（G5-01）：**框里的实际值**，不是配置里的旧值。
+ * 少了这一步，存进去的非法值被宿主钳成空值时，回显判定「台账已经是空串」而不写，
+ * 框里就留下一串没有生效的草稿 —— 用户以为存上了，其实存的是空。
+ * @param {{upper?: string, lower?: string, pct?: string}} boxes 三个输入框的当前串
+ */
+export function savedLedger(boxes = {}) {
+  const str = (v) => String(v ?? "").trim();
+  return { upper: str(boxes.upper), lower: str(boxes.lower), pctNum: str(boxes.pct) };
+}
+
+/**
  * 阈值输入框：数值回显，空着表示未设（`typeof value === "number"` 的判定不动，字符串一律当没给）
  * @param {any} dom Worker 侧的 ctx.dom
  * @param {number|null|undefined} value 配置里的数值
@@ -76,6 +110,8 @@ export function mountWatchList(ctx, state) {
 
   /** 用户碰过、而推送里的配置还没追上他所选的节点：回显先绕开（Bug4 的核心） */
   const editing = new Set();
+  /** 刚点过「存」的输入框：下一帧无条件按宿主的值重画一次（G5-01 的清草稿点） */
+  const forced = new Set();
   /** secid -> 这一行的节点集合。行只在增删时重建，tick 只改文本与值。 */
   const rows = new Map();
   /** tbody 当前的行序（空表时是 [EMPTY_ROW]），与想要的行序不同才走结构重排 */
@@ -83,19 +119,20 @@ export function mountWatchList(ctx, state) {
 
   /** 数值格回显：编辑中的先不动；配置追上用户填的值就放开这把锁 */
   const syncValue = (row, key, box, want) => {
-    if (editing.has(box)) {
-      // 追上即放开：这时写回的就是用户自己填的那串，冲不掉任何东西
-      if (String(box.value ?? "") === want) {
-        editing.delete(box);
-        row.last[key] = want;
-      }
-      return;
-    }
-    // 台账相同就不写：一是别每帧重发同一个 op，二是第一次击键的 input 还在去宿主的路上时，
-    // 这一帧的回显不能把刚敲进去的字符冲掉（那与 Bug4 报的是同一件事，只是窗口更小）
-    if (row.last[key] === want) return;
-    row.last[key] = want;
-    box.value = want;
+    // 决策在 echoStep 里（纯函数，离线单测钉得住）：
+    // 编辑中的先不动；追上即放开；没在编辑就「台账相同不写」——
+    // 一是别每帧重发同一个 op，二是第一次击键的 input 还在去宿主的路上时，
+    // 这一帧的回显不能把刚敲进去的字符冲掉（那与 Bug4 报的是同一件事，只是窗口更小）。
+    const step = echoStep({
+      editing: editing.has(box),
+      value: String(box.value ?? ""),
+      want,
+      ledger: row.last[key],
+      force: forced.delete(box),
+    });
+    if (step.release) editing.delete(box);
+    row.last[key] = step.ledger;
+    if (step.write) box.value = want;
   };
 
   /** 复选框回显：同一条口径（勾上就发命令，所以等配置追上即放开） */
@@ -129,19 +166,6 @@ export function mountWatchList(ctx, state) {
     const lower = numCell(dom, item.lower, "跌到", editing);
     const pct = numCell(dom, item.pct, "±%", editing);
     const save = button(dom, "存");
-    save.on("click", () => {
-      // 点「存」就是提交：三格一起放开，下一轮回显写的是宿主钳过的值。
-      // 提交前不放开 —— 否则一次 tick 就把没存过的输入冲掉（Bug4 报的就是这个）。
-      const payload = {
-        action: "update",
-        secid: item.secid,
-        upper: upper.value.trim(),
-        lower: lower.value.trim(),
-        pct: pct.value.trim(),
-      };
-      for (const box of [upper, lower, pct]) editing.delete(box);
-      ctx.bus.publish(TOPIC_CMD, payload);
-    });
     const limitBox = input(dom, "checkbox");
     limitBox.on("change", () => {
       editing.add(limitBox);
@@ -162,7 +186,7 @@ export function mountWatchList(ctx, state) {
     // 而且它同时是「这一帧的值与上次相同就别写」的依据（见 syncValue）。
     // 初值取建节点时 numCell 已经写进去的那串，否则第一次回显会被台账挡住。
     const numText = (v) => (typeof v === "number" ? String(v) : "");
-    return {
+    const row = {
       tr,
       nameNode,
       codeNode,
@@ -185,6 +209,28 @@ export function mountWatchList(ctx, state) {
         pctNum: numText(item.pct),
       },
     };
+    save.on("click", () => {
+      // 点「存」就是提交：台账改成**框里的实际串**，再把三格放开，下一轮回显写的是宿主钳过的值。
+      // 台账不能留配置里的旧值：存进非法值被宿主钳成空值时，回显拿「空 === 空」判成
+      // 「不用写」，框里就留着那串没生效的草稿（G5-01）。
+      // 提交前不放开 —— 否则一次 tick 就把没存过的输入冲掉（Bug4 报的就是这个）。
+      const saved = savedLedger({ upper: upper.value, lower: lower.value, pct: pct.value });
+      for (const [key, want] of Object.entries(saved)) row.last[key] = want;
+      for (const box of [upper, lower, pct]) {
+        editing.delete(box);
+        // 下一帧不管台账如何都按宿主的值重画：存进去的非法值这时才被清掉，
+        // 也顺手把「点存时还有一帧在途」的窗口关死
+        forced.add(box);
+      }
+      ctx.bus.publish(TOPIC_CMD, {
+        action: "update",
+        secid: item.secid,
+        upper: saved.upper,
+        lower: saved.lower,
+        pct: saved.pctNum,
+      });
+    });
+    return row;
   };
 
   /** 每帧回显：只写变了的那几个槽位，输入框走 syncValue / syncChecked */

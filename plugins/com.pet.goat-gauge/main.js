@@ -12,6 +12,7 @@ import {
   isThrottleError,
 } from "./api.js";
 import { mergeChartBuckets, mergeUsagePages, nextPageCursor } from "./internal.js";
+import { internalFetchGate } from "./guards.js";
 import { buildPanelPayload } from "./panel.js";
 import { mergeDaily, replaceChartDays } from "./daily.js";
 import { clearCookieAfterAuthFailure, COOKIE_EXPIRED_TEXT, maskCookie, migrateSecrets } from "./secrets.js";
@@ -21,6 +22,7 @@ import { buildSnapshot, maskKey } from "./normalize.js";
 import { nextDelay } from "./schedule.js";
 import { DEFAULT_CONFIG, migrate, sanitizeConfig, SCHEMA_VERSION } from "./store-schema.js";
 import { TOPIC_AGENT_STATE, TOPIC_CMD, TOPIC_PANEL, TOPIC_STATUS, TOPIC_USAGE } from "./topics.js";
+import { splitView } from "./view-split.js";
 import { cooldownReason, cooldownUntil, gate, resetThrottle } from "./index.js";
 
 export let ctx = null;
@@ -50,6 +52,8 @@ let timer = 0;
 let overlayChain = Promise.resolve();
 let stopped = false;
 let busy = false;
+/** `/internal` 自己有在飞的拉取时置位：定时刷新与手动刷新别把同一批页叠着打。 */
+let internalBusy = false;
 /** 宿主 agent:state 的最近一次运行态；没有事件时保持默认间隔。 */
 let agentRunning = false;
 let noChangeCount = 0;
@@ -225,7 +229,8 @@ function publishView() {
     },
   };
   try {
-    void ctx.widget.update(view).catch((err) => ctx?.log?.("推送界面失败", err));
+    // 明细只走 :panel（G5-06）：records 最多 300 条，不该随每轮 :widget 广播给所有订阅者
+    void ctx.widget.update(splitView(view)).catch((err) => ctx?.log?.("推送界面失败", err));
   } catch (err) {
     ctx?.log?.("推送界面失败", err);
   }
@@ -432,10 +437,10 @@ async function handleRefreshError(err) {
 
 /** B 段：Cookie 的 /internal usage/charts 拉取与翻页去重；401/403 只清 Cookie。 */
 async function refreshInternal() {
-  if (!ctx?.secrets || !cookie) {
-    cookieState = cookie ? "ready" : cookieState;
-    return;
-  }
+  // 守卫（G5-05）：停用后 ctx 已清空、演示模式不该出网、刷新重叠不该叠着打 ——
+  // 三种情况一律不发请求、不改 cookieState（以前可选链让这段「能跑」，却在空上下文上写状态）。
+  if (internalFetchGate({ ctx, cookie, demo: config.demo, busy, internalBusy })) return;
+  internalBusy = true;
   try {
     const pages = [];
     const seen = new Set();
@@ -443,6 +448,7 @@ async function refreshInternal() {
     let complete = false;
     for (let i = 0; i < 5; i += 1) {
       const page = await fetchInternalUsage(cookie, { cursor });
+      if (!alive()) return;
       pages.push(page);
       const pageRecords = Array.isArray(page) ? page : (page?.records ?? page?.data ?? []);
       for (const record of pageRecords) {
@@ -457,6 +463,7 @@ async function refreshInternal() {
     }
     const merged = mergeUsagePages(pages);
     const chartsPage = await fetchInternalCharts(cookie);
+    if (!alive()) return;
     const buckets = mergeChartBuckets([
       { data: chartsPage?.charts ?? chartsPage?.data ?? chartsPage?.records ?? [] },
     ]);
@@ -473,7 +480,7 @@ async function refreshInternal() {
     }
     cookieState = "ready";
   } catch (err) {
-    if (isAuthError(err)) {
+    if (isAuthError(err) && ctx) {
       await clearCookieAfterAuthFailure({
         secrets: ctx.secrets,
         storage: { set: (key, value) => ctx.storage.set(key, value) },
@@ -486,6 +493,8 @@ async function refreshInternal() {
     }
     cookieState = "error";
     lastError = err?.message ?? String(err);
+  } finally {
+    internalBusy = false;
   }
 }
 

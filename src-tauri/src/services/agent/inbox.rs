@@ -109,6 +109,32 @@ mod tests {
         got
     }
 
+    /// 收件目录上限：超了清空重记，没超的一个字节都不动，非 .jsonl 不归它管。
+    /// 行为级判据（造文件 → 跑 cap → 看盘），不是断言常量等不等于 2MB。
+    #[test]
+    fn the_inbox_cap_clears_only_oversized_jsonl_files() {
+        let dir = std::env::temp_dir().join(format!("pet-inbox-cap-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("pre.jsonl");
+        let small = dir.join("post.jsonl");
+        let other = dir.join("notes.txt");
+        fs::write(&big, vec![b'x'; INBOX_MAX_BYTES as usize + 1]).unwrap();
+        fs::write(&small, b"keep me\n").unwrap();
+        fs::write(&other, vec![b'y'; INBOX_MAX_BYTES as usize + 1]).unwrap();
+
+        enforce_inbox_cap(&dir);
+
+        assert_eq!(fs::metadata(&big).unwrap().len(), 0, "超限的 jsonl 必须被清空");
+        assert_eq!(fs::read(&small).unwrap(), b"keep me\n", "没超限的不许动");
+        assert_eq!(
+            fs::metadata(&other).unwrap().len(),
+            INBOX_MAX_BYTES + 1,
+            "非 jsonl 文件不归收件上限管"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// 一行里只多了 `agent`，其余键与从前一致；非 JSON 的旧形状也一样。
     /// （`keys()` 按字典序排过，所以 `payload` 排在 `phase` 前面：`pa` < `ph`。）
     #[test]

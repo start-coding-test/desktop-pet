@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { loadSpriteSet, FRAME_SIZE, type SpriteSet } from "./pet/sprites";
 import { activeSkin } from "./pet/skins";
 import { DragDirectionTracker, PetStateMachine, type PokeZone } from "./pet/state-machine";
+import { DragController } from "./pet/drag-controller";
 import { pickLine } from "./pet/dialogue";
 import { registerPetController } from "./pet/host";
 import { installClickThrough } from "./pet/click-through";
@@ -126,10 +127,26 @@ function setStatus(pluginId: string, text: string | null): string | null {
 /* ---------- 交互：按住拖拽 vs 戳一戳 ---------- */
 // 按下后移动超过阈值才启动系统级拖拽（拖拽会吞掉后续鼠标事件），
 // 否则抬起视为「戳一戳」：按部位触发反应 + 台词气泡
-/** 起拖阈值（CSS px）：按下后位移超过它才启动系统级拖拽，否则抬起按「戳一戳」处理 */
-const DRAG_START_PX = 6;
-let press: { x: number; y: number } | null = null;
-let dragEngaged = false;
+/**
+ * 按下 → 起拖 → 收尾的判定全在 DragController 里（G6-01/G6-02/G6-08）。
+ * 放成可注入时钟的纯逻辑：拖动期 blur 的 100ms 宽限、真机吞 mouseup 的 250ms 静默兜底
+ * 都只能在 node 里用假时钟验，摊在 main.ts 顶层（摸 document）就永远只能正则匹配源码。
+ */
+const drag = new DragController({
+  now: () => performance.now(),
+  onBegin: () => {
+    // 先把此刻姿势记成松手后的复原目标，再交给系统拖拽。
+    // 从这里往后 webview 收不到 mousemove，方向只能从窗口位移推（见 onWindowMoved）。
+    pet?.beginDrag();
+    dragTracker.begin();
+    void petWindow.startDragging();
+  },
+  onEnd: () => {
+    // 松手复原：拖动前是 waiting 就回 waiting，是插件插播就回那条（由状态机的快照决定）
+    pet?.endDrag();
+    dragTracker.begin(); // 清掉这次拖动残留的净位移，下一次从头攒
+  },
+});
 /** 窗口最近的物理 x（onMoved / outerPosition 维护）：拖动期算水平增量只靠它 */
 let lastWindowX: number | null = null;
 /** 方向判定器（阈值 DRAG_DIRECTION_MIN_PX、去抖 DRAG_DIRECTION_COOLDOWN_MS 都在状态机侧） */
@@ -142,39 +159,28 @@ function insideSprite(clientX: number, clientY: number): boolean {
 
 document.addEventListener("mousedown", (e) => {
   if (e.button !== 0) return;
-  resetPress(); // 上一趟拖拽的 mouseup 可能没收到：先按「松手」收尾，再记这一次的按下点
-  press = { x: e.screenX, y: e.screenY };
+  drag.pressDown(e.screenX, e.screenY); // 上一趟拖拽的 mouseup 没收到时先按「松手」收尾
 });
 
 document.addEventListener("mousemove", (e) => {
   document.documentElement.classList.toggle("over-pet", insideSprite(e.clientX, e.clientY));
-  // 系统级拖拽会吃掉抬起事件，mouseup 常常收不到：按键已经松开就说明这趟拖完了。
-  // 不补这一下的话 dragEngaged 永远挂着，穿透再也不会开启，宠物整块挡鼠标。
-  if (dragEngaged && e.buttons === 0) {
-    resetPress();
-    return;
-  }
-  if (!press || dragEngaged) return;
-  if (Math.hypot(e.screenX - press.x, e.screenY - press.y) > DRAG_START_PX) {
-    // 起拖：先把此刻姿势记成松手后的复原目标，再交给系统拖拽。
-    // 从这里往后 webview 收不到 mousemove，方向只能从窗口位移推（见 onWindowMoved）。
-    dragEngaged = true;
-    pet?.beginDrag();
-    dragTracker.begin();
-    void petWindow.startDragging();
-  }
+  // 起拖判定与「松键了但没收到 mouseup」的补救都在控制器里
+  drag.pointerMove(e.screenX, e.screenY, e.buttons);
 });
 
 // 按下后指针移出窗口、或在窗口外抬起、或失焦：都必须复位，否则 press 会一直挂着
-window.addEventListener("blur", resetPress);
-document.addEventListener("mouseleave", resetPress);
+// 拖动期的 blur 不再直接结束拖动（G6-01）：startDragging 的 blur 抖动会把它误杀在半路，
+// 控制器给 100ms 宽限，期间 focus 回来就作废。
+window.addEventListener("blur", () => drag.blur());
+window.addEventListener("focus", () => drag.focus());
+document.addEventListener("mouseleave", () => drag.mouseLeave());
 document.addEventListener("mouseup", (e) => {
-  const wasPress = press !== null;
-  const wasDrag = dragEngaged;
+  const wasPress = drag.hasPress;
+  const wasDrag = drag.isEngaged;
   const clientX = e.clientX;
   const clientY = e.clientY;
   const dozing = pet?.action === "waiting";
-  resetPress();
+  drag.pointerUp();
   if (!wasPress || wasDrag || e.button !== 0 || !pet) return;
   // 只认落在立绘范围内的一击（原来纵向一条带子无限宽，点窗口角落也会戳到角色）
   if (!insideSprite(clientX, clientY)) return;
@@ -182,15 +188,6 @@ document.addEventListener("mouseup", (e) => {
   // 从 waiting 唤醒时配醒来的台词，而不是普通反应
   say(pickLine(dozing && action === "waving" ? "wake" : action));
 });
-
-function resetPress(): void {
-  press = null;
-  if (!dragEngaged) return;
-  dragEngaged = false;
-  // 松手复原：拖动前是 waiting 就回 waiting，是插件插播就回那条（由状态机的快照决定）
-  pet?.endDrag();
-  dragTracker.begin(); // 清掉这次拖动残留的净位移，下一次从头攒
-}
 
 function hitZone(clientY: number): PokeZone {
   const { top, size } = spriteRect();
@@ -224,9 +221,11 @@ function onceOnly(unlisten: () => void): () => void {
 function onWindowMoved(x: number): void {
   const prev = lastWindowX;
   lastWindowX = x;
+  // 真实位移同时喂给静默兜底：窗口还在动就说明 DragController 的拖拽还活着（G6-02）
+  if (drag.isEngaged) drag.windowMoved();
   // 第一个采样只用来铺基线：没有上一个点就算不出位移。
   // 拖动中几乎每帧都有事件，所以这最多丢掉开头一帧的量，紧接着的位移照样把方向判出来。
-  if (!dragEngaged || prev === null || !pet) return;
+  if (!drag.isEngaged || prev === null || !pet) return;
   // onMoved 给的是物理像素，阈值口径是 CSS px：除 dpr 让 200% 缩放下手感一致
   const dx = (x - prev) / (window.devicePixelRatio || 1);
   pet.dragDirection(dragTracker.sample(dx, performance.now()));
@@ -296,6 +295,8 @@ let rafId = 0;
 function tick(now: number): void {
   const dt = Math.min((now - last) / 1000, 0.1);
   last = now;
+  // 拖动期的 blur 宽限与「静默 250ms 按松手收尾」都按渲染帧裁决（G6-01/G6-02）
+  drag.tick();
   pet.update(dt);
 
   const { left, top, size } = spriteRect();
@@ -343,7 +344,7 @@ let idleChat = 0;
 
 /** 可见时才需要跑的辅助循环：hit-test 光标轮询 + 偶尔自言自语 */
 function startAux(): void {
-  if (!stopThrough) stopThrough = installClickThrough({ spriteRect, isDragging: () => dragEngaged });
+  if (!stopThrough) stopThrough = installClickThrough({ spriteRect, isDragging: () => drag.isEngaged });
   if (!idleChat) {
     idleChat = window.setInterval(() => {
       if (pet.action === "idle" && Math.random() < 0.4) sayRandom(pickLine("idle"));

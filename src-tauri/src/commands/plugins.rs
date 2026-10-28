@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -112,6 +113,7 @@ fn read_manifest(dir: &Path, plugin_id: &str) -> Result<Value, HostError> {
 fn collect_manifests(app: &tauri::AppHandle) -> Result<Vec<Value>, HostError> {
     let dir = plugins_dir(app)?;
     let mut manifests = Vec::new();
+    let mut errors: Vec<(String, String)> = Vec::new();
     let entries = std::fs::read_dir(&dir)
         .map_err(|e| HostError::new(IO, format!("读取插件目录失败: {e}")))?;
     for entry in entries.flatten() {
@@ -132,20 +134,60 @@ fn collect_manifests(app: &tauri::AppHandle) -> Result<Vec<Value>, HostError> {
         });
         match loaded {
             Ok(v) => manifests.push(v),
-            Err(e) => {
-                let _ = app.emit(
-                    "host:plugin-error",
-                    serde_json::json!({ "plugin": name, "error": format!("manifest 无效: {e}") }),
-                );
-            }
+            Err(e) => errors.push((name, format!("manifest 无效: {e}"))),
         }
     }
+    report_manifest_errors(app, &errors);
     Ok(manifests)
 }
 
+/// 这一轮该新报哪些 manifest 错误（纯函数：与上一次上报表比较）。
+/// 错误内容没变的插件不再重复广播 —— `host:plugin-error` 以前挂在每次扫描上，
+/// 插件列表/总线消息一多就把前端日志刷爆（G3-05）。
+fn fresh_manifest_errors(
+    reported: &HashMap<String, String>,
+    errors: &[(String, String)],
+) -> Vec<(String, String)> {
+    errors
+        .iter()
+        .filter(|(plugin, error)| reported.get(plugin) != Some(error))
+        .cloned()
+        .collect()
+}
+
+/// 上报坏 manifest：只在新增/内容变化时发事件；修好或删掉的从表里移除，下次再坏还会再报。
+fn report_manifest_errors(app: &tauri::AppHandle, errors: &[(String, String)]) {
+    static REPORTED: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let to_emit = {
+        let mut reported = REPORTED
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let fresh = fresh_manifest_errors(&reported, errors);
+        let current: HashMap<&str, &str> = errors
+            .iter()
+            .map(|(plugin, error)| (plugin.as_str(), error.as_str()))
+            .collect();
+        reported.retain(|plugin, _| current.contains_key(plugin.as_str()));
+        for (plugin, error) in errors {
+            reported.insert(plugin.clone(), error.clone());
+        }
+        fresh
+    };
+    for (plugin, error) in to_emit {
+        let _ = app.emit(
+            "host:plugin-error",
+            serde_json::json!({ "plugin": plugin, "error": error }),
+        );
+    }
+}
+
 #[tauri::command]
-pub fn plugins_list(app: tauri::AppHandle) -> Result<Vec<Value>, HostError> {
-    collect_manifests(&app)
+pub async fn plugins_list(app: tauri::AppHandle) -> Result<Vec<Value>, HostError> {
+    // G3-05：目录扫描是阻塞 IO，移到阻塞线程池，别占 IPC/主线程
+    tauri::async_runtime::spawn_blocking(move || collect_manifests(&app))
+        .await
+        .map_err(|e| HostError::new(INTERNAL, format!("插件扫描任务失败: {e}")))?
 }
 
 /// 插件文件的修改时间（毫秒）。前端拿它给 `import()` 拼 cache-busting 查询串：
@@ -176,12 +218,39 @@ fn file_modified_millis(path: &std::path::Path) -> Result<u64, HostError> {
         .unwrap_or(0))
 }
 
+/// 已安装插件 id 的缓存（G3-05）。`installed_plugin_ids` 以前每调一次就全量扫目录：
+/// `bus_publish` 每条总线消息、`overlay_show` 每次开窗都要重扫一遍，全是主线程上的目录 IO。
+/// 目录内容只会被 watcher 看见变化 —— 它在去抖落定后调 `invalidate_installed_plugin_ids`，
+/// 下一次读取才重扫；扫描失败不写缓存（下次仍会重试，不会把「读失败」当成「没插件」缓存住）。
+fn installed_ids_cache() -> &'static Mutex<Option<Vec<String>>> {
+    static CACHE: OnceLock<Mutex<Option<Vec<String>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// 仅 watcher 调用：磁盘上的插件集合变了，缓存作废
+pub fn invalidate_installed_plugin_ids() {
+    *installed_ids_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
+}
+
 /// 当前实际安装的插件 id 集合，用于回收已删除插件留下的授权。
 pub fn installed_plugin_ids(app: &tauri::AppHandle) -> Result<Vec<String>, HostError> {
-    Ok(collect_manifests(app)?
+    if let Some(cached) = installed_ids_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+    {
+        return Ok(cached);
+    }
+    let ids: Vec<String> = collect_manifests(app)?
         .iter()
         .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
-        .collect())
+        .collect();
+    *installed_ids_cache()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(ids.clone());
+    Ok(ids)
 }
 
 /// 磁盘 manifest 里的展示名，供同意框显示「你在给谁授权」（ADR-0011）。
@@ -446,6 +515,8 @@ pub fn spawn_plugins_watcher(app: &tauri::AppHandle) -> Result<PluginWatcher, Ho
             };
             let ids = plugin_ids_from_paths(&root, &paths);
             let reload_ids = plugin_reload_ids_from_paths(&root, &paths);
+            // G3-05：插件集合可能变了 —— 先让已安装 id 缓存失效，下面这些读盘逻辑才会重扫
+            invalidate_installed_plugin_ids();
             crate::services::permission::prune_orphan_grants(&sink);
             // 删插件目录是「关闭联动」的第二条路：运行期没有卸载命令，只有这里看得见
             // 磁盘上的变化。resync 自己比较新旧判据，删个无关插件不会把 hook 摘掉。
@@ -486,6 +557,30 @@ mod tests {
                 "plugins.rs 里出现了第二份 id 检查: {banned}"
             );
         }
+    }
+
+    /// G3-05：坏 manifest 的 `host:plugin-error` 只在「新坏 / 错误内容变了」时发，
+    /// 同一份坏 manifest 被反复扫到不该反复刷前端日志。
+    #[test]
+    fn manifest_errors_are_reported_only_when_they_change() {
+        let mut reported = HashMap::new();
+        let bad = vec![("broken".to_string(), "manifest 无效: 缺 id".to_string())];
+        assert_eq!(
+            fresh_manifest_errors(&reported, &bad),
+            bad,
+            "第一次发现必须上报"
+        );
+        reported.extend(bad.clone());
+        assert!(
+            fresh_manifest_errors(&reported, &bad).is_empty(),
+            "同一份错误重复扫描不该再报"
+        );
+        let changed = vec![("broken".to_string(), "manifest 无效: 缺 name".to_string())];
+        assert_eq!(
+            fresh_manifest_errors(&reported, &changed),
+            changed,
+            "错误内容变了要再报一次"
+        );
     }
 
     /// K4：schema 的 id 约束（模式串 + 长度上下限）必须与 `ids.rs` 的词表是同一件事 ——

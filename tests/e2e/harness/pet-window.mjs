@@ -146,6 +146,97 @@ export function movePetWindow({ dx = 0, dy = 0, steps = 1, delayMs = 0 }) {
   });
 }
 
+/**
+ * 常驻搬窗进程：一次 pwsh 启动（~390ms）之后靠 stdin 连发 `move`，每次往返毫秒级。
+ * verify-pet-drag 需要「拖动期间持续位移」把 G6-02 的 250ms 静默兜底喂住 —— 每次新起
+ * 进程搬一下时启动比静默窗口还长，拖动态会在两次搬窗之间被收掉。
+ * 返回 { ready, move, close }：ready 在 ps1 打出 serve 就绪行后 resolve。
+ */
+export function startMover() {
+  const child = spawn(
+    PS,
+    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", PS1, "-Action", "serve"],
+    { stdio: ["pipe", "pipe", "pipe"] },
+  );
+  children.add(child);
+  let buf = "";
+  let stderr = "";
+  const waiters = [];
+  let readyResolve = () => {};
+  const ready = new Promise((resolve) => {
+    readyResolve = resolve;
+  });
+  const settle = (res) => {
+    const waiter = waiters.shift();
+    if (waiter) waiter(res);
+  };
+  child.stdout.on("data", (d) => {
+    buf += d;
+    let idx = buf.indexOf("\n");
+    while (idx >= 0) {
+      const line = buf.slice(0, idx).trim();
+      buf = buf.slice(idx + 1);
+      idx = buf.indexOf("\n");
+      if (!line) continue;
+      let parsed = null;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (parsed.serve) {
+        readyResolve(parsed);
+        continue;
+      }
+      settle(parsed);
+    }
+  });
+  child.stderr.on("data", (d) => {
+    stderr += d;
+  });
+  child.on("error", (err) => {
+    children.delete(child);
+    readyResolve({ ok: false, error: err.message });
+    while (waiters.length > 0) {
+      const waiter = waiters.shift();
+      if (waiter) waiter({ ok: false, error: err.message });
+    }
+  });
+  child.on("close", (code) => {
+    children.delete(child);
+    while (waiters.length > 0) {
+      const waiter = waiters.shift();
+      if (waiter) waiter({ ok: false, error: `常驻搬窗进程退出（code ${code}）：${stderr.trim()}` });
+    }
+  });
+  return {
+    ready,
+    move({ dx = 0, dy = 0, steps = 1, delayMs = 0 }) {
+      return new Promise((resolve, reject) => {
+        waiters.push((res) => {
+          if (res && res.ok === true) resolve(res);
+          else reject(new Error(`常驻搬窗失败：${JSON.stringify(res)}`));
+        });
+        child.stdin.write(`move ${Math.round(dx)} ${Math.round(dy)} ${steps} ${delayMs}\n`);
+      });
+    },
+    close() {
+      try {
+        child.stdin.write("quit\n");
+      } catch {
+        /* 已退出 */
+      }
+      setTimeout(() => {
+        try {
+          child.kill();
+        } catch {
+          /* 已退出 */
+        }
+      }, 300);
+    },
+  };
+}
+
 /** 兜底：套件异常退出时别把搬窗子进程留在后台。 */
 export function killAll() {
   for (const child of children) {

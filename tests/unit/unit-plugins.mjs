@@ -184,3 +184,132 @@ group("未完成排序");
   const c = parseLine("丙 due:2000-01-01");
   deep("同到期日按优先级，无优先级排最后", sortOpen([b, c, a]).map((t) => t.text), ["甲", "乙", "丙"]);
 }
+
+/* ===================== G5-07 / G5-08 / G5-09 ===================== */
+const { readFileSync: readFile } = await import("node:fs");
+const manifestOf = (id) =>
+  JSON.parse(readFile(new URL(`../../plugins/${id}/manifest.json`, import.meta.url), "utf8"));
+
+group("插件 manifest 与实现对齐（G5-07/G5-08）");
+{
+  const agentBridge = manifestOf("com.pet.agent-bridge");
+  check(
+    "agent-bridge 不再申请没用到的 storage 权限（G5-07）",
+    !agentBridge.permissions.includes("storage"),
+    JSON.stringify(agentBridge.permissions),
+  );
+  check(
+    "agent-bridge 仍保留真正用到的能力",
+    ["bus:publish", "bus:subscribe", "widget", "agent:hooks"].every((p) => agentBridge.permissions.includes(p)),
+    JSON.stringify(agentBridge.permissions),
+  );
+
+  const astock = manifestOf("com.pet.astock");
+  const desc = String(astock.description ?? "");
+  check(
+    "astock 描述写明三家数据源（G5-08）",
+    ["东方财富", "腾讯", "新浪"].every((s) => desc.includes(s)),
+    desc,
+  );
+  const hosts = [
+    "push2.eastmoney.com",
+    "push2his.eastmoney.com",
+    "searchadapter.eastmoney.com",
+    "proxy.finance.qq.com",
+    "qt.gtimg.cn",
+    "web.ifzq.gtimg.cn",
+    "ifzq.gtimg.cn",
+    "hq.sinajs.cn",
+  ];
+  check("astock 描述列出全部 8 个可能访问的域名（G5-08）", hosts.every((h) => desc.includes(h)), desc);
+  check("astock 描述提到后备源开关（G5-08）", desc.includes("后备"), desc);
+
+  const { MARKET_HOSTS } = await import(new URL("../../plugins/com.pet.astock/market.js", import.meta.url));
+  check(
+    "描述里的域名与注册表 MARKET_HOSTS 完全一致（不再手写漂移）",
+    hosts.slice().sort().join(",") === MARKET_HOSTS.slice().sort().join(","),
+    MARKET_HOSTS.join(","),
+  );
+}
+
+group("todo 完成状态先落盘再碰宠物（G5-09）");
+{
+  const { commitDone, DONE_EMOJI } = await import(new URL("../../plugins/com.pet.todo/order.js", import.meta.url));
+
+  // 顺利路径：落盘的 await 在宠物调用之前
+  const task = { text: "写周报", done: false, completed: null };
+  const calls = [];
+  await commitDone(task, true, {
+    completed: "2026-10-28",
+    save: async () => {
+      calls.push("save");
+    },
+    react: async (level) => {
+      calls.push(`react:${level}`);
+    },
+    say: async (text) => {
+      calls.push(`say:${text.includes(DONE_EMOJI)}`);
+    },
+  });
+  eq("落盘先于宠物反应", calls[0], "save");
+  eq("完成态与完成日都写进内存", [task.done, task.completed].join(","), "true,2026-10-28");
+  eq("宠物台词带完成符号", calls.at(-1), "say:true");
+  eq("宠物反应在落盘之后", calls[1], "react:jumping");
+
+  // 原 bug 的复现路径：宠物调用 reject 时状态不许丢、异常不许冒出去
+  const risky = { text: "买牛奶", done: false, completed: null };
+  let noted = null;
+  await commitDone(risky, true, {
+    completed: "2026-10-28",
+    save: async () => {},
+    react: async () => {
+      throw new Error("permission denied");
+    },
+    note: (err) => {
+      noted = err;
+    },
+  });
+  eq("宠物 reject 后完成状态仍在", [risky.done, risky.completed].join(","), "true,2026-10-28");
+  eq("失败只记一笔、不抛", noted?.message, "permission denied");
+
+  // 落盘自己失败：内存回滚并抛出，别再碰宠物
+  const failedSave = { text: "回滚", done: false, completed: null };
+  const failedCalls = [];
+  let rolled = null;
+  let failure = null;
+  try {
+    await commitDone(failedSave, true, {
+      completed: "2026-10-28",
+      save: async () => {
+        failedCalls.push("save");
+        throw new Error("disk full");
+      },
+      rollback: (err) => {
+        rolled = err;
+      },
+      react: async () => {
+        failedCalls.push("react");
+      },
+    });
+  } catch (err) {
+    failure = err;
+  }
+  eq("落盘失败要抛出去（调用方才知道没存上）", failure?.message, "disk full");
+  eq("内存回滚到未完成", [failedSave.done, failedSave.completed].join(","), "false,");
+  eq("回滚钩子拿到错误", rolled?.message, "disk full");
+  eq("落盘失败时不再碰宠物", failedCalls.join(","), "save");
+
+  // 取消完成：只落盘，不触发宠物
+  const reopen = { text: "重新打开", done: true, completed: "2026-10-01" };
+  const reopenCalls = [];
+  await commitDone(reopen, false, {
+    save: async () => {
+      reopenCalls.push("save");
+    },
+    react: async () => {
+      reopenCalls.push("react");
+    },
+  });
+  eq("取消完成只落盘", reopenCalls.join(","), "save");
+  eq("completed 清空", [reopen.done, reopen.completed].join(","), "false,");
+}

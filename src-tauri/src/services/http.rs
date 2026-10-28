@@ -1,4 +1,5 @@
-use std::io::Read;
+use std::io::{self, Read};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -61,17 +62,114 @@ pub struct HttpResponse {
 /// `redirects(0)` 与三个 timeout 是两个 agent 共用的口径 —— 走代理**不许**顺带把
 /// 「宿主自己跟重定向并逐跳复核授权」这条改成 ureq 自动跟。
 fn build_agent(proxy: Option<&str>) -> ureq::Agent {
-    let builder = ureq::AgentBuilder::new()
+    let mut builder = ureq::AgentBuilder::new()
         .timeout_connect(TIMEOUT)
         .timeout_read(TIMEOUT)
         .timeout_write(TIMEOUT)
         // 0 = 不自动跟重定向，3xx 原样返回给 send_following_redirects 逐跳复核域名
         .redirects(0);
+    // G3-03：直连时每次 DNS 解析都过「只许公网地址」的守卫（DNS rebinding）。
+    // 代理 agent **不能**挂：它解析的是代理端点（常见 `127.0.0.1:7897`），挂了会把用户自己的
+    // 系统代理当成内网目标拒掉；而走代理时目标主机由代理侧解析，本机根本没有可判的 IP ——
+    // 那条残余如实写在 ADR-0011 追加节。两者都不是「顺手全挂上」能解决的。
+    if proxy.is_none() {
+        builder = builder.resolver(GuardedResolver);
+    }
     match proxy.and_then(|url| ureq::Proxy::new(url).ok()) {
         Some(p) => builder.proxy(p),
         None => builder,
     }
     .build()
+}
+
+/// 出站解析守卫（G3-03）：ureq 解析出的地址先过 `http_proxy::is_public_ip`，
+/// 只要有一个落到回环/私网/链路本地就整次拒绝 —— 防「授过权的公网域名解析到内网」
+/// 的 DNS rebinding。只挂直连 agent；代理 agent 的解析对象是代理端点本身（见 `build_agent`）。
+/// HTTPS 经代理时目标主机由代理侧解析，那条残余如实写在 ADR-0011 追加节。
+struct GuardedResolver;
+
+impl ureq::Resolver for GuardedResolver {
+    fn resolve(&self, netloc: &str) -> io::Result<Vec<SocketAddr>> {
+        let addrs: Vec<SocketAddr> = netloc.to_socket_addrs()?.collect();
+        guard_resolution(netloc, addrs)
+    }
+}
+
+/// 从 resolver 的 `netloc`（`host[:port]`，IPv6 带方括号）里取主机名。
+/// 只负责「取出来」，小写化/去尾点/去括号在判档函数里做。
+fn resolver_host(netloc: &str) -> &str {
+    let text = netloc.trim();
+    let unbracketed = text.strip_prefix('[').unwrap_or(text);
+    if let Some((host, _)) = unbracketed.split_once(']') {
+        return host;
+    }
+    // 无方括号时只有「恰好一个冒号」才可能是 host:port；`::1` 这类整串都是主机名
+    if unbracketed.matches(':').count() == 1 {
+        if let Some((host, port)) = unbracketed.rsplit_once(':') {
+            if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+                return host;
+            }
+        }
+    }
+    unbracketed
+}
+
+/// 「本地名 / 回环字面量」这一档（G3-03 过度拒绝修复）：用户显式授权、解析稳定且不经过
+/// DNS 的时序，再按公网口径拒就等于把 `http://localhost:1420` 这类本地开发目标一并关掉。
+/// `localhost` 与 `*.localhost` 只是**名字层面**的放行档：`localhost` 在 Windows 有本机
+/// 固定表，`*.localhost` 没有 RFC 6761 保证（子域走系统解析）；所以解析结果还要过
+/// [`guard_local_resolution`] 的回环复核。其余是写死在 URL 里的回环字面量
+/// （`127.0.0.0/8`、`::1`、`::ffff:127.0.0.1`）。**不是**「私网都放行」：公网域名解析到
+/// `10/8`、`169.254.169.254` 仍整批拒（见 [`guard_addresses`]）。
+fn is_stable_local_target(netloc: &str) -> bool {
+    let host = resolver_host(netloc).trim_end_matches('.');
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") {
+        return true;
+    }
+    http_proxy::is_loopback_literal(host)
+}
+
+/// 解析守卫的纯判定入口（单测不碰网络）：本地名的解析结果过 [`guard_local_resolution`]
+/// 的回环复核，其余主机名的解析结果整批过 [`guard_addresses`]。
+fn guard_resolution(netloc: &str, addrs: Vec<SocketAddr>) -> io::Result<Vec<SocketAddr>> {
+    if is_stable_local_target(netloc) {
+        return guard_local_resolution(addrs);
+    }
+    guard_addresses(addrs)
+}
+
+/// 本地档的回环复核（复审 32-F1）：放行的只是**名字**，解析结果必须仍落在回环 ——
+/// `localhost` 在 Windows 有本机固定表，`*.localhost` 没有 RFC 6761 保证（子域走系统
+/// 解析，可能被 DNS 带到内网）。名字像本地、解析到 `10.x`/`169.254.169.254` 等非回环地址
+/// 时整批拒，避免恶意插件用 `stats.localhost` 这类「看起来是本机」的授权名去打内网。
+/// 判定复用 [`http_proxy::is_loopback_literal`]（含 IPv4-mapped 回环）。
+fn guard_local_resolution(addrs: Vec<SocketAddr>) -> io::Result<Vec<SocketAddr>> {
+    if let Some(bad) = addrs
+        .iter()
+        .find(|addr| !http_proxy::is_loopback_literal(&addr.ip().to_string()))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("拒绝连接非回环地址 {}（本地名解析未落在回环）", bad.ip()),
+        ));
+    }
+    Ok(addrs)
+}
+
+/// 纯判定（单测不碰网络）：解析结果里混进内网地址就整批拒 ——
+/// 不做「挑一个公网的用」，那会给 DNS 轮询留后门。
+fn guard_addresses(addrs: Vec<SocketAddr>) -> io::Result<Vec<SocketAddr>> {
+    if let Some(bad) = addrs
+        .iter()
+        .find(|addr| !http_proxy::is_public_ip(addr.ip()))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("拒绝连接内网地址 {}（疑似 DNS rebinding）", bad.ip()),
+        ));
+    }
+    Ok(addrs)
 }
 
 impl HttpState {
@@ -275,9 +373,18 @@ fn send_following_redirects(
                 format!("重定向超过 {MAX_REDIRECTS} 跳，已放弃"),
             ));
         }
+        let previous = current.as_str().to_string();
         current = current
             .join(location)
             .map_err(|e| HostError::new(PARSE, format!("重定向目标非法: {e}")))?;
+        // G3-02：https → http 的降级重定向会让下一跳把凭据/内容走明文，一律拒（不跟随）。
+        // 反向升级（http→https）与同协议跳转不拦，交给逐跳域名授权继续把关。
+        if is_scheme_downgrade(&previous, current.as_str()) {
+            return Err(HostError::new(
+                DENIED,
+                format!("拒绝重定向到明文 HTTP：{} 会让凭据暴露", current),
+            ));
+        }
         // 303 一律转 GET；301/302 对非 GET 也转 GET（与浏览器一致）；307/308 保留方法与 body
         if status != 307 && status != 308 {
             method = "GET".to_string();
@@ -288,6 +395,20 @@ fn send_following_redirects(
         NETWORK,
         format!("重定向超过 {MAX_REDIRECTS} 跳，已放弃"),
     ))
+}
+
+/// G3-02：https → http 的降级重定向判定（scheme 大小写不敏感）。
+/// 纯函数，好让「降级一律拒」这条规则有离线单测，不依赖真网络。
+fn is_scheme_downgrade(from: &str, to: &str) -> bool {
+    scheme_of(from).eq_ignore_ascii_case("https") && scheme_of(to).eq_ignore_ascii_case("http")
+}
+
+/// 只取 `scheme://` 里的 scheme 部分；没有 `://` 的输入返回空串（交给别处报解析错误）
+fn scheme_of(url: &str) -> &str {
+    match url.split_once("://") {
+        Some((scheme, _)) => scheme,
+        None => "",
+    }
 }
 
 fn is_credential_header(name: &str) -> bool {
@@ -379,8 +500,11 @@ fn assert_allowed_method(method: &str) -> Result<(), HostError> {
 }
 
 /// 插件出站请求。host 由 Rust 自己从 URL 解析，不采信前端传来的域名。
+/// G3-01：先过窗口归属 —— 插件的悬浮窗只能以自己的名义发请求。
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // IPC 参数是平铺的，多一个 window 只是为归属判定
 pub async fn http_request(
+    window: tauri::Window,
     http: tauri::State<'_, HttpState>,
     perms: tauri::State<'_, PermissionState>,
     plugin_id: String,
@@ -392,6 +516,7 @@ pub async fn http_request(
     if !crate::ids::is_safe_id(&plugin_id) {
         return Err(HostError::new(INVALID_ARG, "invalid plugin id"));
     }
+    crate::gate::window_owns_plugin(&window, &plugin_id)?;
     let host = parse_host(&url)?;
     check_granted(&perms, &plugin_id, &host)?;
 
@@ -858,5 +983,171 @@ mod tests {
             agent_label(&same.proxied_https.clone().expect("夹具里有 https 档"))
                 .contains("port: 3128")
         );
+    }
+
+    /// G3-02：https→http 的降级重定向一律拒；升级与同协议不拦（逐跳授权另管）
+    #[test]
+    fn https_to_http_redirect_is_a_downgrade() {
+        use super::is_scheme_downgrade;
+        assert!(is_scheme_downgrade(
+            "https://a.example/x",
+            "http://a.example/y"
+        ));
+        // scheme 大小写不敏感：纯函数不能指望调用方已经归一化
+        assert!(is_scheme_downgrade("HTTPS://a.example", "HTTP://a.example"));
+        assert!(!is_scheme_downgrade(
+            "http://a.example",
+            "https://a.example"
+        ));
+        assert!(!is_scheme_downgrade(
+            "https://a.example",
+            "https://b.example"
+        ));
+        assert!(!is_scheme_downgrade("http://a.example", "http://a.example"));
+        // 相对/非法输入不算降级（真正的解析错误由 Url::join 报）
+        assert!(!is_scheme_downgrade("/relative", "http://a.example"));
+    }
+
+    /// G3-03：DNS rebinding —— 批量判定里任何回环/私网/链路本地地址都整批拒
+    #[test]
+    fn guard_addresses_rejects_private_and_loopback_batches() {
+        use super::{guard_addresses, GuardedResolver};
+        use std::net::IpAddr;
+        let public: std::net::SocketAddr = "93.184.216.34:443".parse().unwrap();
+        assert_eq!(guard_addresses(vec![public]).unwrap(), vec![public]);
+        let bad: Vec<std::net::SocketAddr> = [
+            "127.0.0.1:80",
+            "10.0.0.5:80",
+            "172.16.1.1:80",
+            "192.168.1.1:80",
+            "169.254.169.254:80",
+            "100.64.0.1:80",
+            "[::1]:80",
+            "[::]:80",
+            "[fe80::1]:80",
+            "[fd00::1]:80",
+            "[::ffff:127.0.0.1]:80",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        for addr in bad {
+            let err = guard_addresses(vec![addr]).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{addr}");
+        }
+        // 混合解析结果（公网 + 内网）也整批拒：不做「挑一个公网的用」
+        let mixed = vec![public, "10.0.0.5:80".parse().unwrap()];
+        assert!(guard_addresses(mixed).is_err());
+        // 解析器入口：非本地名的私网字面量仍拒（守卫没有被整体关掉）
+        let err = ureq::Resolver::resolve(&GuardedResolver, "10.0.0.5:80").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        // 公网字面 IP 放行（同样不依赖 DNS）
+        let ok = ureq::Resolver::resolve(&GuardedResolver, "8.8.8.8:443").unwrap();
+        let public_ip: IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(ok.iter().all(|addr| addr.ip() == public_ip));
+    }
+
+    /// G3-03 误伤修复：本地名/回环字面量不做内网判定（显式授权、解析稳定），
+    /// 其余主机名解析到内网仍整批拒（含混合解析、IPv4-mapped 私网）。
+    #[test]
+    fn local_names_and_loopback_literals_skip_the_private_check() {
+        use super::{guard_resolution, GuardedResolver};
+        use std::net::SocketAddr;
+        let addr = |s: &str| s.parse::<SocketAddr>().unwrap();
+        let loopback = || vec![addr("127.0.0.1:1420")];
+
+        // 放行档：localhost / *.localhost / 127.0.0.0/8 / ::1
+        for target in ["localhost:1420", "foo.localhost:1420", "127.0.0.1:9"] {
+            assert_eq!(
+                guard_resolution(target, loopback()).unwrap(),
+                loopback(),
+                "{target}"
+            );
+        }
+        assert_eq!(
+            guard_resolution("[::1]:1420", vec![addr("[::1]:1420")]).unwrap(),
+            vec![addr("[::1]:1420")]
+        );
+        // localhost 解析成 IPv4-mapped 回环也放行（同一台机器的两种写法）
+        assert!(guard_resolution("localhost:443", vec![addr("[::ffff:127.0.0.1]:443")]).is_ok());
+
+        // 本地档也要复核解析结果（复审 32-F1）：`*.localhost` 在 Windows 没有固定表，
+        // 名字像本机但解析到内网/云元数据时同样整批拒。
+        for target in ["localhost:1420", "foo.localhost:1420"] {
+            for bad in [
+                "10.0.0.5:443",
+                "169.254.169.254:443",
+                "[fe80::1]:443",
+                "[fd00::1]:443",
+                "[::ffff:10.0.0.5]:443",
+            ] {
+                let err = guard_resolution(target, vec![addr(bad)]).unwrap_err();
+                assert_eq!(
+                    err.kind(),
+                    std::io::ErrorKind::PermissionDenied,
+                    "{target} -> {bad}"
+                );
+            }
+            // 混合解析（一回环一内网）同样整批拒
+            let mixed = vec![addr("127.0.0.1:443"), addr("10.0.0.5:443")];
+            assert!(guard_resolution(target, mixed).is_err(), "{target} mixed");
+        }
+
+        // 拒档：公网域名解析到私网 / 链路本地（云元数据）/ 回环 / mapped 私网
+        for address in [
+            "10.0.0.5:443",
+            "172.16.1.1:443",
+            "192.168.1.1:443",
+            "169.254.169.254:443",
+            "[::1]:443",
+            "[fe80::1]:443",
+            "[::ffff:127.0.0.1]:443",
+        ] {
+            let err = guard_resolution("example.com:443", vec![addr(address)]).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{address}");
+        }
+        // 混合解析（一公一私）整批拒：不做「挑一个公网的用」
+        let mixed = vec![addr("93.184.216.34:443"), addr("10.0.0.5:443")];
+        assert!(guard_resolution("example.com:443", mixed).is_err());
+
+        // 解析器入口：e2e 回归的那条路 —— localhost 不再被判内网（真解析走 hosts，不出网）
+        let resolved = ureq::Resolver::resolve(&GuardedResolver, "localhost:1420")
+            .expect("localhost 是本地名，解析守卫必须放行");
+        assert!(resolved.iter().all(|a| a.ip().is_loopback()));
+    }
+
+    /// 验收口径的真路径：挂着守卫的 agent 真去打一个本地 dev server，拿回 200 与正文。
+    /// 对应 `verify-isolation.mjs` 的「已授权域名能取回内容」；端口随机，不出机器。
+    #[test]
+    fn guarded_agent_fetches_from_a_local_dev_server() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 本地端口");
+        let port = listener.local_addr().expect("取本地端口").port();
+        let server = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let body = "<!doctype html><title>pet dev</title>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let response = build_agent(None)
+            .get(&format!("http://localhost:{port}/src/index.html"))
+            .call()
+            .expect("localhost 是本地名，守卫必须放行");
+        assert_eq!(response.status(), 200);
+        let mut body = String::new();
+        response
+            .into_reader()
+            .take(64 * 1024)
+            .read_to_string(&mut body)
+            .expect("读正文");
+        assert!(body.contains("doctype"), "{body}");
+        server.join().expect("服务线程结束");
     }
 }

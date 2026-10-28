@@ -17,7 +17,7 @@
 #      否则 GetWindowText 只拿到第一个字符，枚举「成功」却一个窗口都匹配不上。
 #   2. 交给 EnumWindows 的委托必须有静态根，没有时它「返回 true 却一次都不回调」。
 param(
-  [ValidateSet("info", "rect", "move", "cursor", "wait-transparent")]
+  [ValidateSet("info", "rect", "move", "serve", "cursor", "wait-transparent")]
   [string]$Action = "info",
   [string]$Title = "DesktopPet",
   [int]$Dx = 0,
@@ -156,6 +156,41 @@ switch ($Action) {
       if ($DelayMs -gt 0 -and $i -lt $Steps) { Start-Sleep -Milliseconds $DelayMs }
     }
     [Console]::Out.WriteLine('{"ok":true,"steps":' + $Steps + ',"from":' + $from + ',"to":' + [PetWindow]::RectJson($h) + '}')
+  }
+  # 常驻搬窗进程（verify-pet-drag 的「拖动态持续位移」用）：pwsh 单次启动 ~390ms，而拖动期
+  # 静默兜底只有 250ms —— 每次起新进程搬一下会来不及；这里一次启动后靠 stdin/stdout 往返
+  # （毫秒级）连搬。命令：`move <dx> <dy> <steps> <delayMs>`，`quit` 退出。
+  "serve" {
+    [Console]::Out.WriteLine('{"ok":true,"serve":true}')
+    [Console]::Out.Flush()
+    while ($true) {
+      $line = [Console]::In.ReadLine()
+      if ($null -eq $line) { break }
+      $line = $line.Trim()
+      if ($line -eq "") { continue }
+      if ($line -eq "quit") { [Console]::Out.WriteLine('{"ok":true,"bye":true}'); break }
+      $p = $line.Split(" ")
+      if ($p.Count -ne 5 -or $p[0] -ne "move") {
+        [Console]::Out.WriteLine('{"ok":false,"error":"bad-serving-command"}')
+        continue
+      }
+      $mDx = [int]$p[1]
+      $mDy = [int]$p[2]
+      $mSteps = [int]$p[3]
+      $mDelay = [int]$p[4]
+      $failed = $false
+      for ($i = 1; $i -le $mSteps; $i++) {
+        if (-not [PetWindow]::MoveBy($h, $mDx, $mDy)) {
+          [Console]::Out.WriteLine('{"ok":false,"error":"setwindowpos-failed"}')
+          $failed = $true
+          break
+        }
+        if ($mDelay -gt 0 -and $i -lt $mSteps) { Start-Sleep -Milliseconds $mDelay }
+      }
+      if (-not $failed) {
+        [Console]::Out.WriteLine('{"ok":true,"steps":' + $mSteps + ',"to":' + [PetWindow]::RectJson($h) + '}')
+      }
+    }
   }
   "cursor" {
     [void][PetWindow]::MoveCursorTo($X, $Y)

@@ -3,7 +3,7 @@
 //   renderAlerts(d) —— 最近提醒列表
 // 装配关系不在这里：三个 section 节点由 views/settings.js 按原次序 append。
 
-import { sourceLabelOf } from "../../market.js";
+import { MARKET_HOSTS, MARKET_SOURCES, sourceLabelOf } from "../../market.js";
 import { TOPIC_CMD } from "../../topics.js";
 import { button, clockOf, input, PHASE_TEXT, tag, text } from "../dom.js";
 import { cardXOf, cardYOf, intervalOf, modeOf, netText, prefChecked, statusText } from "./util.js";
@@ -100,6 +100,9 @@ export function mountPrefs(ctx, state) {
   petBox.on("change", () => ctx.bus.publish(TOPIC_CMD, { action: "config", value: { petOn: petBox.checked } }));
   const showIndexBox = input(dom, "checkbox");
   showIndexBox.on("change", () => ctx.bus.publish(TOPIC_CMD, { action: "config", value: { showIndex: showIndexBox.checked } }));
+  // 后备数据源开关（G5-08）：关掉后只打东财主源与各自主入口，别家域名一次都不碰
+  const fallbackBox = input(dom, "checkbox");
+  fallbackBox.on("change", () => ctx.bus.publish(TOPIC_CMD, { action: "config", value: { allowFallback: fallbackBox.checked } }));
   const indexSel = tag(dom, "select");
   for (const idx of INDEXES) {
     const opt = tag(dom, "option");
@@ -121,7 +124,13 @@ export function mountPrefs(ctx, state) {
   l2.append(petBox, text(dom, "宠物反应"));
   const l3 = tag(dom, "label");
   l3.append(showIndexBox, text(dom, "带指数"));
-  checks.append(l1, l2, l3, indexSel);
+  const l4 = tag(dom, "label");
+  l4.append(fallbackBox, text(dom, "允许后备数据源"));
+  checks.append(l1, l2, l3, l4, indexSel);
+
+  // 出网说明与实现对齐（G5-08）：主机名单直接取注册表的并集，别再手写一份会漂的名字
+  const hostsLine = tag(dom, "div", "muted");
+  hostsLine.textContent = `数据源：${MARKET_SOURCES.map((s) => s.label).join("、")}（后两家为后备）。可能访问 ${MARKET_HOSTS.length} 个域名：${MARKET_HOSTS.join("、")}。关掉「允许后备数据源」后只访问东方财富的主机。`;
 
   /* ---------- 回灌 ---------- */
   const render = (d) => {
@@ -151,6 +160,7 @@ export function mountPrefs(ctx, state) {
     alertsBox.checked = prefChecked(cfg.alertsOn);
     petBox.checked = prefChecked(cfg.petOn);
     showIndexBox.checked = prefChecked(cfg.showIndex);
+    fallbackBox.checked = cfg.allowFallback !== false;
     if (cfg.indexSecid) indexSel.value = cfg.indexSecid;
   };
 
@@ -172,7 +182,11 @@ export function mountPrefs(ctx, state) {
 
   return {
     // 次序与原 wrap.append 一致：显示方式 → 刷新与提醒 → 最近提醒
-    sections: [state.section("显示方式", radios, cardRow), state.section("刷新与提醒", row, checks, netLine), state.section("最近提醒", alertList)],
+    sections: [
+      state.section("显示方式", radios, cardRow),
+      state.section("刷新与提醒", row, checks, netLine, hostsLine),
+      state.section("最近提醒", alertList),
+    ],
     render,
     renderAlerts,
   };

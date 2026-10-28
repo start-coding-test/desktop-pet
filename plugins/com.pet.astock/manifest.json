@@ -16,5 +16,5 @@
     "pet:react",
     "pet:say"
   ],
-  "description": "自选股实时盯盘：盘中轮询行情，到价/涨跌幅触发提醒（系统通知 + 宠物反应），badge 小字、左上角盯盘卡、插件页管理自选股与阈值。数据源为东方财富公开只读接口。"
+  "description": "自选股实时盯盘：盘中轮询行情，到价/涨跌幅触发提醒（系统通知 + 宠物反应），badge 小字、左上角盯盘卡、插件页管理自选股与阈值。数据源：东方财富（主源）、腾讯、新浪（后备），共可能访问 8 个公开只读域名（push2.eastmoney.com、push2his.eastmoney.com、searchadapter.eastmoney.com、proxy.finance.qq.com、qt.gtimg.cn、web.ifzq.gtimg.cn、ifzq.gtimg.cn、hq.sinajs.cn）；设置页有「允许后备数据源」开关，关掉后只访问东方财富主源。"
 }

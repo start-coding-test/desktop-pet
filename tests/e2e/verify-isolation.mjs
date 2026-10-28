@@ -1,7 +1,7 @@
 // 隔离与安全回归断言。连到「已在运行」的 dev 实例，跑完给非零退出码即失败。
 //   终端 1: npm run dev:debug     终端 2: npm run verify
 // 只覆盖 dev 能验证的部分；CSP 与打包路径见 verify-release.mjs（每波次收尾手工跑一次）。
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
@@ -32,9 +32,10 @@ import {
   PROBE_ID,
   SPOOF_DIR,
   removeFixtures,
-  removePreseedFixtures,
+  restorePluginsDir,
   unisolatedAgentAdapters,
   writeFixtures,
+  writeProbeFixtures,
 } from "./harness/fixtures.mjs";
 
 const PORT = Number(env.CDP_PORT ?? argv.find((a) => a.startsWith("--port="))?.split("=")[1] ?? 9223);
@@ -1219,7 +1220,9 @@ try {
   await c.ev(`window.__hotSentinel = "armed"`);
   r.check("仅有启用记录、目录缺失时不激活", false, await c.ev(`(window.__probeActivated ?? 0) >= 1`));
   assertProbeRuntimeWritesAllowed("probe fixture 写入");
-  writeFixtures(PLUGINS_DIR);
+  // 只写（此刻不承载的）zz.probe：zz.net 在更早分组里仍 active，重写它的模块会触发
+  // 产品设计内的 dev 热重载，把本组的哨兵与广播探针一起掀掉（套件干扰，不是产品红）。
+  writeProbeFixtures(PLUGINS_DIR);
   r.check("放入目录后免重启即激活", true, await waitUntil(c, `(window.__probeActivated ?? 0) >= 1`, 20_000));
   r.check("目录变动的广播带得出变更的插件 id", true, await waitUntil(c, sawChangedId(PROBE_ID), 10_000));
   r.check("widget 容器随之出现", true, await c.ev(`!!document.querySelector('div[data-plugin-id=${JSON.stringify(PROBE_ID)}]')`));
@@ -3825,10 +3828,13 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
             : `答复 ok=${already.ok} v=${already.v}｜${consentVerdict(alreadyNoWindow)}`,
         );
       } finally {
+        console.log("  · 判据11 收尾：restore11() 前一行（判据5 组已结束）");
         await restore11();
       }
     } finally {
+      console.log("  · 同意区收尾：restore() 前");
       await restore();
+      console.log("  · 同意区收尾：restore() 已返回");
     }
   }
 
@@ -3895,7 +3901,8 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     `${countDeny("zz.probe")}|${countDeny("zz.consent")}|${countDeny("zz.status")}`,
   );
   const remaining = unexpected.filter(
-    (n) => !((n.includes("zz.probe") || n.includes("zz.consent") || n.includes("zz.status")) && n.includes(denyText)),
+    (n) =>
+      !((n.includes("zz.probe") || n.includes("zz.consent") || n.includes("zz.status")) && n.includes(denyText)),
   );
   r.check("无其他 console 错误", 0, remaining.length);
   for (const n of remaining) console.log("   " + n);
@@ -4006,7 +4013,11 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   } catch (err) {
     console.error("D07 收尾清理启停清单失败: " + String(err?.message ?? err));
   }
-  removePreseedFixtures(PLUGINS_DIR);
+  // 收尾口径：不管上面成功还是中途抛错，plugins/ 都恢回「只有真实插件」的样子，别把 zz.* 留给
+  // `npm run build`（tsconfig.plugins.json 会 typecheck plugins/**，残留探针会报一堆 TS2339）。
+  restorePluginsDir(PLUGINS_DIR);
+  const leftover = readdirSync(PLUGINS_DIR).filter((n) => n.startsWith("zz.") || n.startsWith("com.zz."));
+  r.check("收尾：plugins/ 不留 zz.* / com.zz.* 探针目录", [], leftover);
   // D07：预置的 zz.consent/zz.status/hook 与热安装组的 zz.probe 由上面的
   // 「先剔清单、再删目录」统一收口；后续套件不再看到这些 fixture。
   // 探针留在宿主 realm 那条例外只服务于本套件的页面全局断言，不该活到下一轮真实使用里

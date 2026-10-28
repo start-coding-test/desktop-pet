@@ -11,6 +11,8 @@ import { check, deep, eq, group, throws } from "./harness.mjs";
 import { calls as tauriCalls, resetStub, setReply } from "./tauri-stub.mjs";
 
 const smod = await import("../../src/pet/state-machine.ts");
+const dragMod = await import("../../src/pet/drag-controller.ts");
+const { DragController, DRAG_START_PX, BLUR_GRACE_MS, DRAG_SILENCE_MS } = dragMod;
 const acl = await import("../../src/runtime/topic-acl.ts");
 const { bus } = await import("../../src/runtime/event-bus.ts");
 const { pluginFileUrl, pluginFileVersion } = await import("../../src/runtime/plugin-url.ts");
@@ -384,21 +386,199 @@ group("拖动进入与复原");
 }
 
 {
-  // 优先级规则一个字没改：拖动中被更高级的插件请求打断时，松手不抢回来
+  // G6-03：拖动期 request 不再当场切（切了会被下一帧方向帧盖掉，waiting 提示永久丢），
+  // 先入队，松手复原后按原优先级补播。
   const sm = new PetStateMachine(fullSet());
   sm.beginDrag();
   sm.dragDirection("running-right");
+  sm.request("waiting");
+  eq(
+    "拖动中插件请求 waiting 不抢方向帧（旧实现切过去就被覆盖，等于丢掉）",
+    sm.action,
+    "running-right",
+  );
   sm.request("jumping");
-  eq("拖动中插件插播仍按原优先级立即打断", sm.action, "jumping");
+  eq("拖动中更高优先级的请求也只排队", sm.action, "running-right");
   sm.endDrag();
-  eq("松手不抢回插件的姿势", sm.action, "jumping");
-  eq("但拖动期确实结束了", sm.dragging, false);
+  eq("松手后补播优先级最高的那条（jumping）", sm.action, "jumping");
+  sm.update(2);
+  eq("补播的手势按自己的 dwell 播完", sm.action, "idle");
 }
 
-// 接线层（main.ts 顶层就摸 document，node 里 import 不了）：只能钉源码形状。
-// 这三条是「方向确实来自窗口位移」与「监听可注销、不叠加」的静态证据，
-// 运行期证据在 verify 套件/真机拖动里，别把这两类混为一谈。
-group("拖动方向接线（main.ts 形状）");
+{
+  // waiting 单独验：它是审批提示，丢了用户就看不到「需要点确认」。
+  // 拖动前正好在播手势时，补播要按原优先级排队（不抢正在播的手势），但不能永久丢。
+  const sm = new PetStateMachine(fullSet());
+  sm.request("waving"); // 拖动前是手势，复原目标不是 idle
+  sm.beginDrag();
+  sm.dragDirection("running-left");
+  sm.request("waiting");
+  eq("拖动中 waiting 仍不抢方向帧", sm.action, "running-left");
+  sm.endDrag();
+  eq("松手后先复原拖动前的姿势（优先级更高的手势没被打断）", sm.action, "waving");
+  sm.update(1); // waving 一遍 0.7s 播完，队列里的 waiting 补上
+  eq("补播按原优先级排在后面，最终播到 waiting（不再永久丢）", sm.action, "waiting");
+  eq("补播后拖动期已结束", sm.dragging, false);
+}
+
+// 缺方向帧的皮肤（G6-04）：Moved 循环不许每帧重切回退姿势，否则立绘卡在 idle 的首帧上闪。
+group("拖动缺帧皮肤（G6-04）");
+
+{
+  const sm = new PetStateMachine(setWithout("running-left", "running-right"));
+  sm.request("running"); // 拖动前是 running：缺方向帧时画面不该跳成 idle
+  sm.beginDrag();
+  sm.dragDirection("running-right");
+  eq("缺方向帧时不切到不存在的状态（停在拖动前姿势）", sm.action, "running");
+  const frameBefore = sm.frame;
+  sm.update(0.2); // running 帧间隔 ≈0.14s，推进一帧
+  const frameAfter = sm.frame;
+  check("拖动中帧序列照常推进", frameAfter !== frameBefore, "帧没有推进，可能被重切重置了");
+  sm.dragDirection("running-right");
+  sm.dragDirection("running-left");
+  sm.dragDirection(null);
+  eq("连续 Moved 不重切（帧序列没有被重置）", sm.frame, frameAfter);
+  eq("方向帧缺失期间姿势始终停在拖动前那条", sm.action, "running");
+  sm.endDrag();
+  eq("松手后仍在拖动前姿势", sm.action, "running");
+}
+
+{
+  // 拖动前是 idle 时也一样：回退目标恒定，只回退一次，不来回切
+  const sm = new PetStateMachine(setWithout("running-left", "running-right"));
+  sm.beginDrag();
+  sm.dragDirection("running-right");
+  eq("idle 起拖 + 缺方向帧：停在 idle", sm.action, "idle");
+  const first = sm.frame;
+  sm.update(0.2); // idle 帧间隔 ≈0.18s
+  const second = sm.frame;
+  check("帧确实推进过（不是永远首帧）", second !== first);
+  sm.dragDirection("running-left");
+  sm.dragDirection("running-right");
+  eq("重复 Moved 不重切 idle（帧序列保持推进）", sm.frame, second);
+  sm.endDrag();
+  eq("松手后仍是 idle", sm.action, "idle");
+}
+
+// 拖动交互本体（G6-01/G6-02/G6-08）：用假时钟直接驱动 DragController 的公开方法，
+// 不再用正则去 main.ts 里「证明」这些行为存在 —— 正则抓不到「拖动中失焦」「松手没事件」。
+group("拖动交互行为（DragController + 假时钟）");
+
+{
+  let clock = 0;
+  const mk = () => {
+    const log = [];
+    const ctl = new DragController({
+      now: () => clock,
+      onBegin: () => log.push("begin"),
+      onEnd: (reason) => log.push(`end:${reason}`),
+    });
+    return { ctl, log };
+  };
+
+  {
+    const { ctl, log } = mk();
+    ctl.pressDown(100, 100);
+    check("按下只记 press，不立刻起拖", ctl.hasPress && !ctl.isEngaged && log.length === 0);
+    ctl.pointerMove(100 + DRAG_START_PX, 100, 1);
+    check("位移恰在阈值上不起拖", !ctl.isEngaged);
+    ctl.pointerMove(100 + DRAG_START_PX + 1, 100, 1);
+    check("超过阈值才交给系统拖拽（onBegin 一次）", ctl.isEngaged && log.join(",") === "begin");
+    ctl.pointerUp();
+    check("拖动中抬起按 mouseup 收尾", !ctl.isEngaged && log.at(-1) === "end:mouseup");
+  }
+
+  {
+    // G6-01：拖动期 blur 不结束拖动；宽限内 focus 回来就作废
+    clock = 0;
+    const { ctl, log } = mk();
+    ctl.pressDown(0, 0);
+    ctl.pointerMove(10, 0, 1);
+    ctl.blur();
+    check(
+      "拖动中 blur 只清 press、标记待裁决，不结束拖动",
+      ctl.isEngaged && !ctl.hasPress && ctl.awaitingBlurVerdict && !log.includes("end:blur"),
+    );
+    clock += BLUR_GRACE_MS - 1;
+    ctl.tick();
+    check("宽限未到不作废拖动", ctl.isEngaged);
+    ctl.focus();
+    ctl.tick();
+    check("宽限内 focus 回来：这次失焦作废、拖动继续", ctl.isEngaged && !ctl.awaitingBlurVerdict);
+
+    clock = 0;
+    const second = mk();
+    second.ctl.pressDown(0, 0);
+    second.ctl.pointerMove(10, 0, 1);
+    second.ctl.blur();
+    clock += BLUR_GRACE_MS;
+    second.ctl.tick();
+    check(
+      "宽限期到点按真失焦收尾（onEnd reason=blur）",
+      !second.ctl.isEngaged && second.log.join(",") === "begin,end:blur",
+    );
+  }
+
+  {
+    // G6-02：真机吞 mouseup —— 窗口静默 250ms 就按松键收尾，不能永远 running
+    clock = 0;
+    const { ctl, log } = mk();
+    ctl.pressDown(0, 0);
+    ctl.pointerMove(10, 0, 1);
+    clock += DRAG_SILENCE_MS - 1;
+    ctl.tick();
+    check("静默不足 250ms 不收尾", ctl.isEngaged);
+    ctl.windowMoved(); // 窗口还在动 = 拖拽还活着
+    clock += 200;
+    ctl.tick();
+    check("窗口还在动就继续拖（静默计时被窗口位移刷新）", ctl.isEngaged);
+    clock += DRAG_SILENCE_MS;
+    ctl.tick();
+    check(
+      "窗口静默 250ms：按松键收尾（onEnd reason=silent）",
+      !ctl.isEngaged && log.at(-1) === "end:silent",
+    );
+  }
+
+  {
+    // 拖动中按键已松开（buttons=0 的 mousemove）：mouseup 没收到时的常规补救路径
+    clock = 0;
+    const { ctl, log } = mk();
+    ctl.pressDown(0, 0);
+    ctl.pointerMove(10, 0, 1);
+    ctl.pointerMove(999, 0, 0);
+    check("拖动中按键已松开：按松手收尾", !ctl.isEngaged && log.at(-1) === "end:buttons-released");
+  }
+
+  {
+    // 非拖动期的失焦/移出只撤销「按住」候选，不能影响别的拖拽
+    clock = 0;
+    const { ctl, log } = mk();
+    ctl.pressDown(0, 0);
+    ctl.blur();
+    check("非拖动期失焦只撤销按下候选", !ctl.hasPress && !ctl.isEngaged && log.length === 0);
+    ctl.pressDown(0, 0);
+    ctl.mouseLeave();
+    check("移出窗口只撤销按下候选", !ctl.hasPress && !ctl.isEngaged && log.length === 0);
+
+    // 拖动中移出窗口：只清 press，拖动继续
+    ctl.pressDown(0, 0);
+    ctl.pointerMove(10, 0, 1);
+    ctl.mouseLeave();
+    check("拖动中移出窗口不结束拖动", ctl.isEngaged && !ctl.hasPress);
+
+    // 上一趟 mouseup 没收到时重新按下：先按松手收尾，再记新按下点
+    ctl.pressDown(5, 5);
+    check(
+      "上一趟 mouseup 丢失时，重新按下先收尾旧的拖动",
+      log.includes("end:reset") && ctl.hasPress && !ctl.isEngaged,
+    );
+  }
+}
+
+// 接线层（main.ts 顶层就摸 document，node 里 import 不了）：只钉「事件源与生命周期」这类
+// 跑不进 node 的接线事实；拖动行为本身在上面的假时钟单测里验。
+group("拖动接线（main.ts 形状）");
 
 {
   const mainSrc = readFileSync(new URL("../../src/main.ts", import.meta.url), "utf8");
@@ -408,9 +588,15 @@ group("拖动方向接线（main.ts 形状）");
     "main.ts 里没有 onMoved",
   );
   check(
-    "采样结果交给状态机（方向只从窗口位移进，不从拖拽后的 mousemove 进）",
-    /function onWindowMoved[\s\S]*?pet\.dragDirection\(dragTracker\.sample\(/.test(mainSrc),
-    "onWindowMoved 没把采样交给状态机",
+    "onWindowMoved 把窗口位移喂给方向判定与静默兜底",
+    /function onWindowMoved[\s\S]*?pet\.dragDirection\(dragTracker\.sample\(/.test(mainSrc) &&
+      mainSrc.includes("drag.windowMoved()"),
+    "onWindowMoved 没接方向判定/静默兜底",
+  );
+  check(
+    "拖动收尾统一走 DragController（main.ts 不再自己管 press 标志）",
+    mainSrc.includes("drag.pointerUp()") && mainSrc.includes("drag.isEngaged") && !mainSrc.includes("let press:"),
+    "main.ts 没有接 DragController",
   );
   check(
     "重复 activate 不叠加监听（已挂即退）",
@@ -427,11 +613,6 @@ group("拖动方向接线（main.ts 形状）");
     "窗口销毁前摘监听（pagehide）",
     /addEventListener\("pagehide", disposeDragTracking/.test(mainSrc),
     "没有 pagehide 收尾",
-  );
-  check(
-    "松手复原走状态机快照（endDrag），main.ts 不自己存姿势",
-    /function resetPress[\s\S]*?pet\?\.endDrag\(\);/.test(mainSrc),
-    "resetPress 没有复原",
   );
 }
 

@@ -405,7 +405,8 @@ impl Target {
 }
 
 /// 回环 / 私网 / 链路本地 / 运营商 NAT / 未指定地址 —— **永远直连**，优先于一切代理设置。
-/// 覆盖字面 IP 与本机名；一个解析到内网 IP 的公网域名不在防护范围内（由逐域名授权挡，ADR-0011 追加节如实写明）。
+/// 覆盖字面 IP 与本机名；解析到内网 IP 的公网域名由出站解析守卫逐次拒
+/// （`services::http` 的 `GuardedResolver`，G3-03；申报口径见 ADR-0011 追加节）。
 pub fn is_local_or_private(target: &Target) -> bool {
     let host = target.host.trim_start_matches('[').trim_end_matches(']');
     // 本机名走同一个判定函数，别让「`<local>` 的口径」与「第一道否决的口径」有两份实现
@@ -419,6 +420,37 @@ pub fn is_local_or_private(target: &Target) -> bool {
         return v6;
     }
     false
+}
+
+/// 解析出来的这条地址能不能连（G3-03）：与 `is_local_or_private` 同一份口径，
+/// 只是输入换成「已经解析出的 IP」。出站解析器每次解析都过它 ——
+/// 「第一次解析到公网、复解到内网」的 DNS rebinding 在连出去之前就被拒。
+pub fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => !is_private_v4(v4.octets()),
+        // IPv4-mapped 折回 v4 判（`::ffff:127.0.0.1` 不能因为「是 v6」就放行）
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => !is_private_v4(v4.octets()),
+            None => !ipv6_form(&v6.to_string()).unwrap_or(false),
+        },
+    }
+}
+
+/// 回环字面量（G3-03 分档用）：`127.0.0.0/8`、`::1`，以及 IPv4-mapped 的回环写法
+/// （`::ffff:127.0.0.1`、`::ffff:7f00:1`）。只认「写死在 URL 里、解析不经过 DNS」的形态；
+/// `localhost` 这类本机名由调用方另判（`services::http` 的 `is_stable_local_target`）。
+pub fn is_loopback_literal(host: &str) -> bool {
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    if let Some([127, ..]) = ipv4(host) {
+        return true;
+    }
+    let lower = host.to_ascii_lowercase();
+    lower == "::1"
+        || lower == "0:0:0:0:0:0:0:1"
+        || mapped_v4(&lower).is_some_and(|v| v[0] == 127)
 }
 
 /// 点分四段（含前导零宽松解析失败即不认）才返回；主机名不是 IP 时返回 None。
@@ -1058,5 +1090,32 @@ mod tests {
         );
         assert!(s.proxy_for(&target("https://repo.internal/")).is_none());
         assert!(s.proxy_for(&target("http://127.0.0.1:1420/")).is_none());
+    }
+
+    /// G3-03 分档用的回环字面量判定：v4/v6/mapped 都认，公网与私网都不算
+    #[test]
+    fn loopback_literal_covers_v4_v6_and_mapped_forms() {
+        for host in [
+            "127.0.0.1",
+            "127.255.0.9",
+            "[::1]",
+            "::1",
+            "0:0:0:0:0:0:0:1",
+            "::ffff:127.0.0.1",
+            "::ffff:7f00:1",
+        ] {
+            assert!(is_loopback_literal(host), "{host} 是回环字面量");
+        }
+        for host in [
+            "127.0.0.1.example.com",
+            "example.com",
+            "10.0.0.1",
+            "8.8.8.8",
+            "::",
+            "fe80::1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert!(!is_loopback_literal(host), "{host} 不是回环字面量");
+        }
     }
 }

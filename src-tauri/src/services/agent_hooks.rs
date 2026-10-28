@@ -23,6 +23,15 @@ use crate::services::agent::phases::AGENT_FLAG;
 /// 自家条目的识别标记。它同时是 hook 分支的 CLI 参数，两边共用这一个常量
 pub const HOOK_MARKER: &str = "--pet-hook";
 
+/// 「这条路径要先问用户」的机器标记。命令层原样把带这个前缀的错误交给设置页，页面据此弹确认框；
+/// 自动路径（停用→再启用、启动清理）看到它只能**跳过并报告**，不许当成普通失败重试。
+pub const NEED_CONFIRM: &str = "[need-confirm]";
+
+/// 拼一条「要先问」的文案。正文交给适配器 —— 每家客户端要用户确认的东西不一样。
+pub fn need_confirm(adapter: &dyn AgentAdapter, count: usize) -> String {
+    format!("{NEED_CONFIRM} {}", adapter.consent_prompt(count))
+}
+
 /// 装卸串行锁。设置页点按钮、启停联动、启动清理和 `--pet-hook-cleanup` 都在做
 /// 「读原文 → 改 → 原子替换」这三步，并发跑就会互相覆盖：一方按旧内容算出新文本时
 /// 另一方已经写进去了，后写的那份把先写的条目抹掉（或装出双份）。
@@ -117,25 +126,11 @@ fn backup_once(path: &Path, ledger_dir: Option<&Path>) -> Result<(), String> {
     Ok(())
 }
 
-/// 原子写：先落同目录临时文件再 rename，避免写一半被打断留下坏配置。
-/// 临时名必须带 pid —— 固定名会让两个来源同时安装时互相覆盖：
-/// 一方还在写 `settings.json.tmp`，另一方已经把同名文件 rename 走了。
+/// 原子写：走 `fsutil::write_atomic`（临时名带 pid + 序号，写完 fsync 再 rename）。
+/// G3-04：hook 配置写坏会直接影响用户 CLI 的启动，落盘必须抗断电，
+/// 所以不再保留本文件里那份手写实现。
 fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
-    let base = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("settings.json");
-    let tmp = path.with_file_name(format!("{base}.{}.tmp", std::process::id()));
-    if let Err(e) = fs::write(&tmp, text) {
-        return Err(format!("写入临时文件失败: {e}"));
-    }
-    match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            Err(format!("替换配置文件失败: {e}"))
-        }
-    }
+    crate::fsutil::write_atomic(path, text.as_bytes()).map_err(|e| e.to_string())
 }
 
 /// 读原文；文件不存在返回 Ok(None)
@@ -196,13 +191,28 @@ fn apply_text(path: &Path, text: &str, ledger_dir: Option<&Path>) -> Result<(), 
 ///
 /// `ledger_dir` 是备份账本目录（宿主数据目录）：**新建备份必然会写账本**，拿不到目录就算
 /// 备份失败；已存在的备份不是我们写的，不需要记账。
+///
+/// `confirm` 是用户的确认状态。确认门**下沉到这一层**（而不是只留在切换弹框里）：
+/// 「安装」按钮、停用→再启用的自动重装、切换 Agent 三条路径都要过它，谁也别想绕过。
+/// 没确认就一个文件都不写，返回的报告带着 [`NEED_CONFIRM`] 前缀的错误；命令层据此拒绝并要求确认，
+/// 自动路径据此跳过本次安装（不记 choice、不落开关记录）。
 pub fn install_files(
     adapter: &dyn AgentAdapter,
     files: &[PathBuf],
     exe: &Path,
     ledger_dir: Option<&Path>,
+    confirm: bool,
 ) -> Vec<FileReport> {
     let _io = lock_hook_io();
+    if !confirm {
+        if let Some(count) = pending_consent(adapter, files) {
+            let reason = need_confirm(adapter, count);
+            return files
+                .iter()
+                .map(|path| FileReport::failed(path, reason.clone()))
+                .collect();
+        }
+    }
     let command_for = hook_command(adapter, exe);
     files
         .iter()
@@ -322,14 +332,16 @@ pub fn mark_log(adapter: &dyn AgentAdapter, home: &Path) -> Option<LogMark> {
 
 /// 装后自检（方案 §3.5）：只读安装之后新增的那些行，坏行的判据住在适配器里。
 ///
-/// **四种**结果要分开，其中最容易被糊弄的是第三种：
+/// **五档**结果要分开，其中最容易被糊弄的是「没查」与「查了但没新行」：
 /// * `None` —— 这一家根本没有可查的日志（Codex / WorkBuddy / Qoder）。设置页显示空白，
 ///   不是「一切正常」。
 /// * `unavailable` —— 该有日志却没读到（没文件、读不出来），要说出来。
 /// * `problem` —— 查出问题并附日志原文。
-/// * `ok` —— 真查过且没有指向我们的坏行。
+/// * `pending` —— 装完到自检之间**没有任何新日志行**：客户端还没跑下一次事件，自检没的是结论，
+///   不是「没问题」。上一版把它标成 `ok` 是假绿（G2-11）。
+/// * `ok` —— 真读到了新增行且没有指向我们的坏行。
 ///
-/// 把前两档说成最后一档，等于给用户一张假的安全条。
+/// 把前几档说成最后一档，等于给用户一张假的安全条。
 pub fn log_self_check(
     adapter: &dyn AgentAdapter,
     mark: Option<&LogMark>,
@@ -340,6 +352,8 @@ pub fn log_self_check(
     let name = adapter.display_name();
     let (path, len) = match newest_log(&watch) {
         Some(found) => found,
+        // 该有日志却一份都找不到 = 「没查成」，不是「查过没问题」。归 unavailable 而不是 ok，
+        // 也不能归 pending（pending 专指「日志在、但装完到自检之间没有新行」）。
         None => {
             return Some(json!({
                 "status": "unavailable",
@@ -350,7 +364,10 @@ pub fn log_self_check(
     // 还是那份文件就只看新增的一段；冒出新文件（跨天，或装之前根本没有日志）就整份算新增
     let start = mark.filter(|m| m.path == path).map_or(0, |m| m.len);
     if len <= start {
-        return Some(json!({ "status": "ok", "detail": "装完到自检之间没有新日志行" }));
+        return Some(json!({
+            "status": "pending",
+            "detail": "装完到自检之间没有新日志行：客户端还没跑下一次事件，这一项没法判定",
+        }));
     }
     let Ok(all) = fs::read(&path) else {
         return Some(json!({
@@ -369,6 +386,134 @@ pub fn log_self_check(
         }),
         None => json!({ "status": "ok", "detail": "日志里没有指向我们的坏行" }),
     })
+}
+
+/// 一个候选文件的「盘上事实」：真的生效了几条、命令串里是不是我们这份 exe。
+#[derive(Debug, serde::Serialize)]
+pub struct FileCheck {
+    pub path: String,
+    pub found: usize,
+    pub expected: usize,
+    /// 盘上的文本里有几条命令指向**当前** exe。换过安装路径时这里有值对不上。
+    pub command_found: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub problem: Option<String>,
+}
+
+/// 装完回头读盘核对 —— 不信安装报告，只信文件里实际的条数与命令串。
+///
+/// 报告能对得上而盘上不对的形状有两种：写到了别的路径（候选列表只说「会写哪里」，
+/// 报告说的也是同一批候选），或者 exe 换过路径导致旧命令还在。两者都会让状态页显示
+/// 「已安装」而事件其实不来 —— 这正是 G2-11 要判红的假绿，所以自检必须落在盘上而不是报告上。
+pub fn verify_installed(adapter: &dyn AgentAdapter, files: &[PathBuf], exe: &Path) -> Vec<FileCheck> {
+    let display = exe.display().to_string();
+    // JSON 里的 Windows 路径是双反斜杠，直接按显示串找会永远找不到（假红）：
+    // 用 serde 转义一次，按配置文件里真实会出现的写法比对。
+    let needle = serde_json::to_string(&display)
+        .map(|s| s.trim_matches('"').to_string())
+        .unwrap_or(display);
+    let expected = adapter.events().len();
+    // 候选列表为空 = 一个文件都没写下去（装完文件被删、目录不在了）：这是比条数不对更硬的假绿
+    if files.is_empty() {
+        return vec![FileCheck {
+            path: "(候选文件列表)".to_string(),
+            found: 0,
+            expected,
+            command_found: 0,
+            problem: Some("一个候选文件都没有：配置没落盘".to_string()),
+        }];
+    }
+    let _io = lock_hook_io();
+    files
+        .iter()
+        .map(|path| {
+            let check = |found: usize, command_found: usize, problem: Option<String>| FileCheck {
+                path: path.display().to_string(),
+                found,
+                expected,
+                command_found,
+                problem,
+            };
+            let raw = match read_existing(path) {
+                Ok(Some(raw)) => raw,
+                // 候选文件不存在 = 根本没写下去。装完就不在，比条数不对更糟
+                Ok(None) => return check(0, 0, Some("装完文件不存在，配置没落盘".to_string())),
+                Err(e) => return check(0, 0, Some(format!("装完读不出来: {e}"))),
+            };
+            if let Err(e) = serde_json::from_str::<Value>(&raw) {
+                return check(0, 0, Some(format!("装完解析不了（写坏了）: {e}")));
+            }
+            let found = adapter.managed_count(&raw);
+            let command_found = raw.matches(&needle).count();
+            let problem = if found != expected {
+                Some(format!("盘上只有 {found} 条自家条目，应为 {expected} 条"))
+            } else if command_found < expected {
+                Some(format!(
+                    "盘上只有 {command_found} 条命令指向当前 exe，应为 {expected} 条（可能换过安装路径）"
+                ))
+            } else {
+                None
+            };
+            check(found, command_found, problem)
+        })
+        .collect()
+}
+
+/// 装后自检汇总：**先看盘上事实，再看日志增量**，两者都过才给绿。
+///
+/// * `ok` —— 每个候选文件的条数与命令串都对得上，且日志（有的话）没有坏行；
+/// * `pending` —— 盘上核对通过，但日志还没有新增行（客户端没跑下一次事件）；
+/// * `unverified` —— 盘上核对通过，但该有的日志读不到（没做成日志自检）；
+/// * `problem` —— 任一处对不上，`detail` 指到第一个问题（路径 + 原因）。
+///
+/// 自检的输入是 `files` 与 `exe` 本身，不是安装返回的报告 —— 报告全绿而盘上不对时这里必须判红。
+pub fn self_check(
+    adapter: &dyn AgentAdapter,
+    files: &[PathBuf],
+    exe: &Path,
+    mark: Option<&LogMark>,
+    home: &Path,
+    our_command: &str,
+) -> Value {
+    let checks = verify_installed(adapter, files, exe);
+    let log = log_self_check(adapter, mark, home, our_command);
+    let log_status = log
+        .as_ref()
+        .and_then(|v| v.get("status"))
+        .and_then(Value::as_str);
+    let log_detail = log
+        .as_ref()
+        .and_then(|v| v.get("detail"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let expected = adapter.events().len();
+    let (status, detail) = if let Some(bad) = checks.iter().find(|c| c.problem.is_some()) {
+        let why = bad.problem.as_deref().unwrap_or("盘上核对失败");
+        ("problem", format!("{}: {why}", bad.path))
+    } else {
+        match log_status {
+            Some("problem") => ("problem", log_detail.to_string()),
+            Some("pending") => (
+                "pending",
+                format!("盘上核对通过（每文件 {expected} 条）；{log_detail}"),
+            ),
+            Some("unavailable") => (
+                "unverified",
+                format!("盘上核对通过（每文件 {expected} 条），但{log_detail}"),
+            ),
+            Some(_) => (
+                "ok",
+                format!("盘上核对通过（每文件 {expected} 条）；{log_detail}"),
+            ),
+            // 没有可查日志的客户端：盘上核对就是全部证据，但日志自检这一环**没做** ——
+            // 不能报 `ok`（那是「查过且没问题」），只能报 `unverified`（G2-11 契约）
+            None => (
+                "unverified",
+                format!("该客户端没有可查日志；盘上核对通过（每文件 {expected} 条）"),
+            ),
+        }
+    };
+    json!({ "status": status, "detail": detail, "files": checks, "log": log })
 }
 
 /// 切换 Agent 之前问一句：这个适配器在它的候选文件里需不需要用户先确认
@@ -431,6 +576,7 @@ mod tests {
             std::slice::from_ref(&path),
             exe,
             Some(dir.as_path()),
+            true,
         );
         assert!(reports[0].error.is_none(), "{:?}", reports[0].error);
         assert_eq!(reports[0].managed, HOOK_PHASES.len());
@@ -500,7 +646,8 @@ mod tests {
             &QODER,
             &QODER.targets(&dir),
             exe,
-            Some(dir.join("ledger").as_path())
+            Some(dir.join("ledger").as_path()),
+            true,
         )));
 
         let cleaned = uninstall_everywhere(&dir, &json!({}));
@@ -540,6 +687,7 @@ mod tests {
             &ZCODE.targets(&dir),
             exe,
             Some(dir.join("ledger").as_path()),
+            true,
         );
         assert!(any_installed(&reports), "{:?}", reports[0].error);
         assert_eq!(
@@ -623,14 +771,12 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// 装后自检的三种结果要能分开：新增坏行 / 没新行 / **没日志可读所以没查**。
-    /// 第三种最要紧：它不能长得像「查过了、一切正常」。
-    /// 「这一家没有可查的日志」必须一路传成 `None`。接线新客户端时最容易犯的错，是把
-    /// 「没做自检」写成「查过且没问题」（`json!({"status":"ok"})` 只要少写一个分支就顺手冒出来了）——
-    /// 那种绿是假的，而且它长得比真相好看。最后一条反查是必要的：光看前三家全 `None`，
-    /// 「所有适配器都返回 None」这个变异也会一路绿过去。
+    /// G2-11 / t38-B：没有可查日志的客户端，装后自检必须是 `unverified` **对象** ——
+    /// 它不能报 `ok`（那是「查过且没问题」），也不能报 `null`（旧契约，e2e 已按新口径改写）。
+    /// 同时仍要钉住「没日志」这个事实：`log_watch` / `mark_log` / `log_self_check` 都返回 `None`。
+    /// 最后一条反查是必要的：光看三家全 `None`，「所有适配器都返回 None」这个变异也会一路绿过去。
     #[test]
-    fn a_family_without_a_log_gets_no_self_check_at_all() {
+    fn a_family_without_a_log_reports_unverified_instead_of_ok_or_null() {
         let _env = adapters::lock_test_env();
         let dir = tmp_dir("no-log-watch");
         std::env::set_var("PET_AGENT_HOME", &dir);
@@ -642,6 +788,7 @@ mod tests {
             r#"{"event":"config_file_invalid"}"#,
         )
         .unwrap();
+        let exe = Path::new(r"C:\app\desktop-pet.exe");
 
         for adapter in adapters::wired().iter().filter(|a| a.id() != "zcode") {
             assert!(
@@ -657,9 +804,60 @@ mod tests {
             assert!(
                 log_self_check(*adapter, None, &dir, &format!("--agent {}", adapter.id()))
                     .is_none(),
-                "{} 的 selfCheck 必须是「没这回事」而不是 ok",
+                "{} 的日志探针必须是「没这回事」",
                 adapter.id()
             );
+
+            // 先真的装上，再让自检只看盘上事实：没日志 ≠ 没装。
+            // Qoder/Codex/WorkBuddy 的 targets 只认已存在的目录（claude_style::targets），
+            // 夹具里先把 dir_hint 造出来；DSH 是桥形态、根本没有 hook 文件（targets 恒空），跳过。
+            for leaf in adapter.dir_hint() {
+                fs::create_dir_all(dir.join(leaf)).unwrap();
+            }
+            let files = adapter.targets(&dir);
+            if files.is_empty() {
+                assert_eq!(
+                    adapter.id(),
+                    "dsh",
+                    "{} 有目标目录却没有可装的文件",
+                    adapter.id()
+                );
+                continue;
+            }
+            for path in &files {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).unwrap();
+                }
+            }
+            let reports =
+                install_files(*adapter, &files, exe, Some(dir.as_path()), true);
+            assert!(
+                any_installed(&reports),
+                "{}：夹具要先装上，否则自检看到的是「文件不存在」",
+                adapter.id()
+            );
+            let check = self_check(
+                *adapter,
+                &files,
+                exe,
+                None,
+                &dir,
+                &format!("--agent {}", adapter.id()),
+            );
+            assert_eq!(
+                check["status"], "unverified",
+                "{}：没有可查日志时只能报 unverified，不能报 ok 或 null：{check}",
+                adapter.id()
+            );
+            assert!(
+                check["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("没有可查日志"),
+                "{}：detail 要点明没有可查日志：{check}",
+                adapter.id()
+            );
+            uninstall_files(*adapter, &files, &json!({}));
         }
         assert!(
             log_self_check(&ZCODE, None, &dir, "--agent zcode").is_some(),
@@ -753,5 +951,179 @@ mod tests {
             !any_installed(&[ok(0, None)]),
             "managed=0 且无错 = 没写进任何条目，也不算装上"
         );
+    }
+
+    /// G2-09：确认门下沉到 `install_files` 之后，「安装」按钮、停用→再启用的自动重装、
+    /// 切换 Agent 三条路径共用同一道闸。没确认就必须**一个字节都不写**，且错误带机器标记
+    /// （命令层据此回 `[need-confirm]`，自动路径据此跳过这次安装）。
+    #[test]
+    fn install_without_consent_writes_nothing_and_reports_need_confirm() {
+        let _env = adapters::lock_test_env();
+        let dir = tmp_dir("consent-gate");
+        std::env::set_var("PET_AGENT_HOME", &dir);
+        std::env::remove_var("PET_AGENT_CONFIG_FILES");
+        let cli = dir.join(".zcode").join("cli");
+        fs::create_dir_all(&cli).unwrap();
+        let file = cli.join("config.json");
+        let raw = r#"{"hooks":{"enabled":false,"events":{"Stop":[{"hooks":[{"type":"command","command":"keep.sh"}]}]}}}"#;
+        fs::write(&file, raw).unwrap();
+        let exe = Path::new(r"C:\app\desktop-pet.exe");
+
+        let gated = install_files(
+            &ZCODE,
+            &ZCODE.targets(&dir),
+            exe,
+            Some(dir.join("ledger").as_path()),
+            false,
+        );
+        assert!(!any_installed(&gated), "没确认不能算装上");
+        let reason = gated[0].error.clone().expect("没确认必须报错");
+        assert!(
+            reason.starts_with(NEED_CONFIRM),
+            "错误要带机器标记，命令层才认得出来: {reason}"
+        );
+        assert!(reason.contains("1 条"), "文案要带要确认的条数: {reason}");
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            raw,
+            "没确认就一个字节都不写"
+        );
+
+        // 确认之后同一条路径正常装上
+        let installed = install_files(
+            &ZCODE,
+            &ZCODE.targets(&dir),
+            exe,
+            Some(dir.join("ledger").as_path()),
+            true,
+        );
+        assert!(any_installed(&installed), "{:?}", installed[0].error);
+        assert_eq!(installed[0].managed, ZCODE.events().len());
+
+        std::env::remove_var("PET_AGENT_HOME");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// G2-11：自检必须重新读盘核对（路径 + 条数 + 命令串），不能拿安装报告当证据。
+    /// 这里构造三种「报告全绿但盘上不对」的假绿：条目被切少、换过安装路径、候选文件消失。
+    #[test]
+    fn self_check_judges_the_files_not_the_install_report() {
+        let _env = adapters::lock_test_env();
+        let dir = tmp_dir("selfcheck-files");
+        std::env::set_var("PET_AGENT_HOME", &dir);
+        std::env::remove_var("PET_AGENT_CONFIG_FILES");
+        let cli = dir.join(".zcode").join("cli");
+        fs::create_dir_all(&cli).unwrap();
+        let file = cli.join("config.json");
+        fs::write(&file, r#"{"hooks":{"enabled":true,"events":{}}}"#).unwrap();
+        // 装之前先造一份 ZCode 形状的日志（进程内的 mark_log 才有记号可记）：
+        // 这样「盘上对、日志没有新行」才落在 pending 这一档，而不是 unavailable。
+        let log = dir.join(".zcode").join("cli").join("log");
+        fs::create_dir_all(&log).unwrap();
+        fs::write(log.join("zcode-2026-10-18.jsonl"), "{\"level\":\"info\"}\n").unwrap();
+        let exe = Path::new(r"C:\app\desktop-pet.exe");
+        let reports = install_files(
+            &ZCODE,
+            &ZCODE.targets(&dir),
+            exe,
+            Some(dir.join("ledger").as_path()),
+            true,
+        );
+        assert!(any_installed(&reports));
+
+        // 盘上确实有 7 条、命令指向这份 exe：日志还没新行 → pending（不能是 ok）
+        let fresh = self_check(
+            &ZCODE,
+            &ZCODE.targets(&dir),
+            exe,
+            mark_log(&ZCODE, &dir).as_ref(),
+            &dir,
+            "--agent zcode",
+        );
+        assert_eq!(fresh["status"], "pending", "{fresh}");
+        assert_eq!(fresh["files"][0]["found"], ZCODE.events().len());
+
+        // 盘上只剩 1 条（装到别处 / 被别的工具改回）：报告还是 7 条，自检必须判红
+        fs::write(
+            &file,
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"x.exe --pet-hook pre --agent zcode"}]}]}}"#,
+        )
+        .unwrap();
+        let tampered = self_check(&ZCODE, &ZCODE.targets(&dir), exe, None, &dir, "--agent zcode");
+        assert_eq!(tampered["status"], "problem", "{tampered}");
+        assert!(
+            tampered["detail"].as_str().unwrap_or("").contains("7 条"),
+            "问题要指到文件与应有的条数: {tampered}"
+        );
+
+        // 换过安装路径：条数对、命令串不是当前 exe → 同样是假绿，必须判红
+        fs::write(&file, r#"{"hooks":{"enabled":true,"events":{}}}"#).unwrap();
+        install_files(
+            &ZCODE,
+            &ZCODE.targets(&dir),
+            Path::new(r"C:\old\desktop-pet.exe"),
+            Some(dir.join("ledger-old").as_path()),
+            true,
+        );
+        let moved = self_check(&ZCODE, &ZCODE.targets(&dir), exe, None, &dir, "--agent zcode");
+        assert_eq!(moved["status"], "problem", "{moved}");
+        assert!(
+            moved["detail"].as_str().unwrap_or("").contains("exe"),
+            "要指出命令串不对: {moved}"
+        );
+
+        // 装完候选文件消失 = 配置没落盘
+        fs::remove_file(&file).unwrap();
+        let gone = self_check(&ZCODE, &ZCODE.targets(&dir), exe, None, &dir, "--agent zcode");
+        assert_eq!(gone["status"], "problem", "{gone}");
+
+        // 没有可查日志的客户端（Qoder）：盘上核对通过，但日志自检没做 → 只能报 unverified
+        let qoder = dir.join("qoder-settings.json");
+        fs::write(&qoder, r#"{"theme":"dark"}"#).unwrap();
+        install_files(
+            &QODER,
+            std::slice::from_ref(&qoder),
+            exe,
+            Some(dir.join("ledger-qoder").as_path()),
+            true,
+        );
+        let no_log = self_check(
+            &QODER,
+            std::slice::from_ref(&qoder),
+            exe,
+            None,
+            &dir,
+            "--agent qoder",
+        );
+        assert_eq!(no_log["status"], "unverified", "{no_log}");
+        assert_eq!(no_log["log"], Value::Null, "这家没有可查日志");
+        assert!(
+            no_log["detail"]
+                .as_str()
+                .unwrap_or("")
+                .contains("没有可查日志"),
+            "别把「没做日志自检」说成查过了: {no_log}"
+        );
+
+        std::env::remove_var("PET_AGENT_HOME");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 装完到自检之间没有新日志行 = `pending`，不是 `ok`。这一条是 G2-11 里最容易假绿的一档：
+    /// 客户端还没跑到下一次事件时，日志本来就不会变，把它说成「查过没问题」等于没查就发合格证。
+    #[test]
+    fn no_new_log_lines_is_pending_not_ok() {
+        let _env = adapters::lock_test_env();
+        let dir = tmp_dir("pending-log");
+        std::env::set_var("PET_AGENT_HOME", &dir);
+        let log = dir.join(".zcode").join("cli").join("log");
+        fs::create_dir_all(&log).unwrap();
+        let file = log.join("zcode-2026-10-18.jsonl");
+        fs::write(&file, "{\"level\":\"info\"}\n").unwrap();
+        let mark = mark_log(&ZCODE, &dir).expect("该能挑出这份日志");
+        let out = log_self_check(&ZCODE, Some(&mark), &dir, "--agent zcode").expect("有可查日志");
+        assert_eq!(out["status"], "pending", "{out}");
+        std::env::remove_var("PET_AGENT_HOME");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

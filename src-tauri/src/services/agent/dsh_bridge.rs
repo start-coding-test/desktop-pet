@@ -19,6 +19,9 @@ use crate::services::agent::adapters::dsh::BRIDGE_PACKAGE;
 /// 开发/复演时把 `~/.dsh` 指到别处（与 `PET_AGENT_HOME` 同类的隔离开关）。
 pub const HOME_ENV: &str = "PET_DSH_HOME";
 
+/// 全仓统一的「家目录」隔离根：本模块只读它的「回退」语义（见 [`dsh_home`]）。
+const AGENT_HOME_ENV: &str = "PET_AGENT_HOME";
+
 /// 桥目录相对仓库根（dev）或资源目录（release）的位置。
 pub const BUNDLE_DIR: &str = "integrations/dsh-bridge";
 
@@ -38,12 +41,26 @@ pub struct Bridge {
     pub dsh_home: String,
 }
 
-/// `~/.dsh`：`PET_DSH_HOME`（空值视为没设）优先，其次 `<home>/.dsh`。
+/// `~/.dsh` 的解析：`PET_DSH_HOME` → `PET_AGENT_HOME/.dsh` → `<home>/.dsh`（空值都视为没设）。
+///
+/// G2-06：`PET_AGENT_HOME` 是全仓统一的隔离根（dev-debug / e2e fixtures / 适配器单测都用它
+/// 把「家目录」整体指到临时目录）。桥住在 `~/.dsh` 上，只认 `PET_DSH_HOME` 会让 e2e 读到
+/// 开发机真实的 DSH profile，所以第二级必须跟着隔离口径走。
 pub fn dsh_home(home: &Path) -> PathBuf {
-    match std::env::var_os(HOME_ENV) {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => home.join(".dsh"),
+    if let Some(dir) = env_path(HOME_ENV) {
+        return dir;
     }
+    if let Some(dir) = env_path(AGENT_HOME_ENV) {
+        return dir.join(".dsh");
+    }
+    home.join(".dsh")
+}
+
+/// 读「非空」环境变量路径：空串与没设同义（与适配器 `PET_AGENT_HOME` 的口径一致）。
+fn env_path(key: &str) -> Option<PathBuf> {
+    std::env::var_os(key)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 /// 列出所有 profile 目录（含 `package.json` 的那种）。
@@ -231,29 +248,57 @@ mod tests {
     fn home_override_wins_when_set() {
         let _guard = lock_test_env();
         let root = scratch("override");
-        let previous = std::env::var_os(HOME_ENV);
+        let saved = env_snapshot();
         // 环境变量在测试内串行改动（lock_test_env 保证同一时刻只有一个用例）。
         std::env::set_var(HOME_ENV, root.join("elsewhere"));
+        std::env::set_var(AGENT_HOME_ENV, root.join("agent-home"));
         assert_eq!(dsh_home(&root), root.join("elsewhere"));
-        match previous {
-            Some(value) => std::env::set_var(HOME_ENV, value),
-            None => std::env::remove_var(HOME_ENV),
-        }
+        env_restore(saved);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// G2-06：`PET_AGENT_HOME` 是 e2e/单测的统一隔离根，桥的 `~/.dsh` 必须跟着它走。
+    #[test]
+    fn empty_home_override_falls_back_to_agent_home() {
+        let _guard = lock_test_env();
+        let saved = env_snapshot();
+        std::env::set_var(HOME_ENV, "");
+        std::env::set_var(AGENT_HOME_ENV, "C:\\isolated");
+        assert_eq!(
+            dsh_home(Path::new("C:\\Users\\x")),
+            Path::new("C:\\isolated").join(".dsh")
+        );
+        env_restore(saved);
     }
 
     #[test]
-    fn empty_home_override_falls_back_to_dot_dsh() {
+    fn empty_overrides_fall_back_to_dot_dsh_under_home() {
         let _guard = lock_test_env();
-        let previous = std::env::var_os(HOME_ENV);
+        let saved = env_snapshot();
         // 同上，环境变量用例已串行化。
         std::env::set_var(HOME_ENV, "");
+        std::env::set_var(AGENT_HOME_ENV, "");
         assert_eq!(
             dsh_home(Path::new("C:\\Users\\x")),
             Path::new("C:\\Users\\x").join(".dsh")
         );
-        match previous {
-            Some(value) => std::env::set_var(HOME_ENV, value),
-            None => std::env::remove_var(HOME_ENV),
+        env_restore(saved);
+    }
+
+    /// 备份/恢复本模块读的两级 env：用例已由 `lock_test_env` 串行，这里只负责不把值漏给下一个用例。
+    fn env_snapshot() -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+        [HOME_ENV, AGENT_HOME_ENV]
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect()
+    }
+
+    fn env_restore(saved: Vec<(&'static str, Option<std::ffi::OsString>)>) {
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
         }
     }
 }

@@ -2,6 +2,7 @@
 // 这样只改币种不会把刷新间隔或其他字段抹回默认。
 import { TOPIC_CMD } from "../../topics.js";
 import { button, card, hint, input, row, tag, text } from "../dom.js";
+import { currencyPatch } from "./apply.js";
 
 const BADGE_MODES = [
   ["five_hour", "5 小时"],
@@ -73,16 +74,17 @@ export function mountPrefs(ctx, state) {
   rateInput.placeholder = "7.2";
   const currencyBtn = button(dom, "应用", "g-btn");
   currencyBtn.on("click", () => {
-    editing.delete(rateInput);
-    // 币种是 select：应用一次就是把用户所选交给宿主，回显随后会追上 —— 这里一并放行，
-    // 别让 editing 变成「永不复位」（外部改的币种就再也进不来了）
-    editing.delete(currencySel);
-    const rate = Number(rateInput.value);
-    if (!Number.isFinite(rate) || rate < 1 || rate > 20) {
+    // 先校验、后放锁（G5-02）：非法汇率被拒时输入框还锁着，用户能接着改；
+    // 通过才放开汇率锁，下一帧回显写的是宿主钳过的那串。
+    // 币种是「追上即放」：syncSelect 在推送追上用户所选时放行，这里不提前删，
+    // 否则外部改的币种就再也进不来。
+    const { patch, releaseRate } = currencyPatch({ rate: rateInput.value, currency: currencySel.value });
+    if (!patch) {
       state.status.set("汇率要在 1–20 之间", "error");
       return;
     }
-    send({ currency: currencySel.value, usdToCny: Math.round(rate * 100) / 100 });
+    if (releaseRate) editing.delete(rateInput);
+    send(patch);
   });
   currencyCard.append(
     row(dom, text(dom, "显示币种"), currencySel),

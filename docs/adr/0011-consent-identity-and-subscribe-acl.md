@@ -96,8 +96,11 @@ permission_request(pluginId, pluginName, capabilities)   ← pluginName 由前�
   `:widget` —— S4 收掉的是「不报归属也能读」这条默认路，不是这条老缺口本身。
 - S3 收的是 **widget** 的分流这一条路：插件入口（`index.js`）的点名键 `host:realm-plugin-host`
   没动，那条要等 Web Worker 宿主才能一起收口。
-- `http` 的域名白名单纯按域名判，对 DNS rebinding 无防护；重定向只复核 host 不复核 scheme。
-  本轮未动（需要真机与专门的取证设计）。
+- ~~`http` 的域名白名单纯按域名判，对 DNS rebinding 无防护；重定向只复核 host 不复核 scheme。~~
+  2026-10-28 F02 已改写：重定向拒绝 https→http 降级（G3-02），直连解析后的目标 IP
+  若是私网/回环/链路本地一律拒（G3-03）；本地名与回环字面量按显式授权放行，边界见同节补记。
+  **剩余面**是走代理的那条路径（目标由代理侧解析），
+  见文末「追加节（2026-10-28，F02）」第 4 条。
 
 ## 追加节（2026-10-21，B10）：出站走系统代理后的边界
 
@@ -130,6 +133,8 @@ permission_request(pluginId, pluginName, capabilities)   ← pluginName 由前�
    公网域名**不在本节的防护内** —— 挡住它的是本 ADR 的逐域名授权（`http:169.254.169.254` 这类
    默认没人授权），不是 B10。要做「先解析再判私网」需要引入 DNS 解析（新依赖 + 新的时序攻击面），
    本轮不做。`ProxyOverride` 也**只影响选路**，不构成对插件输入的任何限制。
+   （2026-10-28 F02 补：**直连**路径已经加上「先解析再判私网」的守卫，见文末追加节；
+   本条剩余适用面是走代理的路径 —— 那里目标主机由代理侧解析。）
 5. **新增的信任面**（这是本节的重点，别当成免费的功能）：开启之后，被授权域名的**目标主机名、
    端口，以及除被摘掉的凭据头以外的请求头**都会交给系统代理程序 —— 本机 Clash 时等于交给本机那
    个进程，企业/公共代理时等于交给第三方。HTTPS 走 CONNECT，正文与 TLS 仍在端点之间；明文 HTTP
@@ -156,4 +161,82 @@ permission_request(pluginId, pluginName, capabilities)   ← pluginName 由前�
   归统一测试的人工项。
 - 代理端点自身不可信时没有二次校验：我们只保证不把凭据头带过去、不把口令写进日志，不校验
   代理返回的内容是否被篡改（那是 TLS 的事，明文 HTTP 则本来就无解）。
-- 「解析到内网 IP 的域名」仍靠逐域名授权挡（见第 4 条）。
+- 「解析到内网 IP 的域名」在**走代理**时仍靠逐域名授权挡（见第 4 条）；直连已由 F02 的
+  `GuardedResolver` 收口（见 2026-10-28 追加节）。
+
+## 追加节（2026-10-28，F02）：宿主身份与网络收口
+
+本轮 P1/P2 审计（G3-01…G3-05）把「同 realm 自报身份」这条老缺口里窗口能证的部分收了，
+另外收掉出站网络的两个绕过口（降级重定向、DNS rebinding）。改动集中在
+`src-tauri/src/gate.rs`、`src-tauri/src/gate_coverage.rs`、`src-tauri/src/services/http.rs`、
+`src-tauri/src/services/http_proxy.rs`、`src-tauri/src/fsutil.rs`、`src-tauri/src/services/permission.rs`、
+`src-tauri/src/services/agent_hooks.rs`、`src-tauri/src/services/store.rs`、`src-tauri/src/services/secrets.rs`、
+`src-tauri/src/commands/plugins.rs` 与 `src-tauri/src/window/overlay.rs`。
+
+1. **能力门禁收下调用窗口（G3-01，P1）**。`gate::plugin_capability` 的签名从 3 参变 4 参：
+   `(&tauri::Window, &PermissionState, plugin_id, capability)`。门禁先判窗口归属：
+   - 来自 `overlay-*` 的命令，要求 `window::overlay::owner_of_label(label) == Some(plugin_id)` ——
+     悬浮窗只能替**自己那个插件**调能力，不能再在 `invoke` 里把 `pluginId` 填成别人；
+   - 来自 `consent-*`（同意框）的调用**一律拒**：同意框只回答「授权/拒绝」，没有调用能力的立场；
+   - 其余窗口（`pet` / `settings` / 宿主）行为不变 —— 它们仍是「可信宿主壳」，
+     同 realm 的插件在这两扇窗里冒用 id 的缺口没变（见第 4 条）。
+   覆盖面由 `gate_coverage.rs` 的 `MUST_TAKE_WINDOW` 名单钉住（18 条命令：
+   `http_request` / `store_get` / `store_set` / `store_delete` / `secrets_get` / `secrets_set` /
+   `secrets_delete` / `notify_show` / 五条 `ble_*` / `permission_request` / `overlay_show` /
+   `overlay_hide` / `overlay_destroy` / `overlay_reclaim`），漏一条签名就会红。
+   新命令只要收 `pluginId` 又落在窗口门禁面上，就该加进这张表。
+2. **重定向拒绝 https → http 降级（G3-02）**。`send_following_redirects` 在 `join` 之后、
+   发下一跳之前判：来源 https、目标 http ⇒ 直接 `denied`（不跟随）。反向升级（http→https）
+   与同协议跳转不拦，仍由逐跳域名授权把关。理由不是「明文不好看」：首跳若带
+   `Authorization`/`Cookie`，降级会把凭据送进明文；只做「跟随前重校验 scheme」也救不了
+   已发出的凭据，所以是**不跟随**。纯函数 `is_scheme_downgrade` 带离线单测。
+3. **解析后再判私网（G3-03）**。**直连** agent 挂 `GuardedResolver`：每次 DNS 解析结果里只要
+   有一个 IP 落到回环/私网/链路本地（复用 `http_proxy::is_public_ip` 那套 `127/8`、`10/8`、
+   `172.16/12`、`192.168/16`、`169.254/16`、`100.64/10`、`192.0.0/24`、`198.18/15`、`224/4`、
+   `::1`、`fc00::/7`、`fe80::/10` 与 IPv4-mapped 判定）就整批拒绝，不做「挑一个公网的用」
+   （那会给 DNS 轮询留后门）。**代理 agent 不挂**：它解析的是代理端点（常见 `127.0.0.1:7897`），
+   挂上等于把用户自己的系统代理当成内网攻击拒掉；而走代理时目标主机由代理侧解析，
+   本机没有可判的 IP。这条残余与第 4 条必须连着读。
+4. **残余（本次未收口，别当成已解决）**：
+   - **`plugin_id` 仍由调用方自报**：同 realm 的插件可以 `import` 到宿主壳模块直接
+     `invoke("store_get", { pluginId: "com.pet.other" })`；窗口是 `pet`/`settings` 时第 1 条放行。
+     这是 ADR-0006 那条老缺口的本体 —— 收它要换执行边界（L2），不是加参数。
+   - **HTTPS 经代理时目标主机由代理侧解析**：`GuardedResolver` 看不到，DNS rebinding
+     防护只覆盖直连；走代理时能否解析到内网取决于代理。
+   - **代理端点自身不做公网校验**：它通常是本机回环，也允许是本机配置的企业代理。
+5. **L2 收口路线**（给下一个动这块的人的路标，不是承诺的工期）：
+   - L2-1：插件入口（`index.js`）与 widget 全部进 Web Worker，每个插件一个独立 realm；
+     宿主只信 Worker 启动时绑定的 `plugin_id`，JS 侧不再有「调用方自报 id」这个参数面。
+     这条同时收掉本 ADR 第 2 条（订阅 ACL）与 `bus_peek` 的残余。
+   - L2-2：Worker 宿主落地前，命令层保持「收 Window + 自报 id 双判」的口径：窗口能证的
+     先证（overlay 归属），窗内证不了的（pet/settings 同 realm）如实记账，不写「已解决」。
+   - L2-3：`http` 的逐域名授权是最后一道兜底，不因 L2 收口而放宽；DNS rebinding 守卫
+     在 L2 里应留在宿主进程的出站路径上（插件拿不到 socket）。
+
+### 补记（2026-10-28，G3-03 误伤修复）：本地名放行的边界
+
+首版 `GuardedResolver` 对**所有**解析结果一律过 `is_public_ip`，把 `localhost`（解析为
+`127.0.0.1`）也拒了 —— `verify` 里「已授权域名能取回内容」那条断言（`http:localhost:1420`
+→ `http://localhost:1420/src/index.html`）因此由绿转红，是真回归而不是用例写错。修正按
+**目标主机名分档**，判定收在纯函数 `guard_resolution(netloc, addrs)`（`services/http.rs`）里：
+
+- **放行档（名字层面 + 回环复核）**：`localhost`、`*.localhost`，以及回环字面量
+  `127.0.0.0/8`、`::1`、IPv4-mapped 回环写法（`::ffff:127.0.0.1`、`::ffff:7f00:1`）。
+  如实说：**只有 `localhost` 有本机固定表**（Windows 的 hosts / RFC 6761 特例），
+  `*.localhost` **没有**这个保证 —— 子域走普通系统解析，可能被 DNS 带到任意地址。
+  所以本地档不是「名字对就放行」：`guard_resolution` 对本地名的解析结果逐个做回环复核
+  （`is_loopback_literal`，含 IPv4-mapped 回环），解析到 `10.x`/`169.254.169.254` 等非回环
+  地址时整批拒（`拒绝连接非回环地址 …（本地名解析未落在回环）`）。字面量根本不解析，
+  不存在 rebinding 所需要的「第一次公网、第二次内网」时序。
+  它们同时是本地开发（宠物自己的 dev server、本机工具）的正当目标。
+- **仍拒档**：其余任何主机名的解析结果，只要任一地址落到回环/私网/链路本地/云元数据
+  （含混合解析、IPv4-mapped 私网、`169.254.169.254`）就整批拒，不做「挑一个公网的用」。
+- **为什么不是「全部放行私网」**：放行的是**名字层面的白名单**，不是 IP 层面的豁免。
+  公网域名解析到 `10.x`/`169.254.169.254` 仍是 DNS rebinding 的典型形态，放宽等于把 G3-03
+  关掉；`is_public_ip` 本身也没有放宽（它同时服务 B10 的「回环/私网永不走代理」）。
+- **残余不变**：走代理时目标主机由代理侧解析，本机没有可判的 IP（见上文第 3、4 条）；
+  逐域名授权仍是最后一道兜底，不因本补记而放宽。
+- **判红证据**：`services/http.rs` 的 `local_names_and_loopback_literals_skip_the_private_check`
+  钉住放行档与拒档（含混合解析、mapped 私网），并覆盖「本地名解析到内网/云元数据/混合解析
+  一律拒」的回环复核（复审 32-F1）；`guard_addresses_rejects_private_and_loopback_batches`
+  钉住批量判定；`http_proxy::is_loopback_literal` 另有 v4/v6/mapped 的离线单测。

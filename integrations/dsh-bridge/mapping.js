@@ -94,6 +94,18 @@ export function sessionEndLine(session, at = Date.now()) {
 }
 
 /**
+ * 通道错误判据（G6-12）：DSH 的结果里 `error` 键常在，但「没有错误」是 `null`。
+ * 只有对象、非空字符串或 `true` 才算失败；`null`/`undefined`/`false`/空白串都是「没出错」。
+ * 此前用 `!== undefined`，把 `error: null` 也判成了 tool-failure —— 桌宠上会凭空红一下。
+ */
+function isErrorObject(error) {
+  if (error === null || error === undefined || error === false) return false;
+  if (typeof error === "object") return true;
+  if (typeof error === "string") return error.trim() !== "";
+  return true;
+}
+
+/**
  * 一条 `session/event` → 一行收件（或 null 表示这类事件桌宠不关心）。
  * 解析不出来的字段宁可缺，也不猜：宿主缺键时按空值处理，不会因此判错。
  */
@@ -119,7 +131,8 @@ export function eventLine(sessionId, event) {
     }
     case "tool/result":
       // `message.isError` 是工具自己的失败；`error` 是通道失败（见 dsh-ops 的 transportFailed）。
-      return data?.message?.isError === true || data?.error !== undefined
+      // 通道失败只认对象/非空 —— `error: null` 是「没有错误」，不是失败（G6-12）。
+      return data?.message?.isError === true || isErrorObject(data?.error)
         ? line("tool-failure", at, { session_id: id })
         : line("post", at, { session_id: id });
     case "approval/asked": {

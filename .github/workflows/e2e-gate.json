@@ -1,0 +1,30 @@
+{
+  "comment": "E2E gate config for .github/workflows/e2e.yml (G1-05/G1-06/G1-09). Floors are ~80% of the 2026-10-28 measured baselines: verify 485/0, verify:agent 303/4 (the 4 reds are the pre-t38 state: t38's fix is not merged here yet, refresh this baseline after t37 backfills it and never record it as green meanwhile), verify:worker 66/0, verify:todo 31/0, verify:game 15/0, verify:goat-gauge 76/0, verify:drag 41/0, verify:dsh 43/0. add assertions freely, but cutting a big group must lower the floor in the same commit, never silently.",
+  "minAssertions": {
+    "verify": 400,
+    "verify:agent": 250,
+    "verify:worker": 55,
+    "verify:todo": 25,
+    "verify:game": 12,
+    "verify:goat-gauge": 60,
+    "verify:drag": 32,
+    "verify:dsh": 34
+  },
+  "skipMarkers": [
+    "跳过"
+  ],
+  "knownEnvFailures": [
+    {
+      "suite": "verify",
+      "match": "默认值本身必须能设",
+      "reason": "Ctrl+Alt+P is already registered by another app on this runner; set PET_HOTKEY_DEFAULT (E02) or free the key",
+      "expires": "2026-12-31"
+    },
+    {
+      "suite": "verify",
+      "match": "D07 预置 fixture 缺失",
+      "reason": "preseeded fixtures missing; start the instance with PET_E2E_PRESEED=1 (D07) instead of waiving this",
+      "expires": "2026-12-31"
+    }
+  ]
+}

@@ -7,7 +7,7 @@
 // 不测面：mount* / watchView / addStyle / tag 这类要真实 DOM 的函数 —— 测它们就得造假 DOM，
 // 那只会产出恒真断言；运行时由 verify:astock 的像素与挂载断言覆盖。
 
-import { check, eq, group } from "./harness.mjs";
+import { check, deep, eq, group } from "./harness.mjs";
 
 const src = (name) => new URL(`../../plugins/com.pet.astock/${name}`, import.meta.url).href;
 const D = await import(src("views/dom.js"));
@@ -189,3 +189,141 @@ eq(
   SU.netText(undefined, (id) => id),
   "近 1 分钟出网 0 次（上限 —，两次之间至少 —ms）",
 );
+
+/* ===================== 编辑锁与台账：G5-01 的纯决策 ===================== */
+const WL = await import(src("views/settings/watch-list.js"));
+const M = await import(src("market.js"));
+
+group("astock-watch 回显一步（G5-01）");
+{
+  deep(
+    "编辑中且宿主还没追上：不释放、不写，草稿留着",
+    WL.echoStep({ editing: true, value: "88.88", want: "", ledger: "" }),
+    { release: false, write: false, ledger: "" },
+  );
+  deep(
+    "编辑中且宿主已追上：释放锁、台账记成这串、不重复写",
+    WL.echoStep({ editing: true, value: "13.5", want: "13.5", ledger: "88.88" }),
+    { release: true, write: false, ledger: "13.5" },
+  );
+  deep(
+    "没在编辑且台账已等于目标：不发重复 op",
+    WL.echoStep({ editing: false, value: "13.5", want: "13.5", ledger: "13.5" }),
+    { release: false, write: false, ledger: "13.5" },
+  );
+  // 这条就是 G5-01 的要害：存了非法值，宿主把它钳成空串，而台账记的仍是用户键入的那串；
+  // 少了「台账 !== 目标就写」这一步，框里会一直留着没生效的草稿。
+  deep(
+    "台账与目标不同就写（陈旧草稿被清）",
+    WL.echoStep({ editing: false, value: "abc", want: "", ledger: "abc" }),
+    { release: false, write: true, ledger: "" },
+  );
+  eq("没在编辑但值已等于目标：不写", WL.echoStep({ editing: false, value: "", want: "", ledger: "" }).write, false);
+  // 「存」之后走 force：即使框里已经是那串、台账也相同，也要按宿主的值重画一次。
+  // 合法值时这步是幂等的；非法值被钳空时，清掉草稿就发生在这一步。
+  deep(
+    "点过存之后强制对齐一次（不看台账、不看编辑锁）",
+    WL.echoStep({ editing: false, value: "13.5", want: "13.5", ledger: "13.5", force: true }),
+    { release: false, write: true, ledger: "13.5" },
+  );
+}
+
+group("astock-watch 存时的台账（G5-01）");
+{
+  deep("台账只记框里的实际串（trim 后）", WL.savedLedger({ upper: " 13.5 ", lower: "", pct: "3" }), {
+    upper: "13.5",
+    lower: "",
+    pctNum: "3",
+  });
+  deep("缺格按空串记", WL.savedLedger({}), { upper: "", lower: "", pctNum: "" });
+
+  // 端到端一条（纯函数层）：敲 abc → 点存 → 宿主落成 null（want=""）→ 下一帧必须清空，
+  // 而不是把草稿留在框里、让人以为存上了。
+  const saved = WL.savedLedger({ upper: "abc" });
+  const step = WL.echoStep({ editing: false, value: "abc", want: "", ledger: saved.upper, force: true });
+  eq("存了非法值后回显：判定要写", step.write, true);
+  const box = { value: "abc" };
+  if (step.write) box.value = "";
+  eq("存了非法值后回显：框被清空", box.value, "");
+}
+
+/* ===================== 出网域名与后备源开关：G5-08 ===================== */
+group("astock 出网域名与后备源开关（G5-08）");
+{
+  eq("MARKET_HOSTS 是注册表全部主机的并集（3 家 8 个）", M.MARKET_HOSTS.length, 8);
+  deep(
+    "8 个主机与 manifest 描述逐一对得上",
+    [...M.MARKET_HOSTS].sort(),
+    [
+      "hq.sinajs.cn",
+      "ifzq.gtimg.cn",
+      "proxy.finance.qq.com",
+      "push2.eastmoney.com",
+      "push2his.eastmoney.com",
+      "qt.gtimg.cn",
+      "searchadapter.eastmoney.com",
+      "web.ifzq.gtimg.cn",
+    ],
+  );
+  eq("三家源", M.MARKET_SOURCES.map((s) => s.id).join(","), "eastmoney,tencent,sina");
+  eq("默认：东财先", M.orderSourcesForPreferred("").map((s) => s.id).join(","), "eastmoney,tencent,sina");
+  eq("记住上次成功的源，先试它", M.orderSourcesForPreferred("tencent").map((s) => s.id).join(","), "tencent,eastmoney,sina");
+  eq(
+    "关掉后备源后只剩主源（连记忆里的腾讯也不带去）",
+    M.orderSourcesForPreferred("tencent", { allowFallback: false }).map((s) => s.id).join(","),
+    "eastmoney",
+  );
+
+  // 真走取数层：fake request 记下每次尝试的 URL，再按开关对比主机集合
+  const probes = [];
+  const request = async (url) => {
+    probes.push(url);
+    throw new Error("断网");
+  };
+  let failure = null;
+  try {
+    await M.fetchQuotes(request, ["1.600519"], { preferred: "tencent" });
+  } catch (err) {
+    failure = err;
+  }
+  check("三家全试过才算失败", !!failure && probes.length >= 3, probes.join(" | "));
+  deep(
+    "开后备时试过三家各自的主入口",
+    [...new Set(probes.map((u) => new URL(u).host))].sort(),
+    ["hq.sinajs.cn", "push2.eastmoney.com", "qt.gtimg.cn"],
+  );
+  check("错误里带源名，能告诉用户换源也失败", /东方财富/.test(String(failure?.message)) && /腾讯/.test(String(failure?.message)), String(failure?.message));
+
+  probes.length = 0;
+  failure = null;
+  try {
+    await M.fetchQuotes(request, ["1.600519"], { preferred: "tencent", allowFallback: false });
+  } catch (err) {
+    failure = err;
+  }
+  deep("关后备后只碰东财主入口", [...new Set(probes.map((u) => new URL(u).host))], ["push2.eastmoney.com"]);
+  eq("关后备后只试一次", probes.length, 1);
+  check("关后备后错误里不再出现别家源名", !/腾讯|新浪/.test(String(failure?.message)), String(failure?.message));
+
+  // K 线这条更能说明问题：腾讯的后备入口（web.ifzq / ifzq）原本也会被摸到
+  probes.length = 0;
+  failure = null;
+  try {
+    await M.fetchKline(request, "1.600519", 101, { preferred: "tencent" });
+  } catch (err) {
+    failure = err;
+  }
+  check(
+    "腾讯 K 线会试主入口与两个后备入口",
+    ["proxy.finance.qq.com", "web.ifzq.gtimg.cn", "ifzq.gtimg.cn"].every((host) => probes.some((u) => new URL(u).host === host)),
+    probes.join(" | "),
+  );
+  probes.length = 0;
+  failure = null;
+  try {
+    await M.fetchKline(request, "1.600519", 101, { preferred: "tencent", allowFallback: false });
+  } catch (err) {
+    failure = err;
+  }
+  deep("关后备后 K 线也只剩东财主入口", [...new Set(probes.map((u) => new URL(u).host))], ["push2his.eastmoney.com"]);
+}

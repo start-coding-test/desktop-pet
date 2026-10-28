@@ -115,7 +115,11 @@ export async function tick(reason = "timer") {
   }
   busy = true;
   try {
-    const { data: rows, source, host } = await fetchQuotes(out, watchSecids(), { preferred: sourcePrefs.quote });
+    // 后备源开关（G5-08）随每轮带到取数层：关掉时只碰东财主源
+    const { data: rows, source, host } = await fetchQuotes(out, watchSecids(), {
+      preferred: sourcePrefs.quote,
+      allowFallback: config.allowFallback !== false,
+    });
     const next = {};
     for (const q of rows) next[q.secid] = q;
     quotes = next;

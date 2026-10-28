@@ -1,5 +1,6 @@
 // 极简 WebView2 CDP 客户端与断言收集器。零依赖：Node 24 自带 fetch 与全局 WebSocket。
 // 用途见 tests/e2e/verify-isolation.mjs 顶部说明。
+import { execFileSync } from "node:child_process";
 
 export async function listPages(port) {
   const res = await fetch(`http://127.0.0.1:${port}/json/list`);
@@ -122,7 +123,34 @@ export async function attach(port, match, timeoutMs = 90_000) {
      * （宿主侧 skins 安装自己就是 4 段 × 20s 读超时，客户端先超时就是假红）。
      */
     async ev(expression, timeoutMs = 20_000) {
-      const r = await send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true }, timeoutMs);
+      const call = (ms) => send("Runtime.evaluate", { expression, awaitPromise: true, returnByValue: true }, ms);
+      let r;
+      try {
+        r = await call(timeoutMs);
+      } catch (err) {
+        if (!String(err).includes("CDP Runtime.evaluate 超时")) throw err;
+        // 偶发「调试端点 20s 无响应」的取证点：区分「采样抖动」与「渲染主线程真被卡死」。
+        // 判据与做法（T37 复盘）：先快照宿主进程 CPU/WS，再用 3 倍超时重发同一表达式；
+        // 3 倍超时也回不来才按主线程卡死处理，让红带证据，而不是一句“环境中断”。
+        const snap = processSnapshot();
+        console.log(`  · CDP 偶发超时取证：首次 ${timeoutMs}ms 无响应；宿主进程 ${snap}`);
+        const t0 = Date.now();
+        try {
+          r = await call(timeoutMs * 3);
+          console.log(`  · 重发 Runtime.evaluate 于 ${Date.now() - t0}ms 返回 → 判采样抖动，不是主线程卡死`);
+        } catch (again) {
+          // 同一会话 3 倍超时都不回：再开一条新 CDP 连接验一次。
+          // 新连接能算 ⇒ 旧会话卡死（WebView2 会话级问题，页面其实活着）；新连接也不算 ⇒ 主线程真没响应。
+          try {
+            const value = await freshEvaluate(target.webSocketDebuggerUrl, expression);
+            console.log("  · 新 CDP 连接求值成功 → 旧会话卡死（会话级），已用新连接续跑");
+            return value;
+          } catch (freshErr) {
+            console.log(`  · 新连接也超时：${freshErr.message} → 渲染主线程真没响应（不是采样抖动）`);
+            throw again;
+          }
+        }
+      }
       const err = r.result?.exceptionDetails;
       if (err) {
         throw new Error((err.exception?.description ?? err.text ?? JSON.stringify(err)).split("\n").slice(0, 3).join(" | "));
@@ -131,6 +159,62 @@ export async function attach(port, match, timeoutMs = 90_000) {
     },
     close: () => ws.close(),
   };
+}
+/** 偶发 CDP 超时时的一行宿主进程快照（取不到就返回 unknown，绝不让取证本身把套件搞挂）。 */
+function processSnapshot() {
+  try {
+    const out = execFileSync(
+      "powershell",
+      [
+        "-NoProfile",
+        "-Command",
+        "Get-Process desktop-pet -ErrorAction SilentlyContinue | Select-Object -First 1 Id,@{n='WS_MB';e={[int]($_.WS/1MB)}},CPU,@{n='Threads';e={$_.Threads.Count}} | ConvertTo-Json -Compress",
+      ],
+      { encoding: "utf8", timeout: 5_000 },
+    ).trim();
+    return out || "无 desktop-pet 进程";
+  } catch {
+    return "进程快照读取失败";
+  }
+}
+
+
+/** 新开一条 CDP 连接做一次求值：只在旧会话超时时用于区分「会话卡死」与「主线程卡死」。 */
+async function freshEvaluate(targetUrl, expression, timeoutMs = 20_000) {
+  const fresh = new WebSocket(targetUrl);
+  try {
+    await new Promise((res, rej) => {
+      const t = setTimeout(() => rej(new Error("新连接握手超时")), 5_000);
+      fresh.addEventListener("open", () => {
+        clearTimeout(t);
+        res();
+      });
+      fresh.addEventListener("error", () => {
+        clearTimeout(t);
+        rej(new Error("新连接握手失败"));
+      });
+    });
+    return await new Promise((res, rej) => {
+      const t = setTimeout(() => rej(new Error(`新连接 Runtime.evaluate 超时 ${timeoutMs}ms`)), timeoutMs);
+      fresh.addEventListener("message", (ev) => {
+        const msg = JSON.parse(String(ev.data));
+        if (msg.id !== 7) return;
+        clearTimeout(t);
+        const err = msg.result?.exceptionDetails;
+        if (err) rej(new Error((err.exception?.description ?? err.text ?? "?").split("\n")[0]));
+        else res(msg.result?.result?.value);
+      });
+      fresh.send(
+        JSON.stringify({ id: 7, method: "Runtime.evaluate", params: { expression, awaitPromise: true, returnByValue: true } }),
+      );
+    });
+  } finally {
+    try {
+      fresh.close();
+    } catch {
+      /* already closed */
+    }
+  }
 }
 
 /**

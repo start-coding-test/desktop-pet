@@ -23,6 +23,10 @@ pub struct PermissionState {
     file: Mutex<Option<PathBuf>>,
     granted: Mutex<HashMap<String, Vec<String>>>,
     consent: Mutex<ConsentBook>,
+    /// 授权表落盘的串行锁（G3-04）。它只在 `save` 里持有，且锁序固定为
+    /// `save_lock → file → granted`：快照与写盘在同一把锁里完成，
+    /// 并发答复时不会出现「旧快照盖掉新快照」；同时不在 `granted` 锁里做磁盘 IO。
+    save_lock: Mutex<()>,
 }
 
 struct PendingConsent {
@@ -125,6 +129,7 @@ impl PermissionState {
             file: Mutex::new(None),
             granted: Mutex::new(HashMap::new()),
             consent: Mutex::new(ConsentBook::default()),
+            save_lock: Mutex::new(()),
         }
     }
 
@@ -142,6 +147,10 @@ impl PermissionState {
     }
 
     fn save(&self) {
+        // G3-04：快照与写盘一起放进这把串行锁 —— 两个并发 save 交错时，
+        // 后写的那份一定是更晚的快照（旧快照不可能盖掉新快照）；
+        // 且写盘期间不持 `granted` 锁，读授权表的命令不会被磁盘 IO 卡住。
+        let _writing = self.save_lock.lock().unwrap_or_else(|p| p.into_inner());
         let Some(file) = self.file.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
             log::warn!("授权存储尚未初始化，本次授权变更未落盘");
             return;
@@ -472,13 +481,17 @@ pub fn permission_check(
 
 /// 请求授权：只受理 manifest 已声明的能力；已全部授权则立即放行；
 /// 未启用直接拒绝、不弹窗；其余按 plugin_id 合流到同一 pending。
+///
+/// G3-01：先过窗口归属 —— 悬浮窗只能替自己那个插件申请，同意框窗口一律拒。
 #[tauri::command]
 pub async fn permission_request(
     app: AppHandle,
+    window: tauri::Window,
     state: tauri::State<'_, PermissionState>,
     plugin_id: String,
     capabilities: Vec<String>,
 ) -> Result<bool, HostError> {
+    crate::gate::window_owns_plugin(&window, &plugin_id)?;
     checked_plugin_id(&plugin_id)?;
     let declared = crate::commands::plugins::declared_capabilities(&app, &plugin_id)?;
     ensure_declared(&plugin_id, &declared, &capabilities)?;

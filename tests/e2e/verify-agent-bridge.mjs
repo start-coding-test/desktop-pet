@@ -24,9 +24,10 @@ import {
   writeEnabledIds,
 } from "./harness/cdp.mjs";
 import {
-  AGENT_ISOLATION_ADAPTERS,
   agentIsolationEnv,
+  hostIsolationProblems,
   realHomeAgentFiles,
+  restorePluginsDir,
   unisolatedAgentAdapters,
 } from "./harness/fixtures.mjs";
 import { waitWidgetRealm } from "./harness/widget-realm.mjs";
@@ -53,7 +54,46 @@ if (!env.APPDATA) {
 // 否则落回 APPDATA 下的共享目录 —— 那时本机全局 Qoder hook 的真实会话会混进来
 const INBOX = env.PET_AGENT_INBOX || join(env.APPDATA, "com.desktoppet.pet", "agent", "inbox");
 const isPetPage = (t) => /localhost:1420\/(src\/)?index\.html$/.test(t.url);
+
+/**
+ * 让三家「装文件型」适配器的候选落点先存在，再问宿主 everywhere（G2-01 的前置）。
+ * targets() 只回报「父目录已存在」的落点，zcode.rs:42-44 的注释写明它不替用户造文件；
+ * t26 之后 everywhere.home 报的是**生效** home（temp），不种的话三家候选全空，
+ * precheck 会先红、整组写盘断言连坐跳过，「空候选=安全放行」的反向判据也失去意义。
+ * 只碰 PET_AGENT_HOME（temp）下的东西；⑨/⑩/⑪ 三组各自还会清掉自建夹具。
+ */
+function seedAgentCandidates() {
+  const home = String(env.PET_AGENT_HOME ?? "");
+  const tempRoot = resolve(import.meta.dirname, "../../temp");
+  if (home === "" || !resolve(home).startsWith(tempRoot + sep)) return 0;
+  const seed = [
+    [join(home, ".codex", "hooks.json"), { hooks: {} }],
+    [join(home, ".workbuddy", "settings.json"), { hooks: {} }],
+    [join(home, ".zcode", "cli", "config.json"), { hooks: { enabled: false }, permissions: { allow: [] } }],
+    [join(home, ".zcode", "cli", "setting.json"), { hooks: { enabled: false } }],
+  ];
+  for (const [file, body] of seed) {
+    mkdirSync(dirname(file), { recursive: true });
+    if (!existsSync(file)) writeFileSync(file, JSON.stringify(body, null, 2));
+  }
+  return seed.length;
+}
+
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+// 联动状态文件在宿主自己的数据目录（不是 Agent 的配置），套件只读它取证。
+// 放模块级：⑥ 与 ⑨ 两组都要读，留在某一组的 else 里会让另一组 ReferenceError（G7-12a 的断链）。
+const TAURI_IDENTIFIER = JSON.parse(
+  readFileSync(resolve(import.meta.dirname, "../../src-tauri/tauri.conf.json"), "utf8"),
+).identifier;
+const LINKAGE_FILE = join(env.APPDATA, TAURI_IDENTIFIER, "agent-linkage.json");
+function linkageAgent() {
+  try {
+    return JSON.parse(readFileSync(LINKAGE_FILE, "utf8")).agent ?? null;
+  } catch {
+    return "<读不到>";
+  }
+}
+
 
 const r = createReport("Agent 事件链路（dev）");
 
@@ -1200,63 +1240,42 @@ try {
   writeFileSync(cfgB, foreignOnly("b"));
 
   if (!settings) settings = await openSettingsInvoker(PORT, c);
+  r.info("预置三家候选落点", `种了 ${seedAgentCandidates()} 个文件（只碰 PET_AGENT_HOME/temp）`);
   const st0 = await settings.invoke("agent_hooks_status");
   const files0 = Array.isArray(st0.v?.files) ? st0.v.files : [];
   const underTemp = files0.length > 0 && files0.every((f) => resolve(String(f.path)).startsWith(TEMP_ROOT + sep));
   r.info("hook 配置落点", files0.map((f) => f.path).join(" ； ") || "(空)");
   r.check("目标文件都在 temp/ 下（写盘断言只碰样例，不碰真实用户配置）", true, underTemp);
-  // Bug1 缺口（P1）：本组点的是「卸载」，而 agent_hooks_uninstall → agent_hooks::uninstall_everywhere
-  // （agent_hooks.rs:398-403）扫的是 adapters::wired() **四家**的 targets(home)：Qoder 认逐文件
-  // 变量，ZCode/Codex/WorkBuddy 只认 PET_AGENT_HOME（claude_style.rs:170-191、zcode.rs:140-153）。
-  // 只重定向前者时，另外三家会落到真实 ~/.codex、~/.workbuddy、~/.zcode —— 用户自己的配置被
-  // 顺手摘掉，正是 Bug1 的原貌。所以本组的前置必须是「四家的候选文件全在 temp 下」：两个隔离
-  // 变量都齐备、逐家路径都在 temp；缺哪个就把变量名写进失败原因判红（缺项即红，不静默 skip）。
-  // 红在前、正文不跑是防事故（真跑到写盘那步就会改用户的配置），不是把判据降级成跳过。
-  const envList = (name) =>
-    name
-      ? String(env[name] ?? "")
-          .split(";")
-          .map((s) => s.trim())
-          .filter(Boolean)
-      : [];
-  const AGENT_HOME = String(env.PET_AGENT_HOME ?? "").trim();
-  const inTemp = (p) => resolve(String(p)).startsWith(TEMP_ROOT + sep);
-  // 四家的候选文件：逐文件变量优先（与适配器同一条优先级），否则按 PET_AGENT_HOME 换根拼。
-  // 路径表复用 harness/fixtures.mjs 的 AGENT_ISOLATION_ADAPTERS —— 那张表逐条抄自
-  // claude_style.rs:271-282（Qoder 两个目录 / settings.json）、zcode.rs:42-44 与 :140-153、
-  // codex.rs:39-50、workbuddy.rs:36-48，并且有跨语言用例钉住「JS 表 = Rust adapters::WIRED」，
-  // 不在这里再抄一份（抄两份必然漂移）。dsh 没有可改写的 hook 文件（installs_files() 返回
-  // false），按 realHomeFiles 为空滤掉，剩下的正好是卸载会扫的那四家。
-  const AGENT_FAMILIES = AGENT_ISOLATION_ADAPTERS.filter((a) => a.realHomeFiles.length > 0).map((a) => {
-    const listed = envList(a.filesEnv);
-    return {
-      id: a.id,
-      // 两家形状不同：Qoder/Codex/WorkBuddy 是 hooks.<事件>[].hooks[]，
-      // ZCode 是 hooks.events.<事件>[]（外加 hooks.enabled 总开关），快照要分开写。
-      claudeStyle: a.id !== "zcode",
-      paths: listed.length > 0 ? listed : a.realHomeFiles.map((rel) => join(AGENT_HOME, ...rel.split("/"))),
-    };
-  });
-  const isolationProblems = [];
-  if (envList("PET_AGENT_CONFIG_FILES").length === 0) {
-    isolationProblems.push("缺 PET_AGENT_CONFIG_FILES —— Qoder 的候选文件没被重定向，会落到真实 home 的 .qoder/settings.json");
+  // G2-01：隔离判据只有一份 —— 宿主回报的 `everywhere`（它按自己的 env 解析出的、**实际会写**的
+  // 全部候选路径：Qoder 的 PET_AGENT_CONFIG_FILES、ZCode/Codex/WorkBuddy 的 PET_AGENT_HOME 换根、
+  // Codex/WorkBuddy 的逐文件变量）。旧判据是套件自己按 env 拼（claude_style.rs:170-191、
+  // zcode.rs:140-153）：宿主换了解析口径套件不知道，判据会静默变松 —— 正是这次 Bug1 的形状。
+  // 现在按「宿主说会写哪里」判：缺 everywhere、表外 agent、少回报一家、任何一条路径不在 temp 下
+  // 都判红（fail-closed）；红在前、正文不跑，避免真跑到写盘那步改掉用户的配置。
+  const everywhere = st0.v && typeof st0.v === "object" ? st0.v.everywhere : undefined;
+  const hostProblems = hostIsolationProblems(everywhere, { realHome: homedir() });
+  r.check(
+    "宿主回报的候选路径全部在 temp 下（含 PET_AGENT_HOME / *_FILES 解析后的值）",
+    [],
+    hostProblems,
+  );
+  r.info("宿主实际生效 home", String(everywhere?.home ?? "(未回报)"));
+  // 子进程（卸载清理）另有一份 env：宿主回报的是它自己的解析结果，子进程继承的是会话 env，
+  // 两者都得成立 —— 任一份不成立都不 spawn。
+  const isolationGap = unisolatedAgentAdapters(env, homedir());
+  if (isolationGap.length > 0) {
+    r.check("cleanup 子进程的 env 也已换根（四家）", [], isolationGap);
   }
-  if (AGENT_HOME === "") {
-    isolationProblems.push("缺 PET_AGENT_HOME —— ZCode/Codex/WorkBuddy 的候选文件会退到真实 home");
-  } else if (!inTemp(AGENT_HOME)) {
-    isolationProblems.push(`PET_AGENT_HOME 不在 temp 下：${AGENT_HOME}`);
-  }
-  for (const fam of AGENT_FAMILIES) {
-    for (const p of fam.paths) {
-      if (!inTemp(p)) isolationProblems.push(`${fam.id} 的候选文件不在 temp 下：${p}`);
-    }
-  }
-  r.check("四家 hook 配置全部在 temp 下（缺哪个隔离变量就点名判红）", [], isolationProblems);
-  const writesSafe = underTemp && isolationProblems.length === 0;
+  // 写盘断言要按「宿主说会写的那几家」拿候选路径（G2-01 之后判据只剩 everywhere 这一份），
+  // 不再自己按 env 拼 —— 拼出来的值和宿主解析口径一漂，夹具就种到了宿主不会扫的地方。
+  const AGENT_FAMILIES = (Array.isArray(everywhere?.adapters) ? everywhere.adapters : [])
+    .filter((a) => Array.isArray(a?.files) && a.files.length > 0)
+    .map((a) => ({ id: String(a.agent), claudeStyle: String(a.agent) !== "zcode", paths: a.files.map(String) }));
+  const writesSafe = underTemp && hostProblems.length === 0 && isolationGap.length === 0;
   if (!writesSafe) {
     r.info(
       "跳过写盘断言",
-      `隔离前置不成立（${isolationProblems.join("；") || "Qoder 的候选文件不在 temp 下"}）；本组一个文件都不写`,
+      `隔离前置不成立（${[...hostProblems, ...isolationGap].join("；") || "Qoder 的候选文件不在 temp 下"}）；本组一个文件都不写`,
     );
   } else {
     // 「他人条目未变」沿用「逐字段未变」的同一口径：按键排序的规范串比较。
@@ -1500,17 +1519,7 @@ try {
     r.group("启停联动：停用摘净、再启用恢复（只碰 temp 样例）");
     const ours = (p) => readFileSync(p, "utf8").split("--pet-hook").length - 1;
     // 状态文件在宿主自己的数据目录（不是 Agent 的配置），套件只读它取证
-    const identifier = JSON.parse(
-      readFileSync(resolve(import.meta.dirname, "../../src-tauri/tauri.conf.json"), "utf8"),
-    ).identifier;
-    const LINKAGE_FILE = join(env.APPDATA, identifier, "agent-linkage.json");
-    const agentField = () => {
-      try {
-        return JSON.parse(readFileSync(LINKAGE_FILE, "utf8")).agent ?? null;
-      } catch {
-        return "<读不到>";
-      }
-    };
+    const agentField = linkageAgent;
 
     // 起点：先经设置页装一次 —— 那是「用户显式选择」的唯一记录点，也是下面能自动装回来的前提
     const clickedReinstall = await clickShadow(".hk-install", "「安装」按钮再次可点（联动恢复的起点）");
@@ -1673,14 +1682,18 @@ try {
     const REAL_HOME = homedir();
     const isolationGap = unisolatedAgentAdapters(env, REAL_HOME);
     r.check("隔离变量齐备：四家都不会退到真实 home", [], isolationGap);
-    r.info("转发的隔离变量", Object.keys(agentIsolationEnv(env)).join(", ") || "(一个都没设)");
     if (isolationGap.length > 0) {
+      r.info("转发的隔离变量", "(跳过：隔离前置不成立，一个都不转发)");
       r.info(
         "跳过清理分支",
         `这几家的候选文件仍落在真实 home：${isolationGap.join(", ")}；给 dev:debug 与本套件带上同一个 PET_AGENT_HOME（temp 下）再跑`,
       );
     } else {
-      const cleanupEnv = { ...env, ...agentIsolationEnv(env) };
+      // agentIsolationEnv 现在对「设了却没隔离」的值直接抛错（G2-03/G7-09）：
+      // 静默丢值会让子进程退回真实 home，等于把最危险的配置当默认值用。
+      const isolationPatch = agentIsolationEnv(env);
+      r.info("转发的隔离变量", Object.keys(isolationPatch).join(", ") || "(一个都没设)");
+      const cleanupEnv = { ...env, ...isolationPatch };
       // 真实 home 下四家的候选文件：先记下「在不在 + 我们那种条目有几条」。判据用条数而不是
       // mtime —— Qoder 自己随时可能重写 settings.json，mtime 会变红但那与清理分支无关；
       // 而「cleanup 顺手摘掉真实条目」必然让带 --pet-hook 的行数掉下来。
@@ -1840,6 +1853,24 @@ try {
     r.check("dsh 的选项指路到桥插件的 install_bundle", true, /install_bundle/.test(String(dshOption?.hint)));
     r.check("装完提示由适配器给（新开会话才生效）", true, /新开/.test(String(stZ?.hint)));
 
+    // G7-12（a）：**非 Qoder** 时的停用摘除/再启用。上面 ⑥ 只覆盖 qoder 适配器；
+    // ZCode 的落点是 ~/.zcode 双文件 + 我们拨开的总开关，停用走的是「当前那家」的决定，
+    // 用 Qoder 的绿来推断它是错的（那正是审计说的缺口）。
+    const zOurs = () => readFileSync(zcfg, "utf8").split("--pet-hook").length - 1;
+    const withoutAgent = origEnabled.filter((id) => id !== AGENT_ID);
+    await writeEnabledIds(settings.invoke, withoutAgent);
+    await reconcilePetWindow(c);
+    r.check("停用插件后 ZCode 的条目也摘净（不是只摘 Qoder）", 0, zOurs());
+    r.check("停用 ZCode 时不动用户自己的条目", true, readFileSync(zcfg, "utf8").includes("user-hook.sh"));
+    r.check("停用不清空 agent 字段（再启用全靠它恢复）", "zcode", linkageAgent());
+    await writeEnabledIds(settings.invoke, [...new Set([...withoutAgent, AGENT_ID])]);
+    await reconcilePetWindow(c);
+    r.check("再启用后 ZCode 的条目装回来（7 条，带 --agent zcode）", [7, true], [
+      zOurs(),
+      readFileSync(zcfg, "utf8").includes("--pet-hook pre --agent zcode"),
+    ]);
+    r.check("再启用后总开关仍是打开（装回来的副作用一致）", true, JSON.parse(readFileSync(zcfg, "utf8")).hooks.enabled === true);
+
     // 来源过滤在真实切换之后仍只对当前那一家放行：注入 qoder 事件不该动桌宠，zcode 事件该动
     const evCount = async () =>
       (await c.ev(`window.__topics.filter(([k]) => k === 'host-event').length`));
@@ -1940,7 +1971,13 @@ try {
     // 再点一次：幂等，且 selfCheck 必须是「这一家没这回事」而不是「查过且没问题」
     const reC = await settings.invoke("agent_linkage_set", { agent: "codex" });
     r.check("重复切换不越装越多（还是 10 条）", 10, readFileSync(cf, "utf8").split("--pet-hook").length - 1);
-    r.check("Codex 的装后自检是 null，不是 ok", true, reC.ok === true && reC.v?.selfCheck == null);
+    r.check(
+      "Codex 的装后自检是 unverified（没有可查日志，不是 null 也不是 ok）",
+      true,
+      reC.ok === true &&
+        reC.v?.selfCheck?.status === "unverified" &&
+        /没有可查日志/.test(String(reC.v?.selfCheck?.detail)),
+    );
 
     // 用户在同一个文件里配过东西：重装只动我们那些，别的键与条一个都不许碰
     const withUser = JSON.parse(readFileSync(cf, "utf8"));
@@ -1956,6 +1993,27 @@ try {
     );
     r.check("我们那些仍是 10 条", 10, reC2.v?.files?.reduce((n, f) => n + (f.managed ?? 0), 0));
     r.check("没写过的顶层键原样留着（model）", "gpt-5-codex", cAfter.model);
+
+    // G7-12（b）：非 Qoder 时的停用摘除也一样要覆盖 Codex（没有总开关的那家，
+    // 停用只该动 `--pet-hook` 条目，model / 用户 hook 一律原样）。
+    const cOurs = () => readFileSync(cf, "utf8").split("--pet-hook").length - 1;
+    const withoutAgentC = origEnabled.filter((id) => id !== AGENT_ID);
+    await writeEnabledIds(settings.invoke, withoutAgentC);
+    await reconcilePetWindow(c);
+    r.check("停用插件后 Codex 的条目也摘净", 0, cOurs());
+    const cOff = JSON.parse(readFileSync(cf, "utf8"));
+    r.check(
+      "停用 Codex 只摘我们的条目，用户 hook 与他家键都还在",
+      [true, "gpt-5-codex"],
+      [(cOff.hooks.PreToolUse ?? []).some((g) => (g.hooks ?? []).some((h) => h.command === "user-codex-hook.sh")), cOff.model],
+    );
+    await writeEnabledIds(settings.invoke, [...new Set([...withoutAgentC, AGENT_ID])]);
+    await reconcilePetWindow(c);
+    r.check("再启用后 Codex 的条目装回来（10 条，带 --agent codex）", [10, true], [
+      cOurs(),
+      readFileSync(cf, "utf8").includes("--pet-hook pre --agent codex"),
+    ]);
+    r.check("再启用后用户 hook 仍未被误摘", true, readFileSync(cf, "utf8").includes("user-codex-hook.sh"));
 
     // 来源过滤：当前是 Codex 时，qoder 的事件不该驱动桌宠，codex 的事件要能
     const evCountC = async () => (await c.ev(`window.__topics.filter(([k]) => k === 'host-event').length`));
@@ -2117,7 +2175,13 @@ try {
     r.check("装完提示由适配器给（彻底退出 + 实验性）", true, /退出/.test(String(stW?.hint)) && /实验性/.test(String(stW?.hint)));
     // 自检字段只在 `agent_linkage_set` 的返回里（status 没有这个键，比它等于没比）。
     const setW = await settings.invoke("agent_linkage_set", { agent: "workbuddy", confirm: true });
-    r.check("WorkBuddy 没有可查日志，set 返回的 selfCheck 是 null 而不是 ok", true, setW.ok === true && setW.v?.selfCheck == null);
+    r.check(
+      "WorkBuddy 没有可查日志，set 返回的 selfCheck 是 unverified（不是 null 也不是 ok）",
+      true,
+      setW.ok === true &&
+        setW.v?.selfCheck?.status === "unverified" &&
+        /没有可查日志/.test(String(setW.v?.selfCheck?.detail)),
+    );
 
     const evCountW = async () => (await c.ev(`window.__topics.filter(([k]) => k === 'host-event').length`));
     const evBeforeW = await evCountW();
@@ -2298,6 +2362,9 @@ try {
     // 页面没连上就中断的场合，探针目录也要删掉，别给后面所有套件留一个孤儿插件
     rmSync(PROBE_DIR, { recursive: true, force: true });
   }
+  // 无论上面成功还是中途抛错，plugins/ 都恢回「只有真实插件」的样子：zz.* 探针目录会让
+  // `tsconfig.plugins.json` 的 typecheck 报 TS2339、`npm run lint` 的文件数也漂。
+  restorePluginsDir(PLUGINS_DIR);
   const failed = r.summary();
   c?.close();
   await sleep(500);

@@ -1214,25 +1214,45 @@ try {
     return rec?.shadow?.querySelector('input.num[placeholder="涨到"]')?.value ?? "框没了";
   })()`);
   r.check("推送没有冲掉还没保存的输入", "88.88", String(stillTyped));
-  // 反向判据：编辑锁不是永不复位 —— 把值填回配置里的空值并派发 input，
-  // 下一帧推送就会照配置回显（配置没被我们改过，所以这一步不碰 store）
-  const restored = await settings.client.ev(`(async () => {
+  // 反向判据（G7-05）：构造一次「非法值 + 存」的真失败输入，UI 必须判红。
+  // 存下去的是非法串，宿主按 clampNum 落成 null；插件要把「框里的实际串」记进台账，
+  // 而不是记它自己发出去的那份。旧实现记的是用户键入值，于是推送永远追不上、回显永远不动，
+  // 这一格就留成陈旧草稿 —— 下面两条各自都能当场红：
+  //   1) store 里那只股票的 upper 真的被清成 null（失败输入确实落库，判据不是空转）；
+  //   2) 下一帧回显把框清空（陈旧草稿不残留）。
+  const badIn = await settings.client.ev(`(async () => {
     const { widgetHost } = await import('/src/runtime/widget-host.ts');
     const rec = (widgetHost.mounted.get(${JSON.stringify(PID)}) ?? [])[0];
     const box = rec?.shadow?.querySelector('input.num[placeholder="涨到"]');
-    if (!box) return "框没了";
-    box.value = "";
+    if (!box) return { ok: false, why: "框没了" };
+    const tr = box.closest("tr");
+    const code = tr?.querySelector(".muted")?.textContent ?? "";
+    box.value = "abc";
     box.dispatchEvent(new Event("input", { bubbles: true }));
-    return "已回填";
+    const save = [...(tr?.querySelectorAll("button") ?? [])].find((b) => b.textContent === "存");
+    if (!save) return { ok: false, why: "存按钮没了" };
+    save.click();
+    return { ok: true, code, typed: box.value };
   })()`);
-  r.check("把那一格清回配置的空值（不留编辑残留给后面的组）", "已回填", String(restored));
+  r.check("把非法串 abc 敲进阈值格并点「存」", true, badIn?.ok === true && badIn.typed === "abc");
+  const badCode = String(badIn?.code ?? "").trim();
+  const badSaved = await (async () => {
+    for (let i = 0; i < 40; i += 1) {
+      const list = (await invoke("store_get", { pluginId: PID, key: "watch" })).v ?? [];
+      const target = list.find((w) => badCode && badCode.includes(w.code));
+      if (target && target.upper === null) return target;
+      await sleep(200);
+    }
+    return null;
+  })();
+  r.check("失败输入落库为 null（下面那条判据才不是空转）", "null", String(badSaved?.upper));
   await sleep(1200);
-  const echoBack = await settings.client.ev(`(async () => {
+  const clearedBad = await settings.client.ev(`(async () => {
     const { widgetHost } = await import('/src/runtime/widget-host.ts');
     const rec = (widgetHost.mounted.get(${JSON.stringify(PID)}) ?? [])[0];
     return rec?.shadow?.querySelector('input.num[placeholder="涨到"]')?.value ?? "框没了";
   })()`);
-  r.check("回填后回显跟配置一致（锁已复位）", "", String(echoBack));
+  r.check("存了非法值后回显清空，不留陈旧草稿", "", String(clearedBad));
 
   r.group("配置：间隔下限与模式");
   await c.ev(`window.__bus.publish(${JSON.stringify(`${PID}:cmd`)}, ${JSON.stringify({ action: "config", value: { intervalSec: 1, mode: "overlay" } })}); true`);

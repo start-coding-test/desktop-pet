@@ -113,7 +113,14 @@ pub fn plugin_enabled_set(
     write_ids(&app, &cleaned)?;
     cancel_pending_for_removed(&app, previous.as_deref(), &cleaned);
     let _ = app.emit("host:enabled-changed", &cleaned);
-    crate::services::agent::linkage::reconcile(&app, previous.as_deref(), &cleaned);
+    // 用户主动勾选启用就是对「恢复停用时还原的总开关」的同意（G2-09 / t38-A）：
+    // 这条路径按已确认装；启动补写、清单迁移、目录扫描都不是用户动作，仍走严格确认门。
+    crate::services::agent::linkage::reconcile(
+        &app,
+        previous.as_deref(),
+        &cleaned,
+        crate::services::agent::linkage::InstallMode::UserConfirmed,
+    );
     Ok(cleaned)
 }
 
@@ -189,7 +196,13 @@ pub fn plugin_enabled_migrate(
     let cleaned = sanitize(&ids);
     write_ids(&app, &cleaned)?;
     let _ = app.emit("host:enabled-changed", &cleaned);
-    crate::services::agent::linkage::reconcile(&app, None, &cleaned);
+    // 迁移不是用户动作：严格确认门，需要确认的客户端保持原样（t38-A）
+    crate::services::agent::linkage::reconcile(
+        &app,
+        None,
+        &cleaned,
+        crate::services::agent::linkage::InstallMode::Strict,
+    );
     log::info!("已从 WebView 迁移插件启停清单到宿主");
     Ok(cleaned)
 }

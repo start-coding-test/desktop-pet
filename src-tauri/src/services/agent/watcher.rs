@@ -248,8 +248,30 @@ pub fn start_agent_ticker(app: &AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{line_agent, source_matches};
+    use super::{complete_line_prefix, line_agent, resume_offset, source_matches};
     use serde_json::json;
+
+    /// 读取闸门的核心不变量：没有换行 = 一个字节都不算消费。
+    /// 写反了（推进到末尾）的症状是「hook 写一半时 watcher 醒来 → 那行永久丢失」，
+    /// 而且运行时只表现为偶尔少一个事件，离线很难复现。
+    #[test]
+    fn a_half_written_line_is_never_counted_as_consumed() {
+        assert_eq!(complete_line_prefix(0, b""), None);
+        assert_eq!(complete_line_prefix(0, b"{\"phase\":\"pre\"}"), None);
+        // 换行在中间：只消费到换行（含），后面那半行留给下一次
+        assert_eq!(complete_line_prefix(10, b"abc\ndef"), Some((3, 14)));
+        // 多个换行：停在最后一个
+        assert_eq!(complete_line_prefix(0, b"a\nb\n"), Some((3, 4)));
+    }
+
+    /// 记录比文件还大（被 `enforce_inbox_cap` 清空/轮换）= 从头读，不能钳到末尾装没事。
+    #[test]
+    fn a_truncated_inbox_is_reread_from_the_start() {
+        assert_eq!(resume_offset(None, 100), 0, "没记过从 0 起");
+        assert_eq!(resume_offset(Some(40), 100), 40, "记录合法就沿用");
+        assert_eq!(resume_offset(Some(100), 100), 100, "正好等于长度也算合法");
+        assert_eq!(resume_offset(Some(1000), 100), 0, "文件变短说明被清空过");
+    }
 
     /// 缺字段 = qoder（旧行必须继续可用）；非字符串的 agent 值退回缺省，
     /// 不能拿脏值当来源标识参与过滤

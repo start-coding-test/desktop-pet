@@ -48,6 +48,38 @@
 且替换已装包需要重启、写坏就是「DSH 起不来」。**跨应用写别人的配置**这条线，本仓只在有四家
 hook 文件的明确契约时走过（还要备份、原子替换、同意框）；DSH 没有等价契约，就不走。
 
+## 被否方案
+
+- **宿主替用户跑 `plugin_manager` / `dsh plugin`**：安装是 profile 作用域的交互操作，版本与
+  依赖由 DSH 自己管；宿主去代跑就要解析对方 CLI 的人读输出（外部输入）、替用户点掉它的确认，
+  升级即碎。保留「用户装一次、宿主只检测」。
+- **伪造 hook 文件接入**：DSH 没有 hooks 配置文件，写一个「长得像四家」的文件不会有人读；
+  等于让宿主假装接上了（自检会在「文件在但会话没动」上永远红）。
+- **桥改成常驻独立进程 tail 会话日志**：回到上一条的 zstd/版本依赖，还多一个进程要管。
+- **让桥调宠物能力桥（`pet.*`）上报，而不是写收件目录**：桥跑在 DSH 的进程里，拿不到宠物
+  WebView 的 `invoke` 通道；给它开一条反向通道等于把能力桥暴露给另一个进程，收益只是少一个
+  文件路径。写收件目录是单向、可审计、失败不影响会话的边界。
+
+## 信任边界
+
+桥跑在**另一个应用**（DSH）的进程里，宿主与它是两个互不信任的故障域：
+
+1. **收件目录 = 外部输入**。桥写进 `inbox/<phase>.jsonl` 的每一行都按不可信数据处理：逐行
+   JSON 解析、字段白名单、未知 `phase` 丢弃、`agent` 只认 `phases::AGENT_IDS`（`dsh`），
+   落盘路径不由行内容决定（见 `src-tauri/src/services/agent/inbox.rs` 顶部注释）。宿主**不**从
+   这些行里取 hook 配置、命令、插件 id 或任何要执行/拼路径的字段。
+2. **桥拿不到宠物能力**。它没有 `invoke` 通道、不持有插件 id、不参与权限同意；能写哪里只由
+   宿主在启动时传进去的 `inboxDir` 决定。桥也不需要 `pet.*` 任何能力。
+3. **安装/卸载的信任方向**：宿主只往安装目录投 bundle、只读 `profiles/*/package.json` 判断
+   「装没装」（不执行 profile 里的代码）；真正的安装/卸载由用户在 DSH 里做。因此**卸载桌宠
+   不等于卸载桥**——`agent_hooks_uninstall` 会在响应里带 `bridgeHint` 说明桥还挂在几个 profile，
+   要用户自己去 DSH 卸（G6-11）。
+4. **失败边界**：桥的任何异常都不得反向破坏会话（capture never break session）；写侧有上限
+   （单行 32KiB / 单文件 8MiB / 排队 256 行），超限丢弃并只报一次，避免桥在 DSH 里把磁盘写满。
+5. **数据边界**：会话的 prompt / tool 输入会以明文 JSONL 落到桌宠的 appData 收件目录，离开
+   DSH 的进程与它的数据目录。这是「桥」这个方案的固有代价，设置页在接入前必须写清（用户
+   知情后再装），也是把 `PET_DSH_HOME`/`PET_AGENT_INBOX` 纳入隔离口径的原因（G2-06）。
+
 ## 影响
 
 - 设置页列出五家；DSH 那一格是「接入/断开 + 桥状态」，不是「安装/卸载 hook 条目」。
@@ -58,3 +90,7 @@ hook 文件的明确契约时走过（还要备份、原子替换、同意框）
 - 打包资源多一个根：`bundle.resources` 里 `"../integrations": "integrations/"`；单测从
   「每个目标都以 `plugins/` 开头」改成「目标 = 源目录名 + `/`，且根只许 `plugins/` 与 `integrations/`」。
 - 隔离判定表加 `dsh`（`realHomeFiles: []`）：它没有可改写的 home 文件，跨 home 风险判定跳过它。
+- `PET_DSH_HOME` 与 `PET_AGENT_HOME` 一起进隔离口径（G2-06）：`dsh_home()` 的回退链是
+  `PET_DSH_HOME → PET_AGENT_HOME/.dsh → 真实 home`，dev-debug 缺省 `<仓库>/temp/dsh-home`，
+  e2e fixtures 的隔离变量名单与 NSIS 守卫的 ps1 自检都覆盖它 —— 否则 e2e 读的是开发机真实的
+  DSH profile。`.github/workflows/e2e.yml` 的同一行由 F04′ 的 CI 卡跟进（本卡不动 `.github/`）。

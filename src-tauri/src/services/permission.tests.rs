@@ -1018,9 +1018,9 @@ fn the_other_command_signatures_declare_host_error() {
         .join(" ");
     assert!(
         flat.contains(
-            "pub async fn permission_request( app: AppHandle, state: tauri::State<'_, PermissionState>, plugin_id: String, capabilities: Vec<String>, ) -> Result<bool, HostError> {"
+            "pub async fn permission_request( app: AppHandle, window: tauri::Window, state: tauri::State<'_, PermissionState>, plugin_id: String, capabilities: Vec<String>, ) -> Result<bool, HostError> {"
         ),
-        "permission_request 的 Err 侧必须是 HostError"
+        "permission_request 的 Err 侧必须是 HostError，且必须收 Window（G3-01：悬浮窗冒用 id）"
     );
     // ADR-0011：同意框上的名字不再由调用方传入，签名里就不该再有 plugin_name。
     // 这条是负向钉 —— 谁把入参加回来（哪怕只是"顺手带上"），这里当场红。

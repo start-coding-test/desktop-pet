@@ -168,6 +168,47 @@ pub fn is_wired(id: &str) -> bool {
     by_id(id).is_some()
 }
 
+/// 把某个客户端的「主目录 / 候选文件 / 收件目录」指到别处的全部环境变量。
+/// 开发、`verify:agent` 与 CI 用它们做隔离，生产包里它们**同样生效**。
+///
+/// G2-05 的两难在这里选了「照样生效 + 命中必须说出来」：
+/// * 加总开关（`PET_AGENT_TEST_ISOLATION=1`）会让正式包里的残留变量变成静默失效 ——
+///   用户以为隔离了、其实写进了真实配置，这是更坏的失败；
+/// * 直接生效又不该瞒着：`agent_hooks_status` 的 `everywhere.overrides`、安装/清理日志
+///   都会打 `override=<名字>`，用户与套件都能看出「读的不是默认路径」。
+pub const ISOLATION_ENV: &[&str] = &[
+    "PET_AGENT_HOME",
+    "PET_AGENT_CONFIG_FILES",
+    "PET_AGENT_CODEX_FILES",
+    "PET_AGENT_WORKBUDDY_FILES",
+    crate::services::agent::dsh_bridge::HOME_ENV,
+    "PET_AGENT_INBOX",
+];
+
+/// 当前进程里真的生效的隔离覆盖（只列有非空值的）。
+/// 空值的行为在各处都是「视为没设」，所以这里也只认非空值 —— 报一个没生效的名字比不报更坏。
+pub fn active_overrides() -> Vec<&'static str> {
+    ISOLATION_ENV
+        .iter()
+        .copied()
+        .filter(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+        .collect()
+}
+
+/// 「生效 home」的唯一解析点：`PET_AGENT_HOME` 非空就用它整根换掉，否则原样返回。
+/// 空值/纯空白视为没设 —— 与 [`active_overrides`] 和各适配器 `targets()` 同一口径。
+///
+/// 为什么必须只有这一处（T8-F3）：适配器内部各自读 env 换根，而 `agent_hooks_status`
+/// 原先报的是 `app.path().home_dir()` —— 设了 `PET_AGENT_HOME` 时 `files` 在 temp 下、
+/// `home` 却还是真实家目录，e2e 的 fail-closed 隔离守卫读到 `home` 就判红（假红），
+/// 用户排查「为什么写到了别处」也看不出根被换过。现在 `home` 与 `files` 同源。
+pub fn effective_home(home: &Path) -> PathBuf {
+    match std::env::var("PET_AGENT_HOME") {
+        Ok(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
+        _ => home.to_path_buf(),
+    }
+}
+
 /// 设置页的一个槽位
 ///
 /// 序列化键名必须与前端一致：`widget.js` 的 `paintPicker` 读的是 `opt.displayName`。
@@ -233,6 +274,58 @@ pub(crate) fn lock_test_env() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G2-05：覆盖入口在发布构建里照样生效，所以「报不报」这件事本身要可断言。
+    /// 空值视为没设：报一个其实没生效的名字，等于让用户去查一个不存在的换根。
+    #[test]
+    fn active_overrides_lists_only_env_that_really_changes_a_root() {
+        let _env = lock_test_env();
+        std::env::remove_var("PET_AGENT_HOME");
+        assert!(!active_overrides().contains(&"PET_AGENT_HOME"));
+
+        std::env::set_var("PET_AGENT_HOME", "C:\\Users\\me");
+        assert!(active_overrides().contains(&"PET_AGENT_HOME"));
+
+        std::env::set_var("PET_AGENT_HOME", "");
+        assert!(
+            !active_overrides().contains(&"PET_AGENT_HOME"),
+            "空值在各处都是「视为没设」，这里也不该报"
+        );
+
+        std::env::remove_var("PET_AGENT_HOME");
+    }
+
+    /// T8-F3：`effective_home` 是「生效 home」的唯一口径。三态都钉住 —— 否则 e2e
+    /// 隔离守卫又会读到真实家目录（假红），或者空串拼出一串相对路径（写错地方）。
+    #[test]
+    fn effective_home_is_the_one_resolution_point() {
+        let _env = lock_test_env();
+        let base = Path::new("C:\\Users\\me");
+        let isolated = Path::new("C:\\Users\\me\\AppData\\Local\\Temp\\pet-agent-home");
+
+        std::env::remove_var("PET_AGENT_HOME");
+        assert_eq!(
+            effective_home(base),
+            base.to_path_buf(),
+            "未设置时原样返回调用方的 home"
+        );
+
+        std::env::set_var("PET_AGENT_HOME", isolated);
+        assert_eq!(
+            effective_home(base),
+            isolated.to_path_buf(),
+            "设了就用它整根换掉"
+        );
+
+        std::env::set_var("PET_AGENT_HOME", "   ");
+        assert_eq!(
+            effective_home(base),
+            base.to_path_buf(),
+            "空值/纯空白视为没设"
+        );
+
+        std::env::remove_var("PET_AGENT_HOME");
+    }
 
     /// A27：选项清单的序列化键名必须与前端一致。`widget.js` 读 `opt.displayName`，
     /// 少了 `rename_all` 就是四个字面 `undefined` 的按钮（T01 现场）—— 这条钉键集合，

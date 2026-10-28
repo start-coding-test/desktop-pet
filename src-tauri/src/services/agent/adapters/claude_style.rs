@@ -179,10 +179,9 @@ impl AgentAdapter for ClaudeStyleJson {
         }
         // 没有逐项覆盖时，home 根也可以整体换掉（与 ZCode 同一条隔离口径）：runner 上
         // `PET_AGENT_HOME` 指到 temp，四家的夹具目录都在那下面。生产不设这个变量，走的还是真 home。
-        let root = match std::env::var("PET_AGENT_HOME") {
-            Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
-            _ => home.to_path_buf(),
-        };
+        // 解析只走 `super::effective_home` 这一处（T8-F3）：`agent_hooks_status` 报的 home
+        // 必须与这里同源，否则 e2e 隔离守卫读到真实家目录就判红。
+        let root = super::effective_home(home);
         self.dirs
             .iter()
             .map(|leaf| root.join(leaf).join(self.file))

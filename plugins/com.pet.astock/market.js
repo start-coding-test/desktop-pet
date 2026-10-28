@@ -1,4 +1,8 @@
-// 行情数据层：东方财富公开只读接口（K 线与分时另有腾讯作后备源，见 sources/registry.js）。
+// 行情数据层：三家公开只读数据源（东方财富为主，腾讯/新浪作后备，见 sources/registry.js）。
+// 实际可能访问 8 个主机：东财的 push2 / push2his / searchadapter，腾讯的 qt.gtimg.cn /
+// proxy.finance.qq.com / web.ifzq.gtimg.cn / ifzq.gtimg.cn，新浪的 hq.sinajs.cn；
+// 名单以 registry.js 的 MARKET_HOSTS 为准（manifest 描述与插件页说明都跟它对齐）。
+// 不想让后备源接触别家域名时把 allowFallback 关掉（设置页的「后备数据源」，默认开）。
 //
 // 为什么是东财而不是腾讯/新浪：这两个源的实时接口回的是 GBK / GB18030，
 // 而宿主的 http 代理按 UTF-8 取文本（from_utf8_lossy），中文股票名会直接变乱码；
@@ -53,7 +57,7 @@ export {
   tencentCodeOf,
 } from "./sources/tencent.js";
 export { buildSinaQuoteUrl, parseSinaQuotes, SINA_QUOTE_API } from "./sources/sina.js";
-export { MARKET_SOURCES, sourceLabelOf, SOURCE_IDS } from "./sources/registry.js";
+export { MARKET_HOSTS, MARKET_SOURCES, orderSourcesForPreferred, PRIMARY_SOURCE_ID, sourceLabelOf, SOURCE_IDS } from "./sources/registry.js";
 
 /// 一次批量快照最多带多少只：接口本身能吞更多，但列表太长时响应体与解析都会抖
 export const MAX_SECIDS = 40;
@@ -245,11 +249,14 @@ function urlOnHost(url, host) {
 }
 
 /** 一个源的尝试：主入口 → 后备入口。全失败抛出的 message 里带着源名与每个入口的原因 */
-async function trySource(request, source, kind, params) {
+async function trySource(request, source, kind, params, { allowFallback = true } = {}) {
   const spec = source[kind];
   const reasons = [];
-  // 入口按 kind 走（见 MARKET_SOURCES 的注释）：快照在 qt.gtimg.cn，K线/分时在 proxy.finance.qq.com
-  for (const host of spec.hosts) {
+  // 入口按 kind 走（见 MARKET_SOURCES 的注释）：快照在 qt.gtimg.cn，K线/分时在 proxy.finance.qq.com。
+  // 关掉后备源（G5-08）时只试主入口：后备入口也是别家域名（web.ifzq / ifzq），
+  // 开关的意义就是「别去请求没出现过的域名、别弹授权框」。
+  const hosts = allowFallback ? spec.hosts : spec.hosts.slice(0, 1);
+  for (const host of hosts) {
     const url = urlOnHost(spec.url(params), host);
     try {
       const resp = await request(url, { headers: source.headers });
@@ -271,9 +278,10 @@ async function trySource(request, source, kind, params) {
 /**
  * 取数主循环：先试「上一次成功的源」，再依次下移；一个源内部先试主入口，失败才试后备入口。
  * 全部失败抛出的 message 可以直接给界面（一行，含每个源与入口），`detail` 给调用方写日志（每个源一条）。
+ * `allowFallback === false`（G5-08 的设置开关）时只用主源、每源只试主入口，别家域名一次都不碰。
  */
-async function fetchFromSources(kind, request, params, preferred) {
-  const ordered = orderSourcesForPreferred(preferred);
+async function fetchFromSources(kind, request, params, preferred, { allowFallback = true } = {}) {
+  const ordered = orderSourcesForPreferred(preferred, { allowFallback });
   const detail = [];
   for (const source of ordered) {
     // 不供这个 kind 的源（新浪没有五档）直接跳过，并说清是「不供」而不是「失败」
@@ -290,7 +298,7 @@ async function fetchFromSources(kind, request, params, preferred) {
       continue;
     }
     try {
-      return await trySource(request, source, kind, params);
+      return await trySource(request, source, kind, params, { allowFallback });
     } catch (err) {
       if (err?.cooldown) throw err;
       detail.push(err.message);
@@ -305,11 +313,11 @@ async function fetchFromSources(kind, request, params, preferred) {
  * 自选列表快照：多源批量取数（腾讯/新浪一次带走全部自选，东财同样是一次 ulist）。
  * 返回 { data: [quote…], source, host }。
  */
-export async function fetchQuotes(request, secids, { preferred = "" } = {}) {
+export async function fetchQuotes(request, secids, { preferred = "", allowFallback = true } = {}) {
   const list = [...new Set((secids ?? []).filter(Boolean))].slice(0, MAX_SECIDS);
   if (list.length === 0) return { data: [], source: "", host: "" };
   const codes = list.map(tencentCodeOf).filter(Boolean);
-  return fetchFromSources("quote", request, { secids: list, codes }, preferred);
+  return fetchFromSources("quote", request, { secids: list, codes }, preferred, { allowFallback });
 }
 
 export async function fetchSuggest(request, keyword) {
@@ -318,19 +326,19 @@ export async function fetchSuggest(request, keyword) {
 }
 
 /** 五档盘口：多源取数（腾讯的五档与快照是同一条接口的另一段；新浪不供五档） */
-export async function fetchDepth(request, secid, { preferred = "" } = {}) {
+export async function fetchDepth(request, secid, { preferred = "", allowFallback = true } = {}) {
   const params = { secid, code: tencentCodeOf(secid) };
-  return fetchFromSources("depth", request, params, preferred);
+  return fetchFromSources("depth", request, params, preferred, { allowFallback });
 }
 
 /** K 线：多源取数，返回 { data, source, host }；`preferred` 是「上一次成功的源」 */
-export async function fetchKline(request, secid, klt = 101, { preferred = "" } = {}) {
+export async function fetchKline(request, secid, klt = 101, { preferred = "", allowFallback = true } = {}) {
   const params = { secid, code: tencentCodeOf(secid), klt, count: MAX_KLINE_BARS };
-  return fetchFromSources("kline", request, params, preferred);
+  return fetchFromSources("kline", request, params, preferred, { allowFallback });
 }
 
 /** 当日分时：多源取数，返回 { data, source, host } */
-export async function fetchTrend(request, secid, { preferred = "" } = {}) {
+export async function fetchTrend(request, secid, { preferred = "", allowFallback = true } = {}) {
   const params = { secid, code: tencentCodeOf(secid) };
-  return fetchFromSources("trend", request, params, preferred);
+  return fetchFromSources("trend", request, params, preferred, { allowFallback });
 }

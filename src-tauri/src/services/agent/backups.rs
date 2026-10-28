@@ -372,6 +372,7 @@ mod tests {
             &qoder.targets(&home),
             Path::new(r"C:\app\desktop-pet.exe"),
             Some(ledger.as_path()),
+            true,
         );
         std::env::remove_var("PET_AGENT_HOME");
         assert!(
@@ -405,6 +406,7 @@ mod tests {
             &qoder.targets(&home),
             Path::new(r"C:\app\desktop-pet.exe"),
             None,
+            true,
         );
         std::env::remove_var("PET_AGENT_HOME");
         assert_eq!(
@@ -471,6 +473,7 @@ mod tests {
                 &files,
                 exe,
                 Some(ledger.as_path()),
+                true,
             );
             for report in &reports {
                 assert!(

@@ -4,7 +4,7 @@
 import { TOPIC_PANEL } from "./topics.js";
 import { briefReason, fetchDepth, fetchKline, fetchTrend, KIND_NAMES } from "./market.js";
 import { out } from "./index.js";
-import { ctx, klt, noteSource, selected, sourcePrefs } from "./main.js";
+import { ctx, config, klt, noteSource, selected, sourcePrefs } from "./main.js";
 import { quotes, status } from "./core.js";
 
 /** K 线比盘口/分时候份稳定得多，60 秒才重拉一次 */
@@ -85,7 +85,10 @@ export async function loadPanel({ withDepth = true, withTrend = true, withKline 
   };
   const grabDepth = () =>
     grab("depth", async () => {
-      const { data, source, host } = await fetchDepth(traced("depth"), selected, { preferred: sourcePrefs.depth });
+      const { data, source, host } = await fetchDepth(traced("depth"), selected, {
+        preferred: sourcePrefs.depth,
+        allowFallback: config.allowFallback !== false,
+      });
       next.depth = data;
       next.depthAt = Date.now();
       next.depthSource = source;
@@ -93,7 +96,10 @@ export async function loadPanel({ withDepth = true, withTrend = true, withKline 
     });
   const grabTrend = () =>
     grab("trend", async () => {
-      const { data, source, host } = await fetchTrend(traced("trend"), selected, { preferred: sourcePrefs.trend });
+      const { data, source, host } = await fetchTrend(traced("trend"), selected, {
+        preferred: sourcePrefs.trend,
+        allowFallback: config.allowFallback !== false,
+      });
       // 昨收优先取**主轮询那一份快照**（缓存复用）：同一个数不重复问，
       // 而且分时基线跟着列表里的昨收走，不会出现「列表一个昨收、图上一个昨收」。
       // 快照这一轮没成功（或这只不在自选里）时才退回分时响应自带的那个。
@@ -105,7 +111,10 @@ export async function loadPanel({ withDepth = true, withTrend = true, withKline 
     });
   const grabKline = () =>
     grab("kline", async () => {
-      const { data, source, host } = await fetchKline(traced("kline"), selected, klt, { preferred: sourcePrefs.kline });
+      const { data, source, host } = await fetchKline(traced("kline"), selected, klt, {
+        preferred: sourcePrefs.kline,
+        allowFallback: config.allowFallback !== false,
+      });
       next.kline = data;
       next.klineAt = Date.now();
       next.klineKlt = klt;

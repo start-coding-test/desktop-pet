@@ -188,20 +188,27 @@ async fn init_ble(state: &BleState) -> Result<(), HostError> {
 /// JS 能力桥本来就按 manifest 校验，这一步是为了让「绕过桥直接 invoke」也拿不到别人的权限；
 /// 插件之间仍无法区分（同一个宠物窗），那要等 Web Worker 宿主。
 /// 判定收在 `crate::gate::plugin_capability`（S4/S5：全项目一把门禁，别再各写一份）。
-fn require_granted(perms: &PermissionState, plugin_id: &str, cap: &str) -> Result<(), HostError> {
+/// G3-01：先过窗口归属 —— 插件自己的悬浮窗只能替自己操作蓝牙。
+fn require_granted(
+    window: &tauri::Window,
+    perms: &PermissionState,
+    plugin_id: &str,
+    cap: &str,
+) -> Result<(), HostError> {
     // gate 已迁 HostError（ADR-0007），这里不再过 `From<HostError> for String` 那道转换
-    crate::gate::plugin_capability(perms, plugin_id, cap)
+    crate::gate::plugin_capability(window, perms, plugin_id, cap)
 }
 
 /// 开始扫描；发现的新设备通过 ble:device-found 事件广播
 #[tauri::command]
 pub async fn ble_start_scan(
+    window: tauri::Window,
     app: AppHandle,
     state: tauri::State<'_, BleState>,
     perms: tauri::State<'_, PermissionState>,
     plugin_id: String,
 ) -> Result<(), HostError> {
-    require_granted(&perms, &plugin_id, crate::plugin_caps::BLE_SCAN)?;
+    require_granted(&window, &perms, &plugin_id, crate::plugin_caps::BLE_SCAN)?;
     init_ble(&state).await?;
     reset_seen(&state).await;
     begin_adapter_scan(&state).await?;
@@ -289,11 +296,12 @@ fn spawn_scan_pump(app: AppHandle, scanning: Arc<AtomicBool>) {
 
 #[tauri::command]
 pub async fn ble_stop_scan(
+    window: tauri::Window,
     state: tauri::State<'_, BleState>,
     perms: tauri::State<'_, PermissionState>,
     plugin_id: String,
 ) -> Result<(), HostError> {
-    require_granted(&perms, &plugin_id, crate::plugin_caps::BLE_SCAN)?;
+    require_granted(&window, &perms, &plugin_id, crate::plugin_caps::BLE_SCAN)?;
     state.scanning.store(false, Ordering::SeqCst);
     let core_guard = state.core.lock().await;
     if let Some(core) = core_guard.as_ref() {
@@ -305,13 +313,14 @@ pub async fn ble_stop_scan(
 /// 连接指定设备并订阅心率通知（会自动断开旧连接）
 #[tauri::command]
 pub async fn ble_connect(
+    window: tauri::Window,
     app: AppHandle,
     state: tauri::State<'_, BleState>,
     perms: tauri::State<'_, PermissionState>,
     plugin_id: String,
     device_id: String,
 ) -> Result<(), HostError> {
-    require_granted(&perms, &plugin_id, crate::plugin_caps::BLE_CONNECT)?;
+    require_granted(&window, &perms, &plugin_id, crate::plugin_caps::BLE_CONNECT)?;
     init_ble(&state).await?;
     drop_old_connection(&state).await;
     let peripheral = lookup_peripheral(&state, &device_id).await?;
@@ -422,11 +431,12 @@ async fn ble_disconnect_inner(state: &BleState, device_id: String) -> Result<(),
 
 #[tauri::command]
 pub async fn ble_disconnect(
+    window: tauri::Window,
     state: tauri::State<'_, BleState>,
     perms: tauri::State<'_, PermissionState>,
     plugin_id: String,
 ) -> Result<(), HostError> {
-    require_granted(&perms, &plugin_id, crate::plugin_caps::BLE_CONNECT)?;
+    require_granted(&window, &perms, &plugin_id, crate::plugin_caps::BLE_CONNECT)?;
     let current = state.connected.lock().await.clone();
     match current {
         Some(id) => ble_disconnect_inner(&state, id).await,
@@ -436,11 +446,12 @@ pub async fn ble_disconnect(
 
 #[tauri::command]
 pub async fn ble_connected_device(
+    window: tauri::Window,
     state: tauri::State<'_, BleState>,
     perms: tauri::State<'_, PermissionState>,
     plugin_id: String,
 ) -> Result<Option<String>, HostError> {
-    require_granted(&perms, &plugin_id, crate::plugin_caps::BLE_CONNECT)?;
+    require_granted(&window, &perms, &plugin_id, crate::plugin_caps::BLE_CONNECT)?;
     Ok(state.connected.lock().await.clone())
 }
 

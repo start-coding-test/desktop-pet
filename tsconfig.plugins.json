@@ -10,5 +10,18 @@
     "strict": false,
     "skipLibCheck": true
   },
-  "include": ["plugins/**/*.js"]
+  "include": ["plugins/**/*.js"],
+  // e2e 探针插件不参与 typecheck：它们是 fixtures.mjs 在运行时写进 plugins/ 的
+  // 一次性探针（全局 window.__probe* 字段没有类型声明），残留时不该把 build 判红。
+  // 逐个目录名显式排除；不用 plugins/zz.* 通配，避免误伤以后名字相近的真实插件。
+  "exclude": [
+    "plugins/zz.probe/**",
+    "plugins/com.zz.spoof/**",
+    "plugins/zz.net/**",
+    "plugins/zz.consent/**",
+    "plugins/zz.hookprobe/**",
+    "plugins/zz.hookundeclared/**",
+    "plugins/zz.status/**",
+    "plugins/zz.status2/**"
+  ]
 }

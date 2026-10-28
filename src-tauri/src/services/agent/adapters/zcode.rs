@@ -138,10 +138,8 @@ impl AgentAdapter for ZCodeAdapter {
     /// 两个都不存在也照样不造 —— 开发机上到底哪一种对应「装过但还没生成配置」，
     /// 是方案 §3.1 点名要在真机确认的一条，写进人工验证清单。
     fn targets(&self, home: &Path) -> Vec<PathBuf> {
-        let root = match std::env::var("PET_AGENT_HOME") {
-            Ok(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
-            _ => home.to_path_buf(),
-        };
+        // 只有一个解析点：`super::effective_home`（T8-F3），状态命令报的 home 与这里同源。
+        let root = super::effective_home(home);
         if !root.join(".zcode").exists() {
             return Vec::new();
         }
@@ -285,10 +283,8 @@ impl AgentAdapter for ZCodeAdapter {
     /// root 与 `targets()` 用同一个口径（`PET_AGENT_HOME` 能整体换根），否则开发机上
     /// 「装到 temp、自检去读真 home」就是两条不相干的路径。
     fn log_watch(&self, home: &Path) -> Option<LogWatch> {
-        let root = match std::env::var("PET_AGENT_HOME") {
-            Ok(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
-            _ => home.to_path_buf(),
-        };
+        // 与 `targets()` 同一个解析点（T8-F3），否则开发机上「装到 temp、自检去读真 home」。
+        let root = super::effective_home(home);
         Some(LogWatch {
             dir: root.join(".zcode").join("cli").join("log"),
             prefix: "zcode-",

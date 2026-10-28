@@ -15,6 +15,7 @@ import {
   parseQuoteResponse,
   parseTrendResponse,
   QUOTE_API,
+  SUGGEST_API,
   TREND_API,
 } from "./eastmoney.js";
 import {
@@ -141,10 +142,29 @@ export function sourceLabelOf(id) {
 /** 落盘记忆里只认这几个 id（撤销授权会清存储，读到脏值就当没记过） */
 export const SOURCE_IDS = MARKET_SOURCES.map((s) => s.id);
 
-/** 候选源顺序：上一次成功的源排最前，其余保持注册表顺序（原 fetchFromSources 里的内联排序，行为不变） */
-export function orderSourcesForPreferred(preferred) {
-  return [
-    ...MARKET_SOURCES.filter((s) => s.id === preferred),
-    ...MARKET_SOURCES.filter((s) => s.id !== preferred),
-  ];
+/** 主源：不开后备源时只用它（G5-08 的「后备源」开关按这个口径收窄） */
+export const PRIMARY_SOURCE_ID = MARKET_SOURCES[0].id;
+
+/**
+ * 实际可能被请求到的主机（G5-08）：注册表的四个 kind 各自的 hosts 并集，
+ * 再补上「搜索」这一路 —— 它不在注册表里（只有东财供），但确实会出网。
+ * 界面说明、manifest 描述与单测都拿这一份对齐，别再手写主机名。
+ */
+export const MARKET_HOSTS = [
+  ...new Set([
+    ...MARKET_SOURCES.flatMap((s) =>
+      ["quote", "depth", "kline", "trend"].flatMap((kind) => s[kind]?.hosts ?? []),
+    ),
+    hostOf(SUGGEST_API),
+  ]),
+];
+
+/**
+ * 候选源顺序：上一次成功的源排最前，其余保持注册表顺序（原 fetchFromSources 里的内联排序，行为不变）。
+ * `allowFallback === false` 时只留主源：用户关掉后备源就是「别去碰别家域名」，
+ * 记忆里上一次成功的源也不该把请求带到腾讯/新浪去。
+ */
+export function orderSourcesForPreferred(preferred, { allowFallback = true } = {}) {
+  const pool = allowFallback ? MARKET_SOURCES : MARKET_SOURCES.filter((s) => s.id === PRIMARY_SOURCE_ID);
+  return [...pool.filter((s) => s.id === preferred), ...pool.filter((s) => s.id !== preferred)];
 }

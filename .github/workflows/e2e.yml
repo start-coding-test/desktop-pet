@@ -3,9 +3,11 @@
 # **已证明：首次跑绿是 run 38776535438**（2026-10-16，开发机自托管 runner CHEN，套件 verify + verify:agent）。
 # 后续（2026-10-16，runner chen_work）：verify:game 15/0 是 run 38832007396；
 # 更早的 verify:agent 77/0 是 run 38832924368，跑的时候 Qoder 一直在调工具，证明 PET_AGENT_INBOX 隔离生效。
-# verify:agent 的**当期基线是 148/0**（run 39117381226，A02 加的：「ZCode 切换」整组真实点击判据 +
-# 「来源过滤」一组 + 「装好的条目带 --agent qoder」「agent:state 也带 agent」两条）。
-# 上一版 113/0 是 run 39104215835；再上一版 104/0 是 run 39030477943（PR #9 的启停联动与 --pet-hook-cleanup 两组）。
+# 当期基线（2026-10-28 复核，改基线要同步改 .github/workflows/e2e-gate.json 的 minAssertions）：
+#   verify 485/0、verify:agent 303/4（4 红是 t38 修复前的读数，不是全绿；待 t37 回填后更新）、
+#   verify:worker 66/0、verify:todo 31/0、verify:game 15/0、verify:goat-gauge 76/0、
+#   verify:drag 41/0、verify:dsh 43/0。
+# 旧文里「verify:agent 当期基线 148/0」是 A02 时期的读数，早被后面的组数顶过去了，别再拿它对账。
 #
 # 托管 runner 已证否（run 38757735230，2026-10-15，windows-latest）：编译、起 dev 实例都过，
 # 之后每个进程（含 node 与 actions 的 post 步）都以 -1073741502 = 0xC0000142（DLL 初始化失败）退出，
@@ -41,6 +43,17 @@
 #   verify:game    全屏置顶窗 + 定时器，桌面堆（desktop heap）风险；已进白名单，但只在手动点名时跑，不进默认清单；
 #   verify:release 自己起 release exe 并占 9224，还要 3~4 分钟 tauri build；
 #   verify:astock / verify:http / verify:skin 出网（行情、GBK 源、petdex.dev），数据形态随时段漂。
+#
+# 假绿门禁（G1-05 / G1-06，2026-10-28 加；配置在同目录 e2e-gate.json）：
+#   - **skip 即红**：套件日志里出现 skipMarkers（`跳过`）就当失败。以前「前置不满足 → 打一行 info → 退 0」
+#     会被当成通过，全 skip 的 run 也能出绿；现在空转的套件过不了门。
+#   - **断言数下限**：每个套件在 minAssertions 里钉一个下限，低于下限判红 —— 抓「只跑了几条就算过」。
+#     基线上面的 485/303/66/31/15/76/41/43 已留出余量做下限，新增断言不用改；砍掉大组才需要同步调。
+#     （verify:agent 的 303 里含 4 红，t38 修复未合入前它只当下限用，不代表这套件是绿的。）
+#   - **known-env-failures**：环境债（比如 runner 上 Ctrl+Alt+P 被占、preseed 夹具缺失）登记在
+#     e2e-gate.json 的 knownEnvFailures（suite + 失败项子串 + 到期日 + 理由）。命中时在 step summary
+#     里单独列成 ENV-RED 并打 warning 注解，但**整体仍然判红**：白名单只用来区分「环境债」与「回归」，
+#     不允许把红灯洗成绿灯；条目到期自动失效，失效后按回归处理。红灯合入仍需在 PR 里登记豁免与到期日。
 name: E2E（手动触发）
 
 # 这份门只需要读代码：不写任何状态、不发评论、不动包
@@ -159,20 +172,157 @@ jobs:
         run: |
           # The allowlist is part of this gate (see the file header for why game/release/astock/http/skin
           # stay out). It also pins the input to npm script names so the string never reaches the shell.
-          $allowed = @("verify", "verify:agent", "verify:worker", "verify:todo", "verify:game", "verify:goat-gauge")
+          # G1-09: verify:drag is in - the drag fix is verifiable offline, and leaving it out meant it had
+          # no automatic entry point at all.
+          # t39: verify:dsh is in for the same reason - its 43/0 baseline needs a floor this gate can
+          # actually enforce; a floor for a suite outside this list would be documentation, not a gate.
+          $allowed = @("verify", "verify:agent", "verify:worker", "verify:todo", "verify:game", "verify:goat-gauge", "verify:drag", "verify:dsh")
+
+          # G1-05 / G1-06 gate config. Refuse to run without it: silently falling back to "no floors,
+          # no registry" is exactly the fake-green this gate exists to stop.
+          $configPath = ".github/workflows/e2e-gate.json"
+          if (-not (Test-Path $configPath)) {
+            throw "Missing $configPath - the E2E gate needs assertion floors and the known-env-failure registry"
+          }
+          $config = [System.IO.File]::ReadAllText((Resolve-Path $configPath).Path, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+          $floor = @{}
+          foreach ($p in $config.minAssertions.PSObject.Properties) { $floor[$p.Name] = [int]$p.Value }
+          foreach ($a in $allowed) {
+            if (-not $floor.ContainsKey($a)) { throw "Suite $a has no minAssertions entry in $configPath" }
+          }
+          $rules = @()
+          foreach ($k in $config.knownEnvFailures) {
+            $rules += [pscustomobject]@{ Suite = [string]$k.suite; Match = [string]$k.match; Reason = [string]$k.reason; Expires = [string]$k.expires }
+          }
+          $skipMarkers = @()
+          foreach ($m in $config.skipMarkers) { $skipMarkers += [string]$m }
+          $today = (Get-Date).ToString("yyyy-MM-dd")
+
+          New-Item -ItemType Directory -Force -Path temp | Out-Null
           $failed = @()
+          $debt = @()
+          $rows = @()
+
           foreach ($s in ($env:SUITES -split ",")) {
             $name = $s.Trim()
             if (-not $name) { continue }
             if ($allowed -notcontains $name) { throw "Suite $name is not in this workflow's allowlist (allowed: $($allowed -join ', '))" }
-            Write-Host "`n===== npm run $name ====="
-            npm run $name
-            if ($LASTEXITCODE -ne 0) {
-              Write-Host "$name exit code $LASTEXITCODE"
+            $slug = $name -replace ":", "-"
+            $logWin = "temp\suite-$slug.log"
+            $logFull = Join-Path (Get-Location).Path $logWin
+
+            Write-Host ""
+            Write-Host "===== npm run $name ====="
+            # Capture first, then replay, so the log can be scanned for skips, assertion counts and FAIL
+            # labels. Live streaming is not worth losing that: the replay keeps the same text in the log.
+            cmd /c "npm run $name > $logWin 2>&1"
+            $code = $LASTEXITCODE
+            $text = ""
+            if (Test-Path $logFull) { $text = [System.IO.File]::ReadAllText($logFull, [System.Text.Encoding]::UTF8) }
+            Write-Host $text
+
+            $passed = 0
+            $assertFailed = 0
+            $summaryHits = [regex]::Matches($text, "(?m)^\s*(\d+) passed, (\d+) failed")
+            if ($summaryHits.Count -gt 0) {
+              $lastHit = $summaryHits[$summaryHits.Count - 1]
+              $passed = [int]$lastHit.Groups[1].Value
+              $assertFailed = [int]$lastHit.Groups[2].Value
+            }
+            $assertions = $passed + $assertFailed
+
+            $skips = 0
+            foreach ($marker in $skipMarkers) {
+              if ($marker) { $skips += ([regex]::Matches($text, [regex]::Escape($marker))).Count }
+            }
+
+            $failLines = @()
+            foreach ($fm in [regex]::Matches($text, "(?m)^\s+FAIL\s+(.*)$")) { $failLines += $fm.Groups[1].Value.Trim() }
+
+            $reasons = @()
+            if ($code -ne 0) { $reasons += "exit=$code" }
+            if ($skips -gt 0) { $reasons += "skipped=$skips (skip counts as red in CI)" }
+            if ($assertions -lt $floor[$name]) { $reasons += "assertions=$assertions below floor=$($floor[$name])" }
+
+            $debtHits = @()
+            $regressions = @()
+            foreach ($line in $failLines) {
+              $hit = $null
+              foreach ($rule in $rules) {
+                if ($rule.Suite -ne $name) { continue }
+                if ($rule.Match -and -not $line.Contains($rule.Match)) { continue }
+                if ($rule.Expires -and ([string]::CompareOrdinal($rule.Expires, $today) -lt 0)) { continue }
+                $hit = $rule
+                break
+              }
+              if ($hit) { $debtHits += ("{0} [{1}]" -f $line, $hit.Reason) } else { $regressions += $line }
+            }
+            if ($failLines.Count -eq 0) {
+              # A crash (e.g. a preseed guard throwing) has no FAIL label to match, so fall back to the log
+              # text: a registered env cause is then still separable from a real regression - and still red.
+              foreach ($rule in $rules) {
+                if ($rule.Suite -ne $name) { continue }
+                if ($rule.Match -and -not $text.Contains($rule.Match)) { continue }
+                if ($rule.Expires -and ([string]::CompareOrdinal($rule.Expires, $today) -lt 0)) { continue }
+                $debtHits += ("log matched '{0}' [{1}]" -f $rule.Match, $rule.Reason)
+                break
+              }
+            }
+
+            $verdict = "GREEN"
+            if ($reasons.Count -gt 0) {
+              if ($regressions.Count -gt 0) { $verdict = "REGRESSION-RED" }
+              elseif ($skips -gt 0) { $verdict = "SKIP-RED" }
+              elseif ($debtHits.Count -gt 0) { $verdict = "ENV-RED" }
+              else { $verdict = "REGRESSION-RED" }
+            }
+
+            $rows += [pscustomobject]@{ Suite = $name; Passed = $passed; Failed = $assertFailed; Skipped = $skips; Assertions = $assertions; Floor = $floor[$name]; Verdict = $verdict }
+            if ($verdict -eq "GREEN") {
+              Write-Host ("VERDICT GREEN: {0} ({1} assertions, floor {2})" -f $name, $assertions, $floor[$name])
+            } else {
               $failed += $name
+              Write-Host ("VERDICT {0}: {1} | {2}" -f $verdict, $name, ($reasons -join "; "))
+              foreach ($d in $debtHits) {
+                $debt += ("{0}: {1}" -f $name, $d)
+                Write-Host ("::warning title=E2E env debt, still red::{0} | {1}" -f $name, $d)
+              }
+              foreach ($g in $regressions) {
+                Write-Host ("::error title=E2E regression::{0} | {1}" -f $name, $g)
+              }
             }
           }
-          if ($failed.Count -gt 0) { throw "Failed suites: $($failed -join ', ')" }
+
+          # Summary: one table for every requested suite plus a separate list for registered env debt,
+          # so a red run is triaged without opening the job log (which is 403 for anonymous readers).
+          $md = @()
+          $md += "### E2E gate"
+          $md += ""
+          $md += "| suite | passed | failed | skipped | assertions | floor | verdict |"
+          $md += "| --- | --- | --- | --- | --- | --- | --- |"
+          foreach ($r in $rows) {
+            $md += ("| {0} | {1} | {2} | {3} | {4} | {5} | {6} |" -f $r.Suite, $r.Passed, $r.Failed, $r.Skipped, $r.Assertions, $r.Floor, $r.Verdict)
+          }
+          if ($debt.Count -gt 0) {
+            $md += ""
+            $md += "Known environment debt (registered in e2e-gate.json, NOT counted as green):"
+            foreach ($d in $debt) { $md += "- $d" }
+          }
+          if ($failed.Count -gt 0) {
+            $md += ""
+            $md += "Result: RED (not green: $($failed -join ', ')) - a green gate requires every suite at/above floor with zero skips"
+          } else {
+            $md += ""
+            $md += "Result: GREEN (no skips, every suite at or above its floor)"
+          }
+          if ($env:GITHUB_STEP_SUMMARY) { $md | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append }
+          foreach ($lineOut in $md) { Write-Host $lineOut }
+
+          if ($failed.Count -gt 0) {
+            $msg = "E2E suites not green: " + ($failed -join ", ")
+            if ($debt.Count -gt 0) { $msg += ". Registered env debt (still red; needs a waiver with an expiry in the PR): " + ($debt -join " ; ") }
+            throw $msg
+          }
 
       - name: 失败时把 dev 实例的日志打成 artifact
         if: failure()

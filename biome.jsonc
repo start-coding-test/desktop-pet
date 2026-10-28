@@ -13,7 +13,18 @@
       "integrations/**",
       "tests/**",
       "tools/**",
-      "vite.config.ts"
+      "vite.config.ts",
+      // e2e 探针插件（tests/e2e/harness/fixtures.mjs 运行时写入 plugins/，正常收尾自删，
+      // 崩溃时残留）：逐个目录名显式排除，保证 lint 文件数与无探针时一致。
+      // 不用 plugins/zz.* 通配：那会把以后名字相近的真实插件一并放走。
+      "!plugins/zz.probe",
+      "!plugins/com.zz.spoof",
+      "!plugins/zz.net",
+      "!plugins/zz.consent",
+      "!plugins/zz.hookprobe",
+      "!plugins/zz.hookundeclared",
+      "!plugins/zz.status",
+      "!plugins/zz.status2"
     ]
   },
   // 格式化器先不启用：本仓库没有既成的排版约定，在同一波里全量重排会把

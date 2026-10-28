@@ -101,7 +101,8 @@ export class DragDirectionTracker {
 // - waiting 是 petdex 的「耐心待机」变体，本项目用它承担原来的睡觉位（长时间无交互）
 // - request 为插件预留的插播队列入口（pet:react）
 // - running-left/right 另外还由拖动驱动（beginDrag/dragDirection/endDrag）：拖动期不排空队列、
-//   不走到点回落，松手复原到拖动前的姿势；这条路径与 request 的优先级队列互不相交
+//   不走到点回落，松手复原到拖动前的姿势；拖动期的 request 另存一份 deferred（见下），
+//   松手复原后按原优先级补播 —— 否则插件此刻要的 waiting 提示会被方向帧永久吃掉
 export class PetStateMachine {
   private defs: Partial<Record<ActionName, StateDef>> = {};
   private players: Partial<Record<ActionName, FramePlayer>> = {};
@@ -117,6 +118,18 @@ export class PetStateMachine {
    * `request()` 的优先级与排队规则一个字不改。
    */
   private dragReturn: ActionName | null = null;
+  /**
+   * 拖动期间收到的插件请求（G6-03）：拖动期画面由方向帧驱动，此刻立即切过去会被下一帧
+   * Moved 覆盖 —— 插件要的 waiting（审批提示）就这样永久丢了。这里先存着，松手复原后
+   * 再按原来的优先级规则补播（replayDeferred）。
+   */
+  private deferred: ActionName[] = [];
+  /**
+   * 拖动期间真正画到前台的姿势（G6-04）：皮肤缺 running-left/right 帧时会回退到 idle，
+   * 此时拖动画出来的其实是 idle。松手只复原「画面还停在拖动画出来的那一帧」的情况，
+   * 拖动被暂停（installGameMode）等没画出来的时候不要凭空切姿势。
+   */
+  private dragPainted: ActionName | null = null;
 
   private static readonly MAX_QUEUE = 3;
 
@@ -173,7 +186,13 @@ export class PetStateMachine {
       if (def.renewable) this.played = 0;
       return;
     }
-    if (this.queue.includes(action)) return; // 同一状态不重复排队
+    if (this.queue.includes(action) || this.deferred.includes(action)) return; // 同一状态不重复排队
+    // 拖动期只入队不切（G6-03）：切了也会被下一帧方向帧盖掉，请求等于白丢
+    if (this.dragReturn !== null) {
+      this.deferred.push(action);
+      if (this.deferred.length > PetStateMachine.MAX_QUEUE) this.deferred.shift();
+      return;
+    }
     const cur = this.defs[this.current];
     if (!cur || def.priority > cur.priority || this.current === "waiting") {
       this.switchTo(action);
@@ -241,9 +260,14 @@ export class PetStateMachine {
   dragDirection(dir: DragDirection | null): void {
     if (this.dragReturn === null) return;
     this.sinceInteraction = 0;
-    const target = dir ?? this.dragReturn;
+    const wanted = dir ?? this.dragReturn;
+    // 皮肤可能没有 running-left/right 帧：回落目标是**拖动前的姿势**，不是 idle。
+    // 不这么做的话每个 Moved 都会 switchTo(wanted) → 回退 idle → 重置播放进度，
+    // 立绘永远停在 idle 的首帧（半透明入场帧）上抖（G6-04）。回落目标恒定，所以最多切一次。
+    const target = this.players[wanted] ? wanted : this.dragReturn;
     // 重复 set 不重入：不重置播放进度，也不刷 lastSwitchAt（渲染层的弹跳淡入靠它）
     if (target === this.current) return;
+    this.dragPainted = target;
     this.switchTo(target);
   }
 
@@ -255,10 +279,22 @@ export class PetStateMachine {
   endDrag(): void {
     if (this.dragReturn === null) return;
     const back = this.dragReturn;
+    const painted = this.dragPainted;
     this.dragReturn = null;
+    this.dragPainted = null;
     this.sinceInteraction = 0;
-    if (!isDragDirection(this.current) || this.current === back) return;
-    this.switchTo(back);
+    // 只复原「画面还停在拖动画出来的那一帧」的情况：皮肤缺方向帧时画出来的可能是 idle
+    // 回退（G6-04）；拖动期间被插件插播（jumping…）时画面已经不归拖动管，也不抢回来。
+    if (painted !== null && this.current === painted && this.current !== back) this.switchTo(back);
+    this.replayDeferred();
+  }
+
+  /** 松手后补播拖动期排队的请求（G6-03）：仍走 request，优先级与排队语义一个字不改 */
+  private replayDeferred(): void {
+    if (this.deferred.length === 0) return;
+    const pending = this.deferred;
+    this.deferred = [];
+    for (const action of pending) this.request(action);
   }
 
   /** 当前排队等待插播的状态数（诊断与回归断言用） */
@@ -319,9 +355,4 @@ export class PetStateMachine {
 
 function isRenewable(def: StateDef | undefined): boolean {
   return def?.renewable === true;
-}
-
-/** 是不是「拖动驱动的方向态」（复原只认这两种，插件插播的姿势一律让给插件） */
-function isDragDirection(action: ActionName): boolean {
-  return action === "running-left" || action === "running-right";
 }

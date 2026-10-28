@@ -19,7 +19,7 @@ mod tests {
         ("permission_check", "授权表本身的查询接口，门禁就是它"),
         (
             "permission_request",
-            "授权表本身的申请接口，未声明的能力在这里被拒",
+            "授权表本身的申请接口，未声明的能力在这里被拒；另过 G3-01 的窗口归属（同意框不能代表插件）",
         ),
         (
             "permission_revoke",
@@ -48,6 +48,33 @@ mod tests {
         "check_grant(",
         "check_publish(",
         "assert_caller(",
+    ];
+
+    /// G3-01：这些命令必须拿到调用窗，才能分辨「是插件自己的悬浮窗，还是别的窗冒用 id」。
+    /// 漏一个就红 —— 签名里没有 Window 的命令，宿主只能看调用方自报的 plugin_id，
+    /// 而悬浮窗正是自报 id 的唯一来源（见 gate::window_owns_plugin）。
+    const MUST_TAKE_WINDOW: &[(&str, &str)] = &[
+        ("http_request", "按插件逐域名授权，调用窗必须能归属到该插件"),
+        ("store_get", "插件隔离存储，悬浮窗不能读别人的键"),
+        ("store_set", "插件隔离存储，悬浮窗不能写别人的键"),
+        ("store_delete", "插件隔离存储，悬浮窗不能删别人的键"),
+        ("secrets_get", "凭据按插件隔离，悬浮窗不能读别人的凭据"),
+        ("secrets_set", "凭据按插件隔离，悬浮窗不能写别人的凭据"),
+        ("secrets_delete", "凭据按插件隔离，悬浮窗不能删别人的凭据"),
+        ("notify_show", "系统通知以插件名义弹出，调用窗必须能归属"),
+        ("ble_start_scan", "蓝牙按插件授权，调用窗必须能归属"),
+        ("ble_stop_scan", "蓝牙按插件授权，调用窗必须能归属"),
+        ("ble_connect", "蓝牙按插件授权，调用窗必须能归属"),
+        ("ble_disconnect", "蓝牙按插件授权，调用窗必须能归属"),
+        ("ble_connected_device", "蓝牙按插件授权，调用窗必须能归属"),
+        ("permission_request", "同意框窗口不能代表插件申请能力"),
+        ("overlay_show", "悬浮层是插件的脸面，别的窗不能替它开"),
+        ("overlay_hide", "悬浮层是插件的脸面，别的窗不能替它收"),
+        ("overlay_destroy", "悬浮层是插件的脸面，别的窗不能替它销毁"),
+        (
+            "overlay_reclaim",
+            "重认领会带回本插件的悬浮层，调用窗必须能归属",
+        ),
     ];
 
     fn src_root() -> PathBuf {
@@ -126,16 +153,77 @@ mod tests {
         None
     }
 
+    /// `body` 里是否**真的调用了** `name`：注释、字符串与字符字面量里的同名串不算。
+    ///
+    /// 收紧前这里是 `body.contains("window_owns_plugin")`：函数体里只要有一句
+    /// `// window_owns_plugin 由上层调用` 的注释，漏掉调用的命令也会假绿（t18 审计 / t25）。
+    fn calls(body: &str, name: &str) -> bool {
+        let code = code_only(body);
+        code.contains(&format!("{name}("))
+    }
+
+    /// 只留代码骨架：`//` 行注释、`/* */` 块注释、`"…"` 字符串、`'x'` 字符字面量都剥掉。
+    /// 剥字符串是为了不让错误文案里的 `"gate::plugin_capability("` 之类假命中。
+    fn code_only(src: &str) -> String {
+        let chars: Vec<char> = src.chars().collect();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0usize;
+        while i < chars.len() {
+            match chars[i] {
+                '/' if chars.get(i + 1) == Some(&'/') => {
+                    while i < chars.len() && chars[i] != '\n' {
+                        i += 1;
+                    }
+                }
+                '/' if chars.get(i + 1) == Some(&'*') => {
+                    i += 2;
+                    while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                        i += 1;
+                    }
+                    i = (i + 2).min(chars.len());
+                }
+                '"' => {
+                    i += 1;
+                    while i < chars.len() {
+                        if chars[i] == '\\' {
+                            i += 2;
+                        } else if chars[i] == '"' {
+                            i += 1;
+                            break;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                '\'' if char_literal_len(&chars, i) > 0 => i += char_literal_len(&chars, i),
+                c => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    /// `'x'` / `'\n'` / `'\''` 这类字符字面量的长度；`'a`（生命周期）返回 0，按普通代码保留。
+    fn char_literal_len(chars: &[char], i: usize) -> usize {
+        match (chars.get(i + 1), chars.get(i + 2)) {
+            (Some('\\'), Some(_)) if chars.get(i + 3) == Some(&'\'') => 4,
+            (Some(_), Some('\'')) => 3,
+            _ => 0,
+        }
+    }
+
     fn gated_by_capability(body: &str, file_src: &str) -> bool {
-        if DIRECT.iter().any(|m| body.contains(m)) {
+        if DIRECT.iter().any(|m| calls(body, m)) {
             return true;
         }
         WRAPPERS.iter().any(|w| {
             let name = w.trim_end_matches('(');
-            body.contains(w)
+            calls(body, name)
                 && extract_fn(file_src, name)
                     .map(|(_, helper)| {
-                        helper.contains("gate::plugin_capability") || helper.contains("is_granted")
+                        calls(&helper, "gate::plugin_capability") || calls(&helper, "is_granted")
                     })
                     .unwrap_or(false)
         })
@@ -183,12 +271,12 @@ mod tests {
             }
             plugin_faced += 1;
             if let Some((_, reason)) = WINDOW_GATED.iter().find(|(n, _)| *n == name) {
-                let has_window_gate = body.contains("gate::settings")
-                    || body.contains("gate::pet")
-                    || body.contains("is_safe_id")
+                let has_window_gate = calls(&body, "gate::settings")
+                    || calls(&body, "gate::pet")
+                    || calls(&body, "is_safe_id")
                     // 授权表自己的查询口（permission_check 走它）
-                    || body.contains("check_capability")
-                    || body.contains("declared_capabilities");
+                    || calls(&body, "check_capability")
+                    || calls(&body, "declared_capabilities");
                 assert!(
                     has_window_gate,
                     "{name} 挂在窗口门禁名单上（{reason}），函数体里却看不到那把门禁"
@@ -250,5 +338,74 @@ mod tests {
             !commands.iter().any(|c| c.contains('/')),
             "解析把注释当成了命令"
         );
+    }
+
+    /// G3-01：这批插件调用面命令必须收 `Window` —— 没有调用窗就只能信插件自报的 id，
+    /// 而悬浮窗正是「冒用别人 id」的唯一入口。漏一条就从这条路漏一个洞。
+    #[test]
+    fn plugin_facing_commands_receive_the_calling_window() {
+        let root = src_root();
+        let mut files = Vec::new();
+        rs_files(&root, &mut files);
+        for (name, reason) in MUST_TAKE_WINDOW {
+            let found = files
+                .iter()
+                .filter_map(|p| std::fs::read_to_string(p).ok().map(|s| (p, s)))
+                .find_map(|(p, s)| extract_fn(&s, name).map(|f| (p, f)));
+            let Some((path, (params, _))) = found else {
+                panic!("{name} 在 MUST_TAKE_WINDOW 里，但 src/ 下找不到它的定义（{reason}）");
+            };
+            assert!(
+                params.contains("Window"),
+                "{name}（{}）的签名里没有 Window —— {reason}",
+                path.display()
+            );
+        }
+    }
+
+    /// G3-01 的另一半：门禁本身也得收 Window，否则调用方可以绕开归属校验直接查授权表。
+    #[test]
+    fn capability_gate_itself_takes_the_calling_window() {
+        let gate = std::fs::read_to_string(src_root().join("gate.rs")).unwrap();
+        let (params, body) = extract_fn(&gate, "plugin_capability")
+            .expect("gate.rs 里找不到 pub fn plugin_capability");
+        assert!(
+            params.contains("window: &Window"),
+            "gate::plugin_capability 必须收 &Window，实际参数表: {params}"
+        );
+        assert!(
+            calls(&body, "window_owns_plugin"),
+            "gate::plugin_capability 收了 Window 却没判归属"
+        );
+    }
+
+    /// t25：`calls` 必须区分「真的调用」与「注释 / 字符串里提一句」。
+    /// 注释里写 `// window_owns_plugin 由上层调用` 而函数体没有调用时，`calls` 必须判否。
+    #[test]
+    fn calls_ignores_comments_and_literals() {
+        assert!(calls(
+            "gate::plugin_capability(window, &perms, plugin_id, cap)?;",
+            "gate::plugin_capability"
+        ));
+        assert!(calls("let ok = state.is_granted(id, cap);", "is_granted"));
+        assert!(!calls(
+            "// window_owns_plugin 由上层调用",
+            "window_owns_plugin"
+        ));
+        assert!(!calls("/* window_owns_plugin(x) */", "window_owns_plugin"));
+        assert!(!calls(
+            "let hint = \"window_owns_plugin(\";",
+            "window_owns_plugin"
+        ));
+        // 字符字面量里的引号不能吞掉同一行后面的真实调用
+        assert!(calls(
+            "let q = '\"'; gate::settings(window, \"改动\")?;",
+            "gate::settings"
+        ));
+        // 字符串里的 `//` 不能把后面的代码当注释吃掉
+        assert!(calls(
+            "let u = \"https://example.com\"; gate::pet(window, \"x\")?;",
+            "gate::pet"
+        ));
     }
 }

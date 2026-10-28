@@ -22,9 +22,21 @@ temp/
 # 本地打包产物（便携包/安装器输出）
 release-package/
 
-# npm run verify 临时写入的探针插件；脚本正常结束时自行删除
+# e2e 套件临时写入 plugins/ 的探针插件：正常收尾由 fixtures.mjs 的
+# restorePluginsDir / clearPreseedFixtures 删除，崩溃或被杀时才会残留。
+# 逐个目录名显式登记，不用 zz.* / com.zz.* 前缀通配——前缀会把以后误建的
+# 真实插件一起藏掉（t22 卡面：探针不得污染 build / lint / check:docs）。
+# 生成处：tests/e2e/harness/fixtures.mjs。
+# verify-isolation / verify-release 用 writeFixtures() 写这三个：
 /plugins/zz.probe/
 /plugins/com.zz.spoof/
+/plugins/zz.net/
+# dev-debug 在 PET_E2E_PRESEED=1 启动前用 writePreseedFixtures() 写这五个：
+/plugins/zz.consent/
+/plugins/zz.hookprobe/
+/plugins/zz.hookundeclared/
+/plugins/zz.status/
+/plugins/zz.status2/
 
 # Editor
 # 编辑器配置整个目录不入库（用户 2026-10-15 定）。以前显式保留过 extensions.json 与

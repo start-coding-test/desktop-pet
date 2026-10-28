@@ -11,7 +11,8 @@
 // webview 之后收不到 mousemove/mouseup。所以本套件把「谁产生窗口位移」写成了可复跑的替代路径：
 //
 //   1. 起拖：CDP `Input.dispatchMouseEvent` 合成 mousedown + 超过 DRAG_START_PX 的 mousemove
-//      → 触发 main.ts 自己的起拖分支（beginDrag + startDragging invoke），页面进入 dragEngaged。
+//      → 触发 main.ts 自己的起拖分支（DragController.engage → beginDrag + startDragging invoke），
+//      页面进入拖动态（DragController.isEngaged）。
 //      合成的按下没有物理按键，Windows 拖拽循环不会真的接管，所以页面还能继续收 IPC。
 //   2. 位移：由 Win32 `SetWindowPos`（harness/pet-window.ps1，Node 侧外部进程）真实搬宠物窗。
 //      产生的是真 WM_MOVE → tauri://move → getCurrentWindow().onMoved，与鼠标拖拽撞的是同一条链路；
@@ -19,7 +20,8 @@
 //   3. 读数：读真实 DOM 的 `documentElement[data-pet-state]`（由套件注入的观察器写入，见下）。
 //
 // 阈值不另抄一套：DRAG_DIRECTION_MIN_PX / DRAG_DIRECTION_COOLDOWN_MS 从
-// src/pet/state-machine.ts import；DRAG_START_PX 从 /src/main.ts?raw 源码里取。
+// src/pet/state-machine.ts import；DRAG_START_PX / BLUR_GRACE_MS / DRAG_SILENCE_MS 从
+// src/pet/drag-controller.ts import（起拖与收尾的判定已从 main.ts 抽成纯逻辑模块）。
 // 时间预算沿用 t1 卡的验收线：出现方向态 ≤300ms、反向 ≤200ms、松手复原 ≤300ms。
 //
 // ## 覆盖了什么 / 没覆盖什么（如实口径）
@@ -36,6 +38,8 @@
 // 没覆盖（本套件不给绿灯，需人工验）：
 //   - **真实鼠标按住拖动**：Windows 的 OS 拖拽循环（startDragging）本身没被驱动，
 //     「拖拽循环期间 Moved 事件是否照样转发到 webview」只能人工验证，步骤见文末。
+//   - 真机「吞 mouseup」（松手后不动鼠标）与拖动期真实 blur/宽限：这两条已在离线单测用假时钟
+//     钉住（tests/unit/unit-runtime.mjs），但 OS 拖拽循环里的真实时序需人工验。
 //   - DPI 非 100% 的缩放档、多显示器/负坐标屏（套件按 devicePixelRatio 换算，但没有在这些环境跑过）。
 // 其他说明：
 //   - 应用本身没有 data-pet-state 属性；套件用 Page.addScriptToEvaluateOnNewDocument 注入观察器，
@@ -43,11 +47,14 @@
 //     把**真实状态机**切换后的 current 镜像到 <html data-pet-state>。写入者就是被测状态机，
 //     不是另一份状态副本；断言读的是这个真实 DOM 属性。
 //   - 合成按下的按键状态和真机不同：真拖时 mousemove 带 buttons=1，而合成拖拽里若窗口在光标
-//     底下移动，WebView2 会补发 buttons=0 的 mousemove，被 main.ts 的
-//     `dragEngaged && e.buttons === 0` 当成松手而取消拖动。套件因此在拖动相开始前把系统光标
-//     停到远离宠物的屏幕角落，并在拖动相断言「页面没有再收到 mousemove」。
-//   - 本套件本轮不进 .github/workflows/e2e.yml 的 allowlist（CI 本轮不改）：它要求先起 dev 实例、
-//     还要真实桌面窗口，与 verify:skin / verify:release 等按需手动的套件同类。
+//     底下移动，WebView2 会补发 buttons=0 的 mousemove，被 DragController.pointerMove 的
+//     `buttons === 0 → finish("buttons-released")` 当成松手而取消拖动。套件因此在拖动相开始前
+//     把系统光标停到远离宠物的屏幕角落，并在拖动相断言「页面没有再收到 mousemove」。
+//   - 同理，窗口停手超过 DRAG_SILENCE_MS（250ms）会被静默兜底按「松手」收尾：套件在拖动相的
+//     长间隔（去抖闸门、补拍前的 sleep 等）前用 ±2 CSS px 的往返微抖续命（keepDragAlive），
+//     微抖远小于方向阈值、净位移为 0，只刷新「窗口还在动」的时间戳。
+//   - 本套件已在 .github/workflows/e2e.yml 的 allowlist 里（G1-09）：CI 侧要起 dev 实例 + 真实
+//     桌面窗口，按 workflow_dispatch 手动触发；本地 npm run verify:drag 等价。
 //   - 前置缺失（CDP 连不上 / 观察器注入失败 / 找不到宠物窗 / PowerShell 7 缺失）一律报红并打印修复指引，
 //     不静默跳过；退出码 1 = 断言红，2 = 前置连不上。
 //
@@ -61,19 +68,25 @@
 // 判读与做法：看到「系统光标已还原」或窗口矩形还原类红，先查是不是有别的 UI 套件在跑/没退干净；
 // **一套件一实例、串行**，等上一个套件收尾（实例与光标都还回去）再跑本套件。
 //
-// ## 人工验证「真实鼠标拖动」的步骤（未覆盖项）
+// ## 人工验证「真实鼠标拖动」的步骤（G6-16；没跑过的步骤要在验收记录里写「未验」，不得当作通过）
 //   1. npm run dev:debug，等宠物出现在桌面
-//   2. 按住宠物往右拖 >24 CSS px：拖拽期间应显示 running-right（向右跑）
-//   3. 不松手反向往左拖 >24 CSS px：应切成 running-left
-//   4. 松手：应回到按下前的状态（插件在跑时是 running；闲置时是 idle/waiting）
-//   5. 重复 2-4 三次，确认「拖过一次后还能正常戳宠物、点不到时能穿透」
+//   2. 按住宠物往右拖 >24 CSS px：拖拽期间应显示 running-right；不松手反向往左拖 >24 CSS px：
+//      应切成 running-left（反向切换 ≤200ms）
+//   3. 松手后**不动鼠标**：应在 DRAG_SILENCE_MS（250ms）内复原到拖动前的状态、点击穿透恢复开启
+//      （真机会吞掉 mouseup，这条验的是静默兜底）
+//   4. 拖动中 alt-tab / 点桌面切走窗口：拖动不应立刻中断；BLUR_GRACE_MS（100ms）内切回来应继续拖，
+//      超过宽限才按失焦复原（不是半路误杀）
+//   5. DPI≠100%（125%/150%/200%）重复 2-4：方向手感一致（内部按 devicePixelRatio 折算）；
+//      再在本机确认真实 OS 拖拽循环期间窗口 Moved 是否照样转发到页面 —— 这一条套件无法合成，
+//      没验就写「未验」
+//   6. 复原后再戳一戳、把鼠标移到窗口外确认穿透恢复；重复 2-4 三次确认状态不串台
 
 import { attach, createReport, hostInvoke, reloadAndWait, waitUntil } from "./harness/cdp.mjs";
 import {
   killAll,
-  movePetWindow,
   readPetWindow,
   setCursor,
+  startMover,
   waitTransparent,
 } from "./harness/pet-window.mjs";
 
@@ -110,6 +123,8 @@ let rect0 = null;
 let cursor0 = null;
 let center = null;
 let pressed = false;
+/** 常驻搬窗进程（startMover）：拖动相续命与位移都走它，毫秒级往返 */
+let mover = null;
 
 // 观察器：注入到文档起点。注意两件事——
 // 1) 只包 desc.value 是函数的成员：state-machine 的 `get frame()` 是 getter，碰它会抛；
@@ -309,19 +324,24 @@ async function main() {
 
     const derived = await c.ev(`(async () => {
       const sm = await import("/src/pet/state-machine.ts");
-      const raw = (await import("/src/main.ts?raw")).default;
-      const m = /const DRAG_START_PX = (\\d+)/.exec(raw);
+      const dc = await import("/src/pet/drag-controller.ts");
       return {
         minPx: sm.DRAG_DIRECTION_MIN_PX,
         cooldownMs: sm.DRAG_DIRECTION_COOLDOWN_MS,
-        startPx: m ? Number(m[1]) : null,
+        startPx: dc.DRAG_START_PX,
+        blurGraceMs: dc.BLUR_GRACE_MS,
+        silenceMs: dc.DRAG_SILENCE_MS,
       };
     })()`, 15_000);
-    r.check("前置：从源码取到 DRAG_START_PX（不另抄阈值）", true, derived?.startPx !== null && derived?.startPx > 0);
+    r.check(
+      "前置：起拖/失焦宽限/静默兜底常数来自 src/pet/drag-controller.ts（不另抄阈值）",
+      true,
+      derived?.startPx > 0 && derived?.blurGraceMs > 0 && derived?.silenceMs > 0,
+    );
     r.check("前置：方向判定常数来自 src/pet/state-machine.ts", true, derived?.minPx > 0 && derived?.cooldownMs > 0);
     r.info(
       "阈值口径（源码）",
-      `DRAG_START_PX=${derived?.startPx}px, DRAG_DIRECTION_MIN_PX=${derived?.minPx}px, DRAG_DIRECTION_COOLDOWN_MS=${derived?.cooldownMs}ms；时间预算 ${JSON.stringify(DEADLINE)}`,
+      `DRAG_START_PX=${derived?.startPx}px, DRAG_DIRECTION_MIN_PX=${derived?.minPx}px, DRAG_DIRECTION_COOLDOWN_MS=${derived?.cooldownMs}ms, BLUR_GRACE_MS=${derived?.blurGraceMs}ms, DRAG_SILENCE_MS=${derived?.silenceMs}ms；时间预算 ${JSON.stringify(DEADLINE)}`,
     );
     if (!(derived?.startPx > 0) || !(derived?.minPx > 0)) throw new Error("阈值常数取不到，无法按同一口径断言");
 
@@ -335,6 +355,11 @@ async function main() {
     rect0 = { ...w0.rect };
     cursor0 = { ...w0.cursor };
     const dpr = await c.ev("window.devicePixelRatio || 1");
+    // 常驻搬窗进程：一次 pwsh 启动 ~390ms，比 G6-02 的 250ms 静默兜底还长；拖动相里
+    // 每次新起进程搬一下会在两拍之间把合成拖拽收掉。先起好，之后每次搬窗只有毫秒级往返。
+    mover = startMover();
+    const served = await mover.ready;
+    if (served?.serve !== true) throw new Error(`常驻搬窗进程起不来：${JSON.stringify(served)}`);
     const iw = await c.ev("innerWidth");
     const ih = await c.ev("innerHeight");
     center = { x: Math.round(iw / 2), y: Math.round(ih / 2) };
@@ -345,6 +370,23 @@ async function main() {
       Math.abs(w0.rect.width - iw * dpr) <= 2 && Math.abs(w0.rect.height - ih * dpr) <= 2,
     );
     r.info("宠物窗", `hwnd=${w0.hwnd} pid=${w0.pid} rect=${JSON.stringify(w0.rect)} dpr=${dpr} inner=${iw}x${ih}`);
+
+    /**
+     * 拖动相续命：静默兜底（DRAG_SILENCE_MS，G6-02）会在窗口停手这么久后按「松手」收尾。
+     * 本套件两次搬窗之间夹着断言与 sleep（去抖闸门 80ms、同向续拖 120ms、补拍前 150ms 等），
+     * 停手久了合成拖拽会被兜底收尾，后面的断言就不在拖动相里跑了。
+     * 走常驻搬窗进程，按**当前拖动方向**各搬 2 CSS px × 5 步（约 400ms 持续位移，去回净位移 0）：
+     * 幅度远小于 DRAG_DIRECTION_MIN_PX，不会改方向；但反向微抖会把 tracker 的反向进度清零
+     *（见 state-machine 的 sample 注释），所以续命分两段、先顺后逆，别在反向测量窗口里逆着搬。
+     */
+    async function keepDragAlive(dir = 1) {
+      if (!pressed) return;
+      // 只朝当前拖动方向补一小步、不做往返微抖：G6-02 的静默计时只看「窗口有没有在动」，
+      // 而反向判定要求连续的负向位移 —— 往返抖会把负向累计反复清零，反向那一相就会卡住。
+      // 幅度远小于 DRAG_DIRECTION_MIN_PX，推不出方向。
+      const nudge = Math.max(1, Math.round(2 * dpr));
+      await mover.move({ dx: dir * nudge, steps: 1 });
+    }
 
     // ── ④ 未拖动时：穿透 + 戳一戳 ──────────────────────────────────────────────
     r.group("④ 未拖动时：点击穿透与戳一戳不变（回归）");
@@ -377,7 +419,7 @@ async function main() {
     r.info("气泡台词", bubble);
 
     // 起拖前把光标停到远离宠物的屏幕角落：合成按下没有物理按键，窗口若在光标底下移动，
-    // WebView2 会补发 buttons=0 的 mousemove，被 main.ts 的 `dragEngaged && e.buttons === 0` 当成松手而取消拖动。
+    // WebView2 会补发 buttons=0 的 mousemove，被 DragController.pointerMove 的 buttons=0 分支当成松手而取消拖动。
     // 真拖时按键是按下的（buttons=1）不会走到这条，属于本替代路径的合成限制，如实记在覆盖度里。
     setCursor(10, 10);
     const trPark = waitTransparent(true, 5000);
@@ -402,6 +444,14 @@ async function main() {
     await mouse("mousePressed", center.x, center.y, 1);
     pressed = true;
     await mouse("mouseMoved", center.x + engageDx, center.y, 1);
+    const stepCss = 10;
+    const steps = Math.max(2, Math.ceil((derived.minPx + 6) / stepCss));
+    const dxPhys = Math.round(stepCss * dpr);
+    // 起拖后立刻动窗：拖动期静默兜底只等 250ms（DRAG_SILENCE_MS，G6-02）。先拍快照/跑断言
+    // 再动窗，这段「窗口不动」会被兜底当成松手提前收尾 —— 那是 e2e 的节奏，不是产品行为
+    //（真机上手带着窗口走，不会空 250ms）。所以这里先位移，再补拍起拖状态。
+    await mover.move({ dx: dxPhys, steps, delayMs: 40 });
+    await keepDragAlive(); // 拍快照前续命：别让兜底在这几拍里收尾
     const engaged = await waitFor(async () => {
       const s = await snap();
       return s?.dragging === true ? s : null;
@@ -412,13 +462,6 @@ async function main() {
       true,
       (engaged?.events ?? []).some((e) => e.kind === "beginDrag"),
     );
-
-    const stepCss = 10;
-    const steps = Math.max(2, Math.ceil((derived.minPx + 6) / stepCss));
-    const dxPhys = Math.round(stepCss * dpr);
-    const mmAtEngage = (await snap()).mousemoves;
-
-    await movePetWindow({ dx: dxPhys, steps, delayMs: 40 });
     const gotRight = await waitFor(async () => ((await getState()) === "running-right" ? "running-right" : null), DEADLINE.direction + 800);
     r.check("① 起拖后出现 running-right（读真实 DOM data-pet-state）", "running-right", gotRight ?? (await getState()));
 
@@ -438,6 +481,7 @@ async function main() {
       let sw = switchAfter(swSnap, "running-right", crossRight.moveT);
       if (!sw) {
         // 事件回传与快照可能抢跑：补拍一次（只补数据，不改断言口径）
+        await keepDragAlive(); // 补拍前别让静默兜底把拖动收尾（G6-02）
         await sleep(150);
         swSnap = await snap();
         sw = switchAfter(swSnap, "running-right", crossRight.moveT);
@@ -454,21 +498,21 @@ async function main() {
       );
     }
     const mmAfterRight = sRight.mousemoves;
-    r.check(
-      "方向判定期间页面没有新增 mousemove（判定只靠窗口位移）",
-      mmAtEngage,
-      mmAfterRight,
-    );
+    // 合成 mousemove 只在按下后发过 1 次（起拖那一下）。之后方向判定全发生在窗口位移上：
+    // 计数仍是 1 就说明「切方向靠 mousemove」这条老路没被偷偷捡回来。
+    r.check("方向判定期间页面没有新增 mousemove（判定只靠窗口位移）", 1, mmAfterRight);
 
     // ── ② 反向拖动 ────────────────────────────────────────────────────────────
     r.group("② 反向拖动切到 running-left");
-    await movePetWindow({ dx: dxPhys, steps: 2, delayMs: 40 });
+    await mover.move({ dx: dxPhys, steps: 2, delayMs: 40 });
+    await keepDragAlive(); // 下面要停 120ms + 断言，续一下静默兜底的计时（G6-02）
     await sleep(120);
     r.check("同向继续拖不来回抖（仍是 running-right）", "running-right", await getState());
     const lastRightX = (await snap()).moves.at(-1)?.x ?? rectBefore.left;
     await resetProbe();
+    await keepDragAlive(); // 去抖闸门还要停 80ms，先把「窗口还在动」续上
     await sleep(derived.cooldownMs); // 切向去抖闸门（DRAG_DIRECTION_COOLDOWN_MS）留足余量
-    await movePetWindow({ dx: -dxPhys, steps, delayMs: 40 });
+    await mover.move({ dx: -dxPhys, steps, delayMs: 40 });
     const gotLeft = await waitFor(async () => ((await getState()) === "running-left" ? "running-left" : null), DEADLINE.reverse + 800);
     r.check("② 反向拖动切到 running-left（读真实 DOM data-pet-state）", "running-left", gotLeft ?? (await getState()));
 
@@ -479,6 +523,7 @@ async function main() {
       let swSnap = sLeft;
       let sw = switchAfter(swSnap, "running-left", crossLeft.moveT);
       if (!sw) {
+        await keepDragAlive(); // 补拍前别让静默兜底收尾（G6-02）
         await sleep(150);
         swSnap = await snap();
         sw = switchAfter(swSnap, "running-left", crossLeft.moveT);
@@ -493,6 +538,7 @@ async function main() {
 
     // ── ③ 松手复原 ────────────────────────────────────────────────────────────
     r.group("③ 松手回到拖动前状态（running，不是 idle）");
+    await keepDragAlive(-1); // 当前 committed 方向是左：松手前最后一次续命，确保下面是「拖动中松手」而不是被静默兜底先收尾
     const tRelease = await c.ev("performance.now()");
     await mouse("mouseReleased", center.x + engageDx, center.y, 0);
     pressed = false;
@@ -512,7 +558,7 @@ async function main() {
     r.info("复原延迟", `${restoreLatency}ms`);
 
     const switchesBefore = (await snap()).events.filter((e) => e.kind === "switchTo").length;
-    await movePetWindow({ dx: dxPhys, steps: 2, delayMs: 30 });
+    await mover.move({ dx: dxPhys, steps: 2, delayMs: 30 });
     await sleep(320);
     const sIdleMove = await snap();
     r.check("松手后再挪窗不再改状态（onMoved 拖动分支已关）", switchesBefore, sIdleMove.events.filter((e) => e.kind === "switchTo").length);
@@ -530,12 +576,13 @@ async function main() {
       return s?.dragging === true ? s : null;
     }, 2000);
     r.check("第二次起拖同样进入拖动态", true, engaged2?.dragging === true);
-    await movePetWindow({ dx: -dxPhys, steps, delayMs: 40 });
+    await mover.move({ dx: -dxPhys, steps, delayMs: 40 });
     const gotLeft2 = await waitFor(async () => ((await getState()) === "running-left" ? "running-left" : null), DEADLINE.direction + 800);
     r.check("第二次拖动按方向进入 running-left", "running-left", gotLeft2 ?? (await getState()));
     const s2 = await snap();
     const cross2 = firstCrossing(s2, rectBefore2.left, minPxPhys, -1);
     r.check("第二次拖动同样在跨阈值帧切换", true, cross2 !== null);
+    await keepDragAlive();
     await mouse("mouseReleased", center.x + engageDx, center.y, 0);
     pressed = false;
     const restored2 = await waitFor(async () => ((await getState()) === "running" ? "running" : null), DEADLINE.restore + 900);
@@ -547,7 +594,7 @@ async function main() {
     const wEnd = readPetWindow();
     const backDx = rect0.left - wEnd.rect.left;
     const backDy = rect0.top - wEnd.rect.top;
-    if (backDx !== 0 || backDy !== 0) await movePetWindow({ dx: backDx, dy: backDy, steps: 1 });
+    if (backDx !== 0 || backDy !== 0) await mover.move({ dx: backDx, dy: backDy, steps: 1 });
     const wRestored = readPetWindow();
     r.check("窗口位置已还原到套件开始时", rect0, wRestored.rect);
     setCursor(cursor0.x, cursor0.y);
@@ -557,11 +604,11 @@ async function main() {
     // ── 覆盖度（如实口径） ─────────────────────────────────────────────────────
     r.group("覆盖度（如实口径；未覆盖项不当作通过）");
     r.info("窗口位移由谁产生", "外部 Win32 SetWindowPos → 真 WM_MOVE → tauri://move → onMoved（与鼠标拖拽同一条页面链路）");
-    r.info("起拖由谁触发", "CDP 合成 mousedown + 越过 DRAG_START_PX 的 mousemove → main.ts 自己的起拖分支（beginDrag + startDragging invoke）");
-    r.info("已覆盖", "起拖判定/方向判定/去抖阈值（源码取数）；方向态 DOM 读数；反向切换；松手复原；无 mousemove 反证；穿透与戳一戳回归；二次拖动；阈值帧时序");
-    r.info("未覆盖（需人工）", "真实鼠标按住拖动：OS 拖拽循环（startDragging）本身未被驱动，拖拽循环期间 Moved 是否照样转发只能人工验证；DPI≠100% 与多显示器/负坐标屏未跑");
-    r.info("人工验证步骤", "见 tests/e2e/verify-pet-drag.mjs 文件头「人工验证」段；核心：dev:debug 起实例→按住宠物右拖>24px 应 running-right→反向>24px 应 running-left→松手回拖动前状态");
-    r.info("CI 口径", "本轮不进 .github/workflows/e2e.yml allowlist（CI 不改）；属本机桌面回归，按需手动触发（npm run verify:drag）");
+    r.info("起拖由谁触发", "CDP 合成 mousedown + 越过 DRAG_START_PX 的 mousemove → main.ts 自己的起拖分支（DragController.engage → beginDrag + startDragging invoke）");
+    r.info("已覆盖", "起拖判定/方向判定/去抖阈值（源码取数）；方向态 DOM 读数；反向切换；松手复原；无 mousemove 反证；穿透与戳一戳回归；二次拖动；阈值帧时序；拖动相长间隔用 ±2px 微抖续命（不误踩静默兜底）");
+    r.info("未覆盖（需人工）", "真实鼠标按住拖动：OS 拖拽循环（startDragging）本身未被驱动，拖拽循环期间 Moved 是否照样转发只能人工验证；真机「吞 mouseup」的静默兜底与拖动期真实 blur/宽限只在离线单测用假时钟覆盖，真机未验；DPI≠100% 与多显示器/负坐标屏未跑");
+    r.info("人工验证步骤", "见 tests/e2e/verify-pet-drag.mjs 文件头「人工验证」段（G6-16 六步）：dev:debug 起实例→右拖/反向拖方向态→松手不动鼠标 250ms 内复原→拖动中切窗口不误杀→DPI≠100% 重复→戳一戳与穿透恢复");
+    r.info("CI 口径", "已在 .github/workflows/e2e.yml allowlist（G1-09）；CI 侧要起 dev 实例与真实桌面窗口，按 workflow_dispatch 触发；本地等价命令 npm run verify:drag");
   } catch (err) {
     r.check("套件本身未抛异常", true, false);
     console.error(`\n[套件异常] ${err?.stack ?? err}`);
@@ -580,7 +627,7 @@ async function main() {
         const w = readPetWindow();
         const ddx = rect0.left - w.rect.left;
         const ddy = rect0.top - w.rect.top;
-        if (ddx !== 0 || ddy !== 0) await movePetWindow({ dx: ddx, dy: ddy, steps: 1 });
+        if (ddx !== 0 || ddy !== 0) await mover.move({ dx: ddx, dy: ddy, steps: 1 });
       }
     } catch (err) {
       console.error(`[收尾] 窗口位置还原失败：${err.message}`);
