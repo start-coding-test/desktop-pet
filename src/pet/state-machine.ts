@@ -21,13 +21,87 @@ const REVIEW_CHANCE = 0.35;
 /** 可持续状态的默认停留上限：插件不再续期就回落 */
 const RENEW_HOLD_SECONDS = 45;
 
+/**
+ * 拖动方向判定口径（e2e 复用同一口径）：
+ * 窗口水平净位移达到多少才认方向。与 main.ts 的 6px 起拖阈值分开 ——
+ * 起拖只需证明「按着在动」，认方向要证明「确实往那边拖」。
+ * 取 24px = 起拖阈值的 4 倍：按住时的鼠标微颤（±几 px）和抓取点偏移都到不了这里；
+ * 而正常拖速（≥200 px/s）只要 ≤120ms 就能越过，所以方向态在过阈值后的下一帧就出现，
+ * 远快于「起拖后 300ms 内出现方向态」这条验收线。这里是 CSS px，
+ * main.ts 拿到的是物理像素，判断前先除以 devicePixelRatio，200% 缩放下手感才一致。
+ */
+export const DRAG_DIRECTION_MIN_PX = 24;
+/**
+ * 两次方向切换之间的最短间隔（去抖）：拖动时 Windows 的窗口 Move 事件很密（几十到一百多 Hz），
+ * 没有这道时间闸门时「左右抖一抖」（幅度刚过 24px）会把立绘翻成筛子。
+ * 80ms ≈ 25fps 的两帧：反向切换最多被压后 80ms + 一帧事件（<20ms），仍在「反向 200ms 内切换」的验收线内。
+ * 反向的时间预算 = 攒一个阈值（24px，200px/s 的拖速下 ≈120ms）+ 闸门残留（≤80ms）= ≤200ms；
+ * 正常中途反向时闸门早已过期，实测只有 ~120ms（单测「拖动时序预算」钉住这两个数）。
+ * 注意闸门只压时间、不丢位移：净位移一直攒着，闸门一开立刻判。
+ */
+export const DRAG_DIRECTION_COOLDOWN_MS = 80;
+
 export type PokeZone = "head" | "belly" | "tail";
+
+/** 拖动驱动的两个方向态（petdex 九状态的行 1 / 行 2，见 petdex-states.ts；不新造状态） */
+export type DragDirection = "running-right" | "running-left";
+
+/**
+ * 拖动 → 方向态的判定器：纯逻辑，不碰 DOM、不自己取时钟（`now` 由调用方传入）。
+ *
+ * 为什么放在状态机这一侧而不是 main.ts：main.ts 顶层就摸 document，node 里的离线单测
+ * import 不了它；而「窗口往哪边拖」本来就是方向态的前置判定，放一起才能被
+ * `tests/unit/unit-runtime.mjs` 覆盖到。窗口位置事件（`getCurrentWindow().onMoved`）仍由
+ * main.ts 接 —— 系统级拖拽一开始 webview 就收不到 mousemove/mouseup，能用的只剩窗口自己的位移。
+ */
+export class DragDirectionTracker {
+  /** 自上次认方向以来的水平净位移（CSS px，正 = 向右） */
+  private accum = 0;
+  /** 已认定的方向；null = 还没越过阈值，宠物停在拖动前的姿势 */
+  private committed: DragDirection | null = null;
+  private lastSwitchAt = Number.NEGATIVE_INFINITY;
+
+  /** 起拖：清掉上一次拖动残留的累计量（否则上次往右拖剩的余量会把这次起手判成右） */
+  begin(): void {
+    this.accum = 0;
+    this.committed = null;
+    this.lastSwitchAt = Number.NEGATIVE_INFINITY;
+  }
+
+  /**
+   * 喂一次窗口水平位移（dx 为正 = 窗口向右），返回此刻应显示的方向；null = 还没到阈值。
+   *
+   * 未认定方向时判「净位移」（往右 30px 再往左 20px 净剩 10px 不成方向）；
+   * 认定方向之后，反向进度只由**连续**的反向位移累积：窗口只要往已认定方向挪过一帧
+   *（哪怕 1px），反向进度就清零。这条换来两个性质：
+   *   - 抖动不切：±2px 的往复里反向永远攒不满一个阈值；
+   *   - 反向不等等：不会有「一路向右攒下的余量」替反向买单，最坏情况也只要一个阈值
+   *     （24px，200px/s 的拖速下 ≈120ms，见上方 COOLDOWN 的 200ms 预算）。
+   * 代价是反向途中回拖一下要重新攒，这是刻意的取舍：宁可慢半帧，不可抖。
+   */
+  sample(dx: number, now: number): DragDirection | null {
+    const committedSign =
+      this.committed === "running-right" ? 1 : this.committed === "running-left" ? -1 : 0;
+    if (committedSign !== 0 && Math.sign(dx) === committedSign) this.accum = 0;
+    else this.accum += dx;
+    if (Math.abs(this.accum) < DRAG_DIRECTION_MIN_PX) return this.committed;
+    const dir: DragDirection = this.accum > 0 ? "running-right" : "running-left";
+    if (dir === this.committed) return dir;
+    if (now - this.lastSwitchAt < DRAG_DIRECTION_COOLDOWN_MS) return this.committed;
+    this.committed = dir;
+    this.accum = 0;
+    this.lastSwitchAt = now;
+    return dir;
+  }
+}
 
 // 状态词表完全照搬 petdex 的九个状态（见 petdex-states.ts），不再有 sleep/react/greet 等自造动作。
 // - 手势类（waving/jumping/failed）播完一遍整行时长就回 idle，与 petdex 桌面端 dwell 语义一致
 // - 循环类（running/review/running-left/right）可被重复请求续期，安静 RENEW_HOLD_SECONDS 后回落
 // - waiting 是 petdex 的「耐心待机」变体，本项目用它承担原来的睡觉位（长时间无交互）
 // - request 为插件预留的插播队列入口（pet:react）
+// - running-left/right 另外还由拖动驱动（beginDrag/dragDirection/endDrag）：拖动期不排空队列、
+//   不走到点回落，松手复原到拖动前的姿势；这条路径与 request 的优先级队列互不相交
 export class PetStateMachine {
   private defs: Partial<Record<ActionName, StateDef>> = {};
   private players: Partial<Record<ActionName, FramePlayer>> = {};
@@ -36,6 +110,13 @@ export class PetStateMachine {
   /** 同级/低级请求的排队，上限 3：超限时丢最旧的，避免插件刷屏把队列变成无限缓冲 */
   private queue: ActionName[] = [];
   private sinceInteraction = 0;
+  /**
+   * 拖动前的姿势快照；null = 此刻不在拖动。
+   * 拖动期间立绘由窗口位移驱动（running-left/right），与插件请求互不越界：
+   * 拖动期只暂停本状态机的计时（dwell / 队列出队 / 挂机，见 update），
+   * `request()` 的优先级与排队规则一个字不改。
+   */
+  private dragReturn: ActionName | null = null;
 
   private static readonly MAX_QUEUE = 3;
 
@@ -137,12 +218,63 @@ export class PetStateMachine {
     return this.current;
   }
 
+  /** 是否正被拖动驱动（诊断与回归断言用） */
+  get dragging(): boolean {
+    return this.dragReturn !== null;
+  }
+
+  /**
+   * 起拖：把此刻的姿势记成松手后的复原目标。
+   * 幂等 —— 拖动中重复调用不许改写快照：第二次会把 running-right 记成「拖动前」，
+   * 松手就停在跑步态了（main.ts 的 mousemove 与 mouseup 两条路径都可能走到这里）。
+   */
+  beginDrag(): void {
+    this.sinceInteraction = 0;
+    if (this.dragReturn !== null) return;
+    this.dragReturn = this.current;
+  }
+
+  /**
+   * 拖动中按方向切姿势；null = 还没越过判定阈值，落回拖动前那个姿势（但仍算在拖）。
+   * 只由拖动驱动：不在拖动期时调用一律忽略，插件 `pet:react` 的 request() 语义不受影响。
+   */
+  dragDirection(dir: DragDirection | null): void {
+    if (this.dragReturn === null) return;
+    this.sinceInteraction = 0;
+    const target = dir ?? this.dragReturn;
+    // 重复 set 不重入：不重置播放进度，也不刷 lastSwitchAt（渲染层的弹跳淡入靠它）
+    if (target === this.current) return;
+    this.switchTo(target);
+  }
+
+  /**
+   * 松手：回到拖动前的姿势（拖动前是 waiting 就回 waiting，不是 idle）。可重复调用，第二次起是空操作。
+   * 拖动期间被插件插播（jumping/waving…）时不抢回来：方向态只由拖动驱动，复原也只复原
+   * 「此刻还停在方向态」这一种情况，插件的手势/循环态照它原本的优先级、dwell 与队列自己播完。
+   */
+  endDrag(): void {
+    if (this.dragReturn === null) return;
+    const back = this.dragReturn;
+    this.dragReturn = null;
+    this.sinceInteraction = 0;
+    if (!isDragDirection(this.current) || this.current === back) return;
+    this.switchTo(back);
+  }
+
   /** 当前排队等待插播的状态数（诊断与回归断言用） */
   get queuedCount(): number {
     return this.queue.length;
   }
 
   update(dt: number): void {
+    // 拖动期只推进帧序列（在跑就得动），dwell / 队列出队 / 挂机全部暂停：
+    // 否则一次长拖会被 running-* 的 45 秒续期上限打回 idle，插件的排队请求也会被方向态吃掉。
+    if (this.dragReturn !== null) {
+      this.sinceInteraction = 0;
+      this.players[this.current]!.update(dt);
+      return;
+    }
+
     this.played += dt;
     this.sinceInteraction += dt;
 
@@ -187,4 +319,9 @@ export class PetStateMachine {
 
 function isRenewable(def: StateDef | undefined): boolean {
   return def?.renewable === true;
+}
+
+/** 是不是「拖动驱动的方向态」（复原只认这两种，插件插播的姿势一律让给插件） */
+function isDragDirection(action: ActionName): boolean {
+  return action === "running-left" || action === "running-right";
 }

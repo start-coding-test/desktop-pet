@@ -2,7 +2,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { loadSpriteSet, FRAME_SIZE, type SpriteSet } from "./pet/sprites";
 import { activeSkin } from "./pet/skins";
-import { PetStateMachine, type PokeZone } from "./pet/state-machine";
+import { DragDirectionTracker, PetStateMachine, type PokeZone } from "./pet/state-machine";
 import { pickLine } from "./pet/dialogue";
 import { registerPetController } from "./pet/host";
 import { installClickThrough } from "./pet/click-through";
@@ -126,8 +126,14 @@ function setStatus(pluginId: string, text: string | null): string | null {
 /* ---------- 交互：按住拖拽 vs 戳一戳 ---------- */
 // 按下后移动超过阈值才启动系统级拖拽（拖拽会吞掉后续鼠标事件），
 // 否则抬起视为「戳一戳」：按部位触发反应 + 台词气泡
+/** 起拖阈值（CSS px）：按下后位移超过它才启动系统级拖拽，否则抬起按「戳一戳」处理 */
+const DRAG_START_PX = 6;
 let press: { x: number; y: number } | null = null;
 let dragEngaged = false;
+/** 窗口最近的物理 x（onMoved / outerPosition 维护）：拖动期算水平增量只靠它 */
+let lastWindowX: number | null = null;
+/** 方向判定器（阈值 DRAG_DIRECTION_MIN_PX、去抖 DRAG_DIRECTION_COOLDOWN_MS 都在状态机侧） */
+const dragTracker = new DragDirectionTracker();
 
 function insideSprite(clientX: number, clientY: number): boolean {
   const r = spriteRect();
@@ -136,8 +142,8 @@ function insideSprite(clientX: number, clientY: number): boolean {
 
 document.addEventListener("mousedown", (e) => {
   if (e.button !== 0) return;
+  resetPress(); // 上一趟拖拽的 mouseup 可能没收到：先按「松手」收尾，再记这一次的按下点
   press = { x: e.screenX, y: e.screenY };
-  dragEngaged = false;
 });
 
 document.addEventListener("mousemove", (e) => {
@@ -149,8 +155,12 @@ document.addEventListener("mousemove", (e) => {
     return;
   }
   if (!press || dragEngaged) return;
-  if (Math.hypot(e.screenX - press.x, e.screenY - press.y) > 6) {
+  if (Math.hypot(e.screenX - press.x, e.screenY - press.y) > DRAG_START_PX) {
+    // 起拖：先把此刻姿势记成松手后的复原目标，再交给系统拖拽。
+    // 从这里往后 webview 收不到 mousemove，方向只能从窗口位移推（见 onWindowMoved）。
     dragEngaged = true;
+    pet?.beginDrag();
+    dragTracker.begin();
     void petWindow.startDragging();
   }
 });
@@ -175,7 +185,11 @@ document.addEventListener("mouseup", (e) => {
 
 function resetPress(): void {
   press = null;
+  if (!dragEngaged) return;
   dragEngaged = false;
+  // 松手复原：拖动前是 waiting 就回 waiting，是插件插播就回那条（由状态机的快照决定）
+  pet?.endDrag();
+  dragTracker.begin(); // 清掉这次拖动残留的净位移，下一次从头攒
 }
 
 function hitZone(clientY: number): PokeZone {
@@ -185,6 +199,67 @@ function hitZone(clientY: number): PokeZone {
   if (ny < 0.5) return "head";
   return "belly";
 }
+
+/* ---------- 拖动方向：窗口位移 → running-right / running-left ---------- */
+// 系统级拖拽一开始，webview 就不再收到 mousemove/mouseup，能拿到「被拖到哪边」的只剩窗口自身位置
+// （Rust 侧 WindowEvent::Moved 由 Tauri 转发成前端 onMoved，不新增命令）。
+// 监听生命周期按两条硬要求写：
+//   1) dev 下 main.ts 会被 HMR 重新执行，重复挂监听会让一次移动被处理多遍 → 单飞 + 已挂即退；
+//   2) 窗口拆除（pagehide）时若 unlisten 调了两次，Tauri 会报「callback 不存在」→ onceOnly 包一层。
+let unlistenMoved: (() => void) | null = null;
+let dragTrackingPending = false;
+let dragTrackingDisposed = false;
+
+/** 原生 unlisten 只许调一次：重复 dispose 是幂等的 */
+function onceOnly(unlisten: () => void): () => void {
+  let done = false;
+  return () => {
+    if (done) return;
+    done = true;
+    unlisten();
+  };
+}
+
+/** 拖动期的窗口位移 → 方向态。非拖动期只更新基线，不碰状态机 */
+function onWindowMoved(x: number): void {
+  const prev = lastWindowX;
+  lastWindowX = x;
+  // 第一个采样只用来铺基线：没有上一个点就算不出位移。
+  // 拖动中几乎每帧都有事件，所以这最多丢掉开头一帧的量，紧接着的位移照样把方向判出来。
+  if (!dragEngaged || prev === null || !pet) return;
+  // onMoved 给的是物理像素，阈值口径是 CSS px：除 dpr 让 200% 缩放下手感一致
+  const dx = (x - prev) / (window.devicePixelRatio || 1);
+  pet.dragDirection(dragTracker.sample(dx, performance.now()));
+}
+
+async function installDragTracking(): Promise<void> {
+  if (dragTrackingDisposed || dragTrackingPending || unlistenMoved) return; // 重复 activate 不叠加监听
+  dragTrackingPending = true;
+  try {
+    const un = await petWindow.onMoved(({ payload }) => onWindowMoved(payload.x));
+    if (dragTrackingDisposed) {
+      un(); // 等监听挂上的这段时间窗口已经开始拆了：挂上就立刻摘掉
+      return;
+    }
+    unlistenMoved = onceOnly(un);
+    // 先订阅再读一次位置：反过来的话，两步之间的窗口移动会丢基线；
+    // 只在不被事件填过时才采用（事件载荷比这次 IPC 更新）
+    const pos = await petWindow.outerPosition();
+    if (lastWindowX === null) lastWindowX = pos.x;
+  } catch (err) {
+    console.error("[pet] 监听窗口移动失败", err);
+  } finally {
+    dragTrackingPending = false;
+  }
+}
+
+function disposeDragTracking(): void {
+  dragTrackingDisposed = true;
+  unlistenMoved?.();
+  unlistenMoved = null;
+}
+// 页面要被导航/重载掉时先摘监听，避免往正在拆毁的 IPC 通道里派事件
+window.addEventListener("pagehide", disposeDragTracking, { once: true });
 
 /* ---------- 皮肤：从宿主取当前 Petdex 图集并按 dpr 烘焙 ---------- */
 
@@ -332,6 +407,8 @@ async function init(): Promise<void> {
     setStatus,
   });
 
+  // 拖动方向只能从窗口位移推（系统拖拽吞掉鼠标事件），越早挂越好：第一个 onMoved 只铺基线
+  void installDragTracking();
   void initRuntime();
   setRunning(true);
   void installGameMode({ pause: () => setRunning(false), resume: () => setRunning(true) });

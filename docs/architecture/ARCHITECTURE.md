@@ -195,6 +195,10 @@ export default {
 
 **5. 动画引擎**：序列帧播放器 + 有限状态机，状态词表完全照搬 petdex 的九个状态（行号/帧数/时长见「8. 桌宠形象」），按优先级打断、同级或更低排队（上限 3）。交互语义：摸头→`waving`、戳肚子→`jumping`、拉尾巴→`failed` 并附加抖动；手势类（waving/jumping/failed）播完一遍整行时长回 idle；循环类（`running`/`review`/`running-left|right`）可被重复请求续期，安静 45 秒后自然回落 idle；长时间无交互（180 秒）进入 `waiting`（取代原来的「睡觉」位），任何交互即唤醒。插件只能通过 `pet:react` 请求这九个状态之一（其余名字被能力桥拒绝），不能直接操作画布。Agent 桥的 phase→状态映射也照搬 petdex：`pre`→`running`（只读工具 Read/Grep/Glob →`review`）、`tool-failure`/`stop-failure`→`failed`、`stop`→`waving`、`user-prompt`/`session-start`→`jumping`、`approval-request`/`notification`→`waiting`；会话仍在进行时 `post` 不把姿势打回 `idle`。
 
+**状态与优先级（实际口径，照 `src/pet/state-machine.ts`）**：优先级数值 `idle` 0 < `running-right`/`running-left` 1 < `review` 2 < `running` 3 < `waiting` 5 < `waving`/`jumping`/`failed` 10（`waiting` 的 dwell 是 1e9，只被交互或请求打断）。`request()` 的规则：重复请求当前状态只在 renewable 时续期、否则直接丢弃；优先级高于当前立即打断，同级或更低入队（上限 3，超限丢最旧的）；当前是 `waiting` 时任何请求都可立即打断。`running`/`review`/`running-left`/`running-right` 是 renewable，安静 45 秒（`RENEW_HOLD_SECONDS`）回落 `idle`；手势类播完一整行回 `idle`；非 renewable 状态 180 秒无交互进 `waiting`。
+
+**拖动态（拖动方向态）**：按住宠物移动超过 `DRAG_START_PX`（6 CSS px）才 `startDragging()` 起拖；系统拖拽一开始 webview 就收不到 mousemove/mouseup，方向只能由窗口自身位移推——`src/main.ts` 订阅 `getCurrentWindow().onMoved`（Tauri 转发的 `WindowEvent::Moved`，不新增 Rust 命令），首个采样只铺基线，之后把物理像素除以 `devicePixelRatio` 折成 CSS px 喂给 `DragDirectionTracker`。水平净位移达到 `DRAG_DIRECTION_MIN_PX`（24 CSS px）才认方向（`running-right` 走行 1、`running-left` 走行 2，不新造状态）；已认方向后反向进度只由**连续的**反向位移累积，窗口往已认方向挪过一帧（哪怕 1px）就清零，相邻两次切换至少隔 `DRAG_DIRECTION_COOLDOWN_MS`（80ms，只压时间、不丢位移）。方向路径**不经过 `request()`**：`beginDrag()` / `dragDirection()` / `endDrag()` 直接切状态、不查优先级，不进队列；拖动期 `update()` 只推进帧序列，dwell、队列出队与 180 秒挂机全部暂停，所以**不占** `running-left|right` 的 45 秒续期。`beginDrag()` 把起拖那一刻的 action 记成快照且幂等；松手 `endDrag()` 只在「此刻还停在方向态」时复原快照（起拖前是 `waiting` 就回 `waiting`，不是 `idle`；插件插播留下的姿势不抢回，交回插件按它自己的优先级/dwell/队列处理）。插件的 `pet:react` 在拖动期照旧走 `request()`、优先级与排队规则不变；只要再有窗口位移，方向路径就重新接管（方向态或拖动前姿势），插件插播只存在于两次窗口位移之间。
+
 **6. 心率 BLE 服务**：`btleplug` 双模式——
 
 - a) 广播监听（AdvertisementWatcher 收 ManufacturerData，不建链）；

@@ -172,6 +172,269 @@ group("状态机优先级");
   check("换帧后帧对象是新的", sm.frame !== frameBefore, "还是旧帧");
 }
 
+/* ============================ 拖动驱动方向态（running-left/right） ============================ */
+// 口径与 src/pet/state-machine.ts 的常量一致：起拖 6px（main.ts），认方向要 24 CSS px 净位移，
+// 两次切换至少隔 80ms。e2e 的拖动断言必须复用同一口径，否则两边会在同一段位移上判出不同结果。
+group("拖动方向判定纯逻辑");
+
+{
+  const t = new smod.DragDirectionTracker();
+  t.begin();
+  eq("阈值口径是 24 CSS px", smod.DRAG_DIRECTION_MIN_PX, 24);
+  eq("去抖口径是 80ms", smod.DRAG_DIRECTION_COOLDOWN_MS, 80);
+  eq("零位移不认方向", t.sample(0, 0), null);
+  eq("阈值内的位移（23px）不认方向", t.sample(23, 0), null);
+  eq("越过阈值立刻认右（事件本身就当帧，不另等计时）", t.sample(1, 8), "running-right");
+  eq("同方向的一帧把反向进度清零", t.sample(5, 16), "running-right");
+  eq("反向 20px 还不够", t.sample(-20, 24), "running-right");
+  eq("中途回拖一帧（哪怕 1px）就把反向进度清零", t.sample(1, 32), "running-right");
+  eq("再反向 20px 仍不够", t.sample(-20, 40), "running-right");
+  eq("凑满 -24px 但离上次切换不足 80ms → 仍右（位移不丢）", t.sample(-4, 48), "running-right");
+  eq("闸门到点后同一笔位移立刻切左", t.sample(0, 500), "running-left");
+}
+
+{
+  // 反向只需要一个阈值：不会有「一路向右攒下的余量」替反向买单（否则最坏要 2 个阈值）
+  const t = new smod.DragDirectionTracker();
+  t.begin();
+  eq("先向右 24px", t.sample(24, 100), "running-right");
+  eq("同方向继续走 24px：仍是右，不重置切换时间戳", t.sample(24, 200), "running-right");
+  eq("此时反向 23px 还不够（一个阈值 = 24px）", t.sample(-23, 300), "running-right");
+  eq("反向满 24px 立刻切（没有旧余量挡路）", t.sample(-1, 340), "running-left");
+  eq("零位移保持已认定的方向", t.sample(0, 500), "running-left");
+}
+
+{
+  // 抖动：往复幅度小于阈值时净位移互抵，一次都不该切
+  const t = new smod.DragDirectionTracker();
+  t.begin();
+  const seen = [t.sample(20, 0), t.sample(-40, 40), t.sample(40, 80), t.sample(-40, 120)];
+  deep("±20px 的往复抖动不切换（净位移攒不够一个阈值）", seen, [null, null, null, null]);
+}
+
+{
+  // 时间闸门：位移够了但离上次切换不足 80ms → 先不切，且不丢位移（闸门一开立刻切）
+  const t = new smod.DragDirectionTracker();
+  t.begin();
+  eq("先向右", t.sample(24, 1000), "running-right");
+  eq("40ms 内反向 24px 被闸门压住", t.sample(-24, 1040), "running-right");
+  eq("到 80ms 后同一笔净位移立刻生效（不丢量）", t.sample(0, 1080), "running-left");
+}
+
+{
+  const t = new smod.DragDirectionTracker();
+  t.begin();
+  t.sample(24, 0);
+  t.begin();
+  eq("重新起拖清掉上一次的净位移（不会被旧余量提前判方向）", t.sample(-10, 10), null);
+}
+
+group("拖动时序预算（按 onMoved 帧率喂事件流）");
+
+{
+  // 8ms/帧 = Windows 拖窗口时 Move 事件的常见密度（125Hz 上限，实测几十到一百多 Hz）。
+  // 这里不模拟物理鼠标，只把「窗口每帧移动多少」喂给真实的判定器，验收线因此可测：
+  //   ① 越过 24px 的那一帧就出方向，稳态拖速下 ≪300ms；
+  //   ② 反向从「开始往左拖」到切左 ≤200ms（攒位移 + 80ms 闸门）；
+  //   ③ 幅度小于阈值的往复抖动一次都不切。
+  const TICK = 8;
+  const STEP = 1.6; // 每帧 1.6 CSS px ≈ 200 px/s 的慢速拖
+  const feed = (tracker, frames, dxAt, now0 = 0) => {
+    let now = now0;
+    const marks = [];
+    for (let i = 0; i < frames; i += 1) {
+      now += TICK;
+      marks.push({ now, dir: tracker.sample(dxAt(i, now), now) });
+    }
+    return marks;
+  };
+
+  const t = new smod.DragDirectionTracker();
+  t.begin();
+  const right = feed(t, 200, () => STEP);
+  const firstRight = right.find((m) => m.dir !== null);
+  check(
+    "200px/s 匀速右拖：越过 24px 的那一帧就认右（≈128ms ≪ 300ms 验收线）",
+    firstRight?.dir === "running-right" && firstRight.now <= 300,
+    `first=${firstRight?.now}ms dir=${firstRight?.dir}`,
+  );
+
+  const t2 = new smod.DragDirectionTracker();
+  t2.begin();
+  const warm = feed(t2, 100, () => STEP);
+  const commitAt = warm.find((m) => m.dir !== null).now;
+  const back = feed(t2, 100, () => -STEP, commitAt);
+  const flipped = back.find((m) => m.dir === "running-left");
+  check(
+    "同速反向：从开始往左拖到切 left ≤200ms（含 80ms 闸门，实测≈128ms）",
+    flipped !== undefined && flipped.now - commitAt <= 200,
+    `flip=${flipped?.now}ms after ${commitAt}ms`,
+  );
+
+  const t3 = new smod.DragDirectionTracker();
+  t3.begin();
+  const jitter = feed(t3, 200, (i) => (i % 2 === 0 ? 2 : -2));
+  check(
+    "±2px/帧 的往复抖动（幅度远小于 24px）一次都不切",
+    jitter.every((m) => m.dir === null),
+    `dirs=${[...new Set(jitter.map((m) => m.dir))].join(",")}`,
+  );
+
+  const t4 = new smod.DragDirectionTracker();
+  t4.begin();
+  feed(t4, 40, () => STEP); // 先稳定认右
+  const after = feed(t4, 200, (i) => (i % 2 === 0 ? -2 : 2), 40 * TICK);
+  check(
+    "已认右后再抖：抖动吃不掉方向（净位移始终远小于阈值）",
+    after.every((m) => m.dir === "running-right"),
+    `dirs=${[...new Set(after.map((m) => m.dir))].join(",")}`,
+  );
+}
+
+group("拖动进入与复原");
+
+{
+  const sm = new PetStateMachine(fullSet());
+  eq("没有拖动时 dragging 为 false", sm.dragging, false);
+  sm.dragDirection("running-right");
+  eq("没起拖时方向请求被忽略（方向态只由拖动驱动）", sm.action, "idle");
+  sm.beginDrag();
+  eq("起拖后进入拖动期", sm.dragging, true);
+  eq("起拖本身不改姿势（先停在拖动前的 idle）", sm.action, "idle");
+  sm.dragDirection("running-right");
+  eq("向右拖切 running-right", sm.action, "running-right");
+  const switchedAt = sm.lastSwitchAt;
+  sm.dragDirection("running-right");
+  eq("重复 set 同一方向不重入（不刷 lastSwitchAt）", sm.lastSwitchAt, switchedAt);
+  sm.dragDirection("running-left");
+  eq("拖动中反向立即切 running-left", sm.action, "running-left");
+  sm.update(200);
+  eq("长拖也停得住：dwell 不会把方向态打回 idle", sm.action, "running-left");
+  sm.endDrag();
+  eq("松手回到拖动前的 idle", sm.action, "idle");
+  eq("松手后退出拖动期", sm.dragging, false);
+  const endedAt = sm.lastSwitchAt;
+  sm.endDrag();
+  eq("重复 endDrag 是空操作", sm.lastSwitchAt, endedAt);
+}
+
+{
+  const sm = new PetStateMachine(fullSet());
+  sm.request("waiting");
+  eq("拖动前先在 waiting", sm.action, "waiting");
+  sm.beginDrag();
+  sm.dragDirection("running-right");
+  eq("waiting 也能被拖动切走", sm.action, "running-right");
+  sm.endDrag();
+  eq("拖动前是 waiting 就回 waiting，不是 idle", sm.action, "waiting");
+}
+
+{
+  const sm = new PetStateMachine(fullSet());
+  sm.request("waiting");
+  sm.beginDrag();
+  sm.dragDirection("running-right");
+  sm.beginDrag(); // 拖动中的重复调用：mousemove 与 mouseup 两条路径都可能走到
+  sm.endDrag();
+  eq("重复 beginDrag 不改写复原目标", sm.action, "waiting");
+}
+
+{
+  const sm = new PetStateMachine(fullSet());
+  sm.request("waving");
+  eq("拖动前是手势 waving", sm.action, "waving");
+  sm.beginDrag();
+  sm.dragDirection("running-right");
+  sm.dragDirection(null);
+  eq("还没越过阈值落在 null 上时回到拖动前的姿势", sm.action, "waving");
+  eq("null 不结束拖动期", sm.dragging, true);
+  sm.endDrag();
+  eq("随后松手仍复原到拖动前那条", sm.action, "waving");
+}
+
+{
+  // 拖动前被插件插播占用：复原回插件那条，且插件自己的 dwell 照原样播完
+  const sm = new PetStateMachine(fullSet());
+  sm.request("jumping");
+  eq("插件 pet:react 先占住姿势", sm.action, "jumping");
+  sm.beginDrag();
+  sm.dragDirection("running-left");
+  eq("拖动可以临时接管插件插播的姿势", sm.action, "running-left");
+  sm.endDrag();
+  eq("松手复原到插件那条（不是 idle）", sm.action, "jumping");
+  sm.update(2);
+  eq("复原后插件手势按自己的 dwell 播完", sm.action, "idle");
+}
+
+{
+  // 拖动期不排空队列：插件的排队请求既不被丢掉，也不会被方向态吃掉
+  const sm = new PetStateMachine(fullSet());
+  sm.request("running");
+  sm.request("review");
+  eq("低优先级插件请求排队", sm.queuedCount, 1);
+  sm.beginDrag();
+  sm.dragDirection("running-right");
+  sm.update(120);
+  eq("拖动期不排空插件的排队请求", sm.queuedCount, 1);
+  sm.endDrag();
+  eq("松手复原到拖动前的 running", sm.action, "running");
+  sm.update(46);
+  eq("复原后排队的请求照常出队", sm.action, "review");
+  eq("队列已排空", sm.queuedCount, 0);
+}
+
+{
+  // 优先级规则一个字没改：拖动中被更高级的插件请求打断时，松手不抢回来
+  const sm = new PetStateMachine(fullSet());
+  sm.beginDrag();
+  sm.dragDirection("running-right");
+  sm.request("jumping");
+  eq("拖动中插件插播仍按原优先级立即打断", sm.action, "jumping");
+  sm.endDrag();
+  eq("松手不抢回插件的姿势", sm.action, "jumping");
+  eq("但拖动期确实结束了", sm.dragging, false);
+}
+
+// 接线层（main.ts 顶层就摸 document，node 里 import 不了）：只能钉源码形状。
+// 这三条是「方向确实来自窗口位移」与「监听可注销、不叠加」的静态证据，
+// 运行期证据在 verify 套件/真机拖动里，别把这两类混为一谈。
+group("拖动方向接线（main.ts 形状）");
+
+{
+  const mainSrc = readFileSync(new URL("../../src/main.ts", import.meta.url), "utf8");
+  check(
+    "方向来自窗口真实位移：挂的是 petWindow.onMoved",
+    mainSrc.includes("petWindow.onMoved("),
+    "main.ts 里没有 onMoved",
+  );
+  check(
+    "采样结果交给状态机（方向只从窗口位移进，不从拖拽后的 mousemove 进）",
+    /function onWindowMoved[\s\S]*?pet\.dragDirection\(dragTracker\.sample\(/.test(mainSrc),
+    "onWindowMoved 没把采样交给状态机",
+  );
+  check(
+    "重复 activate 不叠加监听（已挂即退）",
+    mainSrc.includes("if (dragTrackingDisposed || dragTrackingPending || unlistenMoved) return;"),
+    "installDragTracking 缺少单飞守卫",
+  );
+  check(
+    "unlisten 只调一次：原生注销包在 onceOnly 里",
+    mainSrc.includes("unlistenMoved = onceOnly(un);") &&
+      /function onceOnly[\s\S]*?done = true;\s*unlisten\(\);/.test(mainSrc),
+    "onceOnly 缺位或没有幂等",
+  );
+  check(
+    "窗口销毁前摘监听（pagehide）",
+    /addEventListener\("pagehide", disposeDragTracking/.test(mainSrc),
+    "没有 pagehide 收尾",
+  );
+  check(
+    "松手复原走状态机快照（endDrag），main.ts 不自己存姿势",
+    /function resetPress[\s\S]*?pet\?\.endDrag\(\);/.test(mainSrc),
+    "resetPress 没有复原",
+  );
+}
+
 /* ============================ topic 归属 ACL ============================ */
 group("topic-acl");
 

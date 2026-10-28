@@ -2,6 +2,14 @@
 
 项目内所有文档、卡片与代码注释按这些词说话。改术语要先改这里。
 
+## 宠物本体
+
+- **拖动态（drag state）** —— 按住宠物拖动期间由**窗口真实水平位移**驱动的 `running-right` / `running-left`
+  （`getCurrentWindow().onMoved` 喂 `DragDirectionTracker`；系统拖拽一开始 webview 就收不到 mousemove，
+  方向不能从鼠标事件推）。它**不是** `request()` 的排队态：不进优先级队列、不占方向态 45 秒续期，
+  拖动期 dwell / 出队 / 180 秒挂机全停；松手复原起拖那一刻的 action（起拖前是 `waiting` 就回 `waiting`，
+  插件插播留下的姿势不抢回）。回归套件 `npm run verify:drag`；真实鼠标拖动属人工验证项。
+
 ## Agent 联动
 
 - **联动（linkage）** —— 某个编码 Agent 的事件正在驱动桌宠的这一状态。**由宿主持有**

@@ -7,7 +7,7 @@ Tauri 2 + TypeScript/Vite 实现的桌面宠物框架：宠物本体只提供窗
 **宠物本体**
 
 - 透明置顶宠物窗（Canvas2D 图集序列帧）、按 hit-zone 启用点击穿透、可拖拽、托盘、单实例
-- **九个状态的状态机，词表照搬 Petdex**：`idle` / `running-right` / `running-left` / `waving` / `jumping` / `failed` / `waiting` / `running` / `review`，带优先级队列（去重、排队上限 3、可持续状态只续期不排队）
+- **九个状态的状态机，词表照搬 Petdex**：`idle` / `running-right` / `running-left` / `waving` / `jumping` / `failed` / `waiting` / `running` / `review`，带优先级队列（去重、排队上限 3、可持续状态只续期不排队）；按住拖动时按窗口真实水平位移切 `running-right` / `running-left`（`onMoved`，不依赖被系统拖拽吞掉的 mousemove），松手复原拖动前的状态
 - **桌宠形象来自 Petdex 公开画廊**：设置窗输入名字（如 `deepseek`）即下载并切换，默认形象 `deepseek`；本项目不内置、不再分发任何美术文件，仅供学习与自娱自乐
 - 呼吸/轻摆渲染层叠加在真序列帧之上，插件经 `ctx.pet.*` 受控驱动本体
 - 精灵帧按设备像素比烘焙并响应 DPI 变化；渲染循环节流（脏矩形、可见性门控、定时器清理）
