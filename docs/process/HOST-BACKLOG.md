@@ -33,8 +33,8 @@ MVP 范围：<这一轮只做什么>
 |---|---|---|---|---|---|---|
 | S1 | 发布 0.2.0 便携包 | 工程发布 | **已完成**（2026-10-16 用户直接要求出包；B3/B4/A9b 未落地，包按当期 main 切，证据见卡面） | — | `93a6eef` | — |
 | S3 | 发布 0.2.2（安装包 + 便携包） | 工程发布 | **已完成**（2026-10-27；tag `v0.2.2` → `bf585fe`；GitHub Release 双资产；真机 A27/A28/A29/A30/A32/C09/E03 通过，`verify:release` 36/0，main 组合 E2E 五套件全 0；已知项与校验值见发版说明） | — | `bf585fe` | — |
-| S4 | 发布 0.2.3 / 0.2.4 修复轮（tag `v0.2.4` → `b6d98cd`；0.2.3 安装器作废） | 工程发布 | **已出包、GitHub Release 未建；b6d98cd CI 绿（run 40643854516），E2E 门未触发**（2026-10-28；`v0.2.4` annotated tag 已打，0.2.3 安装器内嵌桥为修复前版本、已作废；E2E 本地读数跑在 a18ec21 工作区、不是 tag `b6d98cd` 的字节（`verify:dsh` 套件 a18ec21 才加入，不能当作 0.2.4 包的证据）：`verify` 485/0、`verify:agent` 307/0、`verify:drag` 41/0、`verify:dsh` 43/0（t37 实测，336s、0 rebuild）；注（2026-11-01）：本行 `verify:agent` 307/0 是 2026-10-28 的历史读数，已按 N4 作废，现行基线只认 `.github/workflows/e2e-gate.json` 的 `floorBasis`（303/4，floor 250）；发版清单 [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md)、notes [RELEASE-NOTES-0.2.x.md](RELEASE-NOTES-0.2.x.md)；分支保护未开，需管理员） | — | `b6d98cd`（release）+ `02e5102`（0.2.3）+ `4df82f9`（修复轮） | — |
-| R1 | main CI 红：Rust fmt 门（a18ec21，23 处差异 / 7 文件） | 工程/门禁 | **本地已收口（2026-11-01）/ CI 复验待推送**（本地最终字节 `cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check` 退出 0、0 处 `Diff in`；写模式 fmt 前后 `git diff -- src-tauri/src` 的 sha256 一致＝零字节改动，详见 [ACCEPTANCE-a18ec21-2026-10-29.md](ACCEPTANCE-a18ec21-2026-10-29.md) 的「fmt 收口」节。原判：run 40725727745 / 40725728961，step 12「Rust fmt」失败、13～15 skipped；修复由 t1/t2 在覆盖 `src-tauri/**` 的卡里落地。**CI 侧仍未复验：本地没有推送，没有新 run**） | — | `a18ec21` | — |
+| S4 | 发布 0.2.3 / 0.2.4 修复轮（tag `v0.2.4` → `b6d98cd`；0.2.3 安装器作废） | 工程发布 | **已出包、GitHub Release 未建；b6d98cd CI 绿（run 40643854516），E2E 门未触发**（2026-10-28；`v0.2.4` annotated tag 已打，0.2.3 安装器内嵌桥为修复前版本、已作废；E2E 本地读数跑在 a18ec21 工作区、不是 tag `b6d98cd` 的字节（`verify:dsh` 套件 a18ec21 才加入，不能当作 0.2.4 包的证据）：`verify` 485/0、`verify:agent` 307/0、`verify:drag` 41/0、`verify:dsh` 43/0（t37 实测，336s、0 rebuild）；注（2026-11-01）：本行 `verify:agent` 307/0 是 2026-10-28 的历史读数，已按 N4 作废，现行基线只认 `.github/workflows/e2e-gate.json` 的 `floorBasis`（`verify:agent` 318/0，floor 250；2026-11-01 本机四套全绿后更新）；发版清单 [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md)、notes [RELEASE-NOTES-0.2.x.md](RELEASE-NOTES-0.2.x.md)；分支保护未开，需管理员） | — | `b6d98cd`（release）+ `02e5102`（0.2.3）+ `4df82f9`（修复轮） | — |
+| R1 | main CI 红：Rust fmt 门（a18ec21，23 处差异 / 7 文件） | 工程/门禁 | **已收口（2026-11-01；main CI run `41323567293` 全绿）**（本地最终字节 `cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check` 退出 0、0 处 `Diff in`；写模式 fmt 前后 `git diff -- src-tauri/src` 的 sha256 一致＝零字节改动，详见 [ACCEPTANCE-a18ec21-2026-10-29.md](ACCEPTANCE-a18ec21-2026-10-29.md) 的「fmt 收口」节。原判：run 40725727745 / 40725728961，step 12「Rust fmt」失败、13～15 skipped；修复由 t1/t2 在覆盖 `src-tauri/**` 的卡里落地。CI 已复验：main run `41323567293`（head `33c78d8`）**15 步全绿、250s**，第 12 步「Rust 格式检查」与之后的 clippy / 单测 / Tauri debug 构建全部通过） | — | `33c78d8` | — |
 | R2 | 2026-10-29 验收复核：报告式门禁修复（结构化 skip 计数、gate v2、e2e-extended、NSIS 已知缺口、文档口径） | 工程/门禁 + 文档 | **已放行**（2026-10-29；`.github/workflows/e2e.yml` / `e2e-gate.json` / 新增 `e2e-extended.yml`、`tests/e2e/harness/{cdp,fixtures}.mjs`、`tools/{check-e2e-gate,check-docs,check-nsis-cleanup}.*`、`tests/unit/{harness,unit-nsis-hook}.mjs`、docs；逐项判定与证据见 [ACCEPTANCE-a18ec21-2026-10-29.md](ACCEPTANCE-a18ec21-2026-10-29.md)；离线 `unit` 2241/0、`check:docs` 全绿；fmt 红项见 R1） | — | 本轮工作区（未推送） | — |
 | R3 | 巨型 E2E 文件与超长行排版（G9-08 / G8-02 残余） | 回归/文档 | **待排**（`verify-isolation.mjs` 4064 行、`verify-agent-bridge.mjs` 2372 行；`CONVENTIONS.md` 仍有 8452 字单行与 38 行 >400 字；拆文件与排版不改判据，但改动面大，单开卡） | — | 未提交 | — |
 | R4 | NSIS Case C 真机重跑 + 0.2.4 SHA256 补录（G1-07 / G1-08 真机部分） | 工程发布 | **待排（需真机与打包产物）**（`tools/check-nsis-cleanup.ps1` 现在默认把「被动覆盖摘 hook」判红，真机接受时须显式 `-AcceptKnownGapC`；0.2.4 的 SHA256 仍是「待补录」，需在打好的安装包上实测后写回发版清单） | — | 未提交 | — |
@@ -354,7 +354,7 @@ MVP 范围：<这一轮只做什么>
   `verify-isolation` / `verify-release` 全绿，且探针按新契约重写后仍覆盖
   「settings 区拿得到 `ctx.host.agentHooks`、badge/overlay 区拿不到」这条不变量。
 
-### R1 main CI Rust fmt 红 · 状态：**本地已收口（2026-11-01）/ CI 待复验**
+### R1 main CI Rust fmt 红 · 状态：**已收口（2026-11-01；run `41323567293` 全绿）**
 
 - 目标：把 a18ec21 上 23 处 rustfmt 差异修掉（7 个文件，全部在 `src-tauri/**`），让 `ci.yml` 的
   「Rust fmt」步重新绿。这一步不过，后面的 clippy / `cargo test` / `tauri build` 三步都是 skipped，
@@ -371,8 +371,10 @@ MVP 范围：<这一轮只做什么>
   **t1 的 inScope 排除 `src-tauri/**`**，所以本卡只复核与记账，实现由覆盖 src-tauri 的卡接手
   （builder-2 / builder-3 的文件级认领见团队邮箱）。
 - 验收：新 run 在 main 上 fmt + clippy + `cargo test` 三步全绿，run 号回填状态板 S4/R1 与
-  [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md)。**这一步没做**：本地没有推送（用户未授权），所以 R1 只是
-  「本地已收口」，不是「CI 绿」。
+  [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md)。**已做（2026-11-01 夜）**：修复轮提交 `33c78d8` 已推送 main
+  （用户授权「提交、发版由我自行决策」），CI run `41323567293` 15 步全绿、250s —— 第 12 步 Rust fmt、13 clippy、
+  14 `cargo test`、15 Tauri debug 构建全部 success。R1 从此是「CI 绿」，不再只是本地收口；run 号已回填本行、
+  S4 与发版清单。仍缺的是 E2E 门（`e2e.yml` 的 `workflow_dispatch` 没有触发）。
 
 ### R2 2026-10-29 验收复核修复轮 · 状态：**已放行**
 

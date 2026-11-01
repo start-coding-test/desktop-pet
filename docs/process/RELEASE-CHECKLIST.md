@@ -32,20 +32,24 @@
   `f2e9fd0`（文档）、`a18ec21`（F01′–F06 修复轮）。
 - tag：`v0.2.4`（annotated → `b6d98cd`）**已打**；GitHub Release **未建**（管理员）。
 - CI / E2E 门：`b6d98cd` 的 CI 绿（run `40643854516`，success）；E2E 门（`e2e.yml`）**未触发**。
-  本地读数（工作区、不是 tag 字节）：`verify` 485/0、`verify:agent` 303/4（t38 修复前记录）、
-  `verify:drag` 41/0、`verify:dsh` 43/0；基线见 `.github/workflows/e2e-gate.json`。
-  tag 后 `a18ec21` 的 CI **红在 Rust fmt**（run `40725727745` / `40725728961`），修复见 HOST-BACKLOG R1。
+  本地读数（工作区、不是 tag 字节）：`verify` 485/0、`verify:agent` 303/4（t38 修复前记录；2026-11-01 复跑为 318/0）、
+  `verify:drag` 41/0、`verify:dsh` 43/0；现行基线见 `.github/workflows/e2e-gate.json` 的 `floorBasis`。
+  tag 后 `a18ec21` 的 CI **红在 Rust fmt**（run `40725727745` / `40725728961`）；修复提交 `33c78d8` 的 main CI
+  **全绿**（run `41323567293`，15 步、250s），详见 HOST-BACKLOG R1。
 - 已知事实：0.2.3 安装器**作废**（内嵌收件目录修复前的桥）；0.2.4 修复轮含收件目录回退、CRLF 判据、
   四家卸载断言、13 条恒真断言转真与发版口径纠偏。
 - 产物：`release-package/DesktopPet_0.2.4_x64-setup.exe`、`release-package/DesktopPet-0.2.4/`
   （本地产物、`.gitignore` 覆盖，不作为入库证据）；SHA256 **待补录**（本机未复跑产物校验）。
 - 未验：真机安装/覆盖升级、DSH 真机 `install_bundle` 一次后桌宠联动。
-- **工作区（2026-11-01 修复轮，不是 0.2.4 包字节、未提交、未推送）**：Rust fmt 已收口 ——
+- **2026-11-01 修复轮（提交 `33c78d8`，已推送 main；不是 0.2.4 包字节）**：Rust fmt 已收口 ——
   `cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check` 退出 0、0 处差异，写模式 fmt 前后
-  `git diff -- src-tauri/src` 指纹一致（零字节改动）；离线门 `npm run unit` 2636/0、
+  `git diff -- src-tauri/src` 指纹一致（零字节改动）；离线门 `npm run unit` 2638/0、
   `cargo test` 428/0、`check:docs` / `check:shape` / `check:e2e-gate` / `lint` / `build` 全部退出 0；
-  clippy `-D warnings` 退出 0。**这一步不等于发版前置**：第 1 条（CI 绿）与第 2 条（E2E 门）仍缺新 run，
-  本轮没有推送，所以 0.2.4 的 CI/E2E 读数保持原样（CI 绿 run `40643854516`；E2E 门未触发；本轮 0 条 E2E 读数）。
+  clippy `-D warnings` 退出 0。**CI 已复验**：main run `41323567293`（head `33c78d8`）15 步全绿、250s，
+  原先红的第 12 步「Rust 格式检查」及其后的 clippy / 单测 / Tauri debug 构建全部通过。
+  **E2E 门仍未触发**（`e2e.yml` 是 `workflow_dispatch` + 自托管 runner）；本机 `node tools/e2e-run.mjs` 实测
+  四套全绿：`verify` 485/0、`verify:agent` 318/0、`verify:drag` 41/0、`verify:dsh` 43/0。
+  这一轮**不等于 0.2.4 发版前置**：0.2.4 的包字节仍是 `b6d98cd`，E2E 门没有在 0.2.4 上触发过。
 
 ## 0.2.3（作废）
 
