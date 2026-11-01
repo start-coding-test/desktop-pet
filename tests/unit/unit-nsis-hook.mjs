@@ -10,7 +10,7 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { check, group } from "./harness.mjs";
+import { check, group, skip } from "./harness.mjs";
 import {
   AGENT_ISOLATION_ADAPTERS,
   AGENT_ISOLATION_ENV_NAMES,
@@ -18,6 +18,7 @@ import {
   devAgentHomeDefault,
   devDshHomeDefault,
   hostIsolationProblems,
+  isRealAgentPath,
   realHomeAgentFiles,
   snapshotAgentFiles,
   unknownAgentIsolationAdapters,
@@ -182,7 +183,11 @@ check(
 group("Agent 隔离 env 收口（Bug1 / G2-03）");
 // 反斜杠必须成对写：源里单写 `\U` 会被 JS 当无效转义吃掉，REAL 就退化成 "C:Usersme"，
 // 下面所有 startsWith / 等值判定会全绿但测的是个假路径 —— 所以专门钉一条防住这个坑。
-const REAL = "C:\\Users\\me";
+// 报告 N7 / G2-N10：夹具 home 必须是**当前平台的绝对路径**。Windows 值里写双反斜杠
+// （值里是两个反斜杠），钉住「转义没被吃掉」；POSIX 上这个值会被 resolve 成 cwd 下的
+// 相对路径，仓库又在 tmpdir 下时 case 1412/1419/1422 会跟着 cwd 漂，所以非 Windows
+// 用绝对 home `/home/me`。
+const REAL = process.platform === "win32" ? "C:\\Users\\me" : "/home/me";
 const TEMP_ROOT = tmpdir();
 const tempPath = (...parts) => join(TEMP_ROOT, "pet-iso-fixtures", ...parts);
 const tempIsolation = () =>
@@ -190,7 +195,25 @@ const tempIsolation = () =>
     PET_AGENT_CONFIG_FILES: `${tempPath("a.json")};${tempPath("b.json")}`,
     PET_AGENT_HOME: tempPath("agent-home"),
   });
-check("夹具 home 是带反斜杠的 Windows 路径（转义没被吃掉）", REAL.includes("\\Users\\me"), REAL);
+check(
+  "夹具 home 是绝对路径（转义没被吃掉；POSIX 上不会退化成 cwd 相对路径）",
+  process.platform === "win32" ? /^[A-Za-z]:\\Users\\me$/.test(REAL) : REAL === "/home/me",
+  REAL,
+);
+// 报告 N6 / G2-N6：Windows 默认 TEMP 在 %USERPROFILE%\AppData\Local\Temp 下，
+// 「在真实 home 下就判红」会把所有合法夹具误判成写到真实配置。反例钉住修好后的判据：
+// home 下的 TEMP 不红；home 下的已知 agent 目录（.codex）仍红；home 本身仍红。
+check(
+  "反例：真实 home 下的 TEMP 子目录不算真实配置（Windows 默认布局，G2-N6）",
+  isRealAgentPath(join(REAL, "AppData", "Local", "Temp", "pet-iso", "a.json"), REAL) === false,
+  join(REAL, "AppData", "Local", "Temp", "pet-iso", "a.json"),
+);
+check(
+  "反例：真实 home 下的 .codex 仍判真实配置",
+  isRealAgentPath(join(REAL, ".codex", "hooks.json"), REAL) === true,
+  join(REAL, ".codex", "hooks.json"),
+);
+check("反例：真实 home 本身仍判真实配置", isRealAgentPath(REAL, REAL) === true, REAL);
 check(
   "一个隔离变量都没设：四家全裸奔",
   JSON.stringify(unisolatedAgentAdapters({}, REAL)) === JSON.stringify(["qoder", "zcode", "codex", "workbuddy"]),
@@ -408,8 +431,17 @@ const PS_SHELL =
   ["pwsh", "powershell"].find(
     (exe) => spawnSync(exe, ["-NoProfile", "-Command", "exit 0"], { encoding: "utf8" }).status === 0,
   ) ?? "";
+// 报告 N7 / G2-N10：没有 pwsh 是环境缺失，不是回归。旧写法在没有 shell 时仍然 spawn
+// "pwsh"，失败后把 shell= status=null 当红断言 —— Linux 上的离线门因此永远跑不绿。
+// 这里改成 skip（单独计数，不算通过），有 pwsh 的机器上仍按行为判据真跑。
+if (PS_SHELL === "") {
+  skip("手动脚本的隔离 guard 用 pwsh 真跑反例（G7-09）", "本机没有 pwsh / powershell（环境缺失，离线门不执行 PowerShell 自检）");
+  skip("guard 反例覆盖四家的变量（含 G2-04 的 CODEX / WORKBUDDY、G2-06 的 DSH、A3 的两条子规则）", "环境缺失：没有 pwsh");
+  skip("每条 dsh-home-* 都在 guard 真跑输出里（名单与 ps1 双向一致）", "环境缺失：没有 pwsh");
+  skip("guard 反例含「只设了文件变量、home 没设」这条（fail-closed）", "环境缺失：没有 pwsh");
+} else {
 const guardRun = spawnSync(
-  PS_SHELL || "pwsh",
+  PS_SHELL,
   ["-NoProfile", "-NonInteractive", "-File", join(REPO, "tools/check-nsis-cleanup.ps1"), "-GuardSelfTest"],
   { encoding: "utf8" },
 );
@@ -456,6 +488,7 @@ check(
   guardCases.some((line) => line.includes("config-only-leaves-home-unset")),
   guardCases.join(" | "),
 );
+} // end of "pwsh 可用" 分支
 
 // 套件那条路：cleanup 子进程的 env 必须来自同一份收口，而不是各拼一份
 const bridge = read("tests/e2e/verify-agent-bridge.mjs");
@@ -471,3 +504,24 @@ check("cleanup 跑完显式判真实 home 的条数未变", bridge.includes("rea
 // （tools/check-nsis-cleanup.ps1 的 BEFORE/AFTER 段）只在**真跑安装/卸载**时执行 —— 需要装好的
 // NSIS 安装包与本机卸载流程；`-GuardSelfTest` 只跑隔离守卫，不执行那两段。离线单测没有行为级钉子
 // （最多也只能核源码里那几行存在），不要把「self-test 全绿」当 BEFORE/AFTER 的行为证据。
+
+// G1-08：Case C 被动覆盖把 hook 摘掉时，旧脚本只打 Note 然后当成通过。现在默认判红、
+// 必须显式给 -AcceptKnownGapC 才算「记录已知缺口」。这段也是**接线检查**：真跑 /P 需要
+// 装好的安装包（见上一条边界），离线只能钉住「默认红 / 接受时明说」这两句话还在。
+group("NSIS 已知缺口口径（G1-08）");
+const nsisPs1 = read("tools/check-nsis-cleanup.ps1");
+check(
+  "Case C 有显式接受开关（param 声明 [switch] $AcceptKnownGapC）",
+  nsisPs1.includes("[switch] $AcceptKnownGapC"),
+);
+check(
+  "Case C 默认判红，且报错文案点名 -AcceptKnownGapC",
+  nsisPs1.includes("if (-not $AcceptKnownGapC)") &&
+    nsisPs1.includes("Fail (\"case C: passive overwrite stripped the pre-uninstall hooks") &&
+    nsisPs1.includes("re-run with -AcceptKnownGapC"),
+);
+check(
+  "接受缺口时写 KNOWN GAP ACCEPTED 且不写成 Pass",
+  nsisPs1.includes("KNOWN GAP ACCEPTED (-AcceptKnownGapC): recorded explicitly, NOT a pass"),
+);
+

@@ -40,6 +40,36 @@ async function pollUntil(fn, timeoutMs = 10_000, intervalMs = 250) {
   }
   return null;
 }
+
+/**
+ * 采样窗口内一直保持某个值（G7-06 的修法）。
+ * 固定 sleep(800) 之后只读一次，等于赌「这一瞬间正好没被冲掉」：采样点早一点就假绿、
+ * 机器慢一点就假红。改成在整个窗口里连续采样，任一次偏离就当场判失败并带上样本序列。
+ */
+async function constantFor(read, want, windowMs = 1_600, stepMs = 100) {
+  const samples = [];
+  const until = Date.now() + windowMs;
+  do {
+    const value = await read().catch(() => null);
+    samples.push(value);
+    if (value !== want) return { ok: false, samples };
+    await sleep(stepMs);
+  } while (Date.now() < until);
+  return { ok: true, samples };
+}
+
+/** 窗口内不许出现新的推送（G7-15）：早停比睡满 10 秒更快暴露，也照样记足观测时长。 */
+async function quietFor(read, windowMs = 10_000, stepMs = 500) {
+  const start = Date.now();
+  let last = await read();
+  while (Date.now() - start < windowMs) {
+    await sleep(stepMs);
+    const now = await read();
+    if (now !== last) return { ok: false, from: last, to: now, atMs: Date.now() - start };
+    last = now;
+  }
+  return { ok: true, count: last, windowMs: Date.now() - start };
+}
 const r = createReport("GOAT 用量插件（dev）");
 
 let c = null;
@@ -295,6 +325,11 @@ try {
 
   r.group("启用与授权");
   await writeEnabledIds(settings.invoke, [...safeOrigEnabled, PID]);
+  // G7-07：启用集必须是本套件显式写下的那一份（orig 里剔掉 hr-ble/zz 探针 + goat），
+  // 不能靠「机器上本来就开着什么」碰运气 —— 空态与共存判据都受它影响。
+  const explicitEnabled = [...safeOrigEnabled, PID].slice().sort();
+  const appliedEnabled = (await readEnabledIds(invoke)).slice().sort();
+  r.check("启用集按显式清单落盘", JSON.stringify(explicitEnabled), JSON.stringify(appliedEnabled));
   await reloadAndWait(c);
   await setupBus();
 
@@ -319,11 +354,12 @@ try {
     wanted.length > 0 && wanted.every((cap) => caps.has(cap)) && caps.size === wanted.length,
   );
 
-  // #widget-badge 的宽度会被共存插件的 badge 撑开（例如同时启用 A股盯盘），块级插槽会继承这个宽度；
-  // 空态要看 goat 插槽自己的高度与内容，不能把父容器的宽度算成它的尺寸。高度 0 且无文本才是真的没渲染。
+  // #widget-badge 的宽度会被共存插件的 badge 撑开（例如同时启用 A股盯盘），块级插槽会继承这个宽度，
+  // 所以宽度不能当判据；closed shadow 里的文案从宿主这侧读不到（host.textContent 恒为空），
+  // 拿它判「没渲染」永远成立 —— 那是把判据悄悄放宽（G7-07）。空态只认插槽自身高度为 0。
   const empty = await waitUntil(
     c,
-    `(() => { const n = document.querySelector(${JSON.stringify(badgeHost)}); if (!n) return false; const b = n.getBoundingClientRect(); return b.height === 0 && !n.textContent.trim(); })()`,
+    `(() => { const n = document.querySelector(${JSON.stringify(badgeHost)}); if (!n) return false; const b = n.getBoundingClientRect(); return b.height === 0; })()`,
     10_000,
   );
   if (!empty) {
@@ -598,8 +634,9 @@ try {
     return current?.overlayX === 301 && current?.currency === "CNY" ? current : null;
   }, 8_000);
   r.check("推送确实进到了插件（改了坐标而 currency 仍是 CNY）", true, !!pushed);
-  await sleep(800);
-  r.check("推送不回显用户还没应用的选择", "USD", String(await readCurrencySel()));
+  const keptUsd = await constantFor(readCurrencySel, "USD", 1_600, 100);
+  r.check("推送不回显用户还没应用的选择（1.6s 内逐次采样都是 USD）", true, keptUsd.ok);
+  if (!keptUsd.ok) r.info("采样序列", JSON.stringify(keptUsd.samples));
   // 反向判据：配置追上所选后锁要放开，之后的外部改动照样进得来（别写成永不复位）
   await send({ action: "saveConfig", config: { currency: "USD" } });
   r.check(
@@ -607,7 +644,9 @@ try {
     true,
     !!(await pollUntil(async () => ((await storeGet("config"))?.currency === "USD" ? true : null), 8_000)),
   );
-  await sleep(800);
+  const keptUsd2 = await constantFor(readCurrencySel, "USD", 1_600, 100);
+  r.check("配置追上所选后编辑锁放开（1.6s 内仍是 USD）", true, keptUsd2.ok);
+  if (!keptUsd2.ok) r.info("采样序列", JSON.stringify(keptUsd2.samples));
   await send({ action: "saveConfig", config: { currency: "CNY" } });
   const backCny = await pollUntil(async () => {
     const value = await readCurrencySel();
@@ -757,9 +796,10 @@ try {
   );
   r.check("停用生效确认（isActive=false）", true, inactive);
   const widgetCountBefore = await widgetTimeline("停用确认后");
-  await sleep(10_000);
-  const widgetCountAfter = await widgetTimeline("观察 10 秒后");
-  r.check("停用后 10 秒没有新的 :widget 推送", widgetCountBefore, widgetCountAfter);
+  const quiet = await quietFor(() => widgetTimeline("观察窗口采样"), 10_000, 500);
+  const widgetCountAfter = await widgetTimeline("观察窗口结束");
+  r.check("停用后 10 秒窗口内没有新的 :widget 推送", true, quiet.ok && widgetCountBefore === widgetCountAfter);
+  if (!quiet.ok) r.info("窗口内出现推送", JSON.stringify(quiet));
   const hidden = await pollUntil(
     async () => !(await overlayVisible().catch(() => true)),
     12_000,
@@ -809,7 +849,7 @@ try {
     const clearedOnline = await clearCred();
     r.check("在线真实 Key 已从插件存储清空", true, !!clearedOnline);
   } else {
-    r.info("在线组已跳过", "需要同时设置 GOAT_GAUGE_KEY 与 GOAT_GAUGE_ONLINE=1");
+    r.skip("在线组", "需要同时设置 GOAT_GAUGE_KEY 与 GOAT_GAUGE_ONLINE=1；CI runner 不配密钥");
   }
 
   r.group("零噪音");

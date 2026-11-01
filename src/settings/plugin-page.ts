@@ -4,6 +4,7 @@ import { validateManifest } from "../runtime/plugin-runtime";
 import { widgetHost } from "../runtime/widget-host";
 import { $, el } from "./dom";
 import { enabledSet } from "./nav";
+import { showNotice } from "./notice";
 import { manifests, mountedFor, selected, setMountedFor } from "./state";
 
 /* ---------- 插件页：壳由宿主给，中间那块由插件自己渲染 ---------- */
@@ -12,9 +13,47 @@ export async function detachWidget(): Promise<void> {
   if (!mountedFor) return;
   const id = mountedFor;
   setMountedFor(null);
-  await widgetHost.unmount(id);
+  // widget 卸载失败不该把「切页」这一步带崩（不然换插件时整窗停在旧页）
+  await widgetHost.unmount(id).catch((error) => {
+    console.error(`[settings] 卸载 ${id} 的插件页失败`, error);
+  });
   const box = $<HTMLDivElement>("plugin-settings");
   box?.replaceChildren();
+}
+
+/**
+ * chips 是 manifest **声明**的能力，不是授权记录（N8：不能假装有授权）。
+ * 授权表的事实来源在宿主：逐项问 `permission_check`，把「已授权几项」写在 chips 下面；
+ * 问不到就明说「未知」，不拿声明冒充记录。
+ */
+async function fillGrantHint(
+  pluginId: string,
+  declared: readonly string[],
+  hint: HTMLElement
+): Promise<void> {
+  if (declared.length === 0) {
+    hint.textContent = "该插件没有声明需要授权的能力";
+    return;
+  }
+  let granted: boolean[] | null = null;
+  try {
+    granted = await Promise.all(
+      declared.map((capability) => hostCall<boolean>("permission_check", { pluginId, capability }))
+    );
+  } catch (error) {
+    console.error(`[settings] 查询 ${pluginId} 的授权状态失败`, error);
+    granted = null;
+  }
+  if (!hint.isConnected) return; // 页面已经切走，别把结果写到新页面上
+  if (!granted) {
+    hint.textContent = `授权状态未知（宿主未应答）：${declared.length} 项声明能力会在首次调用时弹确认框`;
+    return;
+  }
+  const yes = granted.filter(Boolean).length;
+  hint.textContent =
+    yes > 0
+      ? `已授权 ${yes}/${declared.length} 项；其余能力首次调用时弹确认框`
+      : "当前没有已授权能力；首次调用时宿主会弹确认框";
 }
 
 export async function renderPluginPage(): Promise<void> {
@@ -47,6 +86,14 @@ export async function renderPluginPage(): Promise<void> {
       // 不再在调用点硬编码名字 —— 名单里加一条同样有副作用的能力就自动被标险
       perms.append(el("span", p, "perm-chip" + (RISK_FLAGS.includes(p) ? " warn" : "")));
     }
+    // 声明 ≠ 已授权：单独一行说清授权表的实况（N8）
+    const hint = el("span", "授权状态查询中…", "perm-hint");
+    perms.append(hint);
+    void fillGrantHint(
+      manifest.id,
+      manifest.permissions ?? [],
+      hint
+    );
     if ((manifest.permissions ?? []).length > 0) {
       const revoke = el("button", "撤销授权", "btn-revoke");
       revoke.type = "button";
@@ -91,10 +138,19 @@ export async function renderPluginPage(): Promise<void> {
             await hostCall("permission_revoke", { pluginId: manifest.id });
             revoke.textContent = alsoUninstall?.checked ? "已撤销（含卸载 hook）" : "已撤销（仅能力）";
             revoke.disabled = true;
+            // 撤销是宿主端的真动作：撤销后重新问一次授权表，别让「声明列表」继续冒充记录
+            void fillGrantHint(manifest.id, manifest.permissions ?? [], hint);
+            showNotice(
+              alsoUninstall?.checked
+                ? `已撤销「${manifest.name || manifest.id}」的全部能力，并卸载了 Agent hook`
+                : `已撤销「${manifest.name || manifest.id}」的全部能力；它下次调用会重新弹确认框`,
+              "info"
+            );
           } catch (err) {
             // 撤销现在是宿主端会失败的命令（门禁、非法 id），不能装成成功
             revoke.textContent = `撤销失败：${hostErrorMessage(err)}`;
             go.disabled = false;
+            showNotice(`撤销「${manifest.name || manifest.id}」的授权失败：${hostErrorMessage(err)}`);
           }
           strip.remove();
         });

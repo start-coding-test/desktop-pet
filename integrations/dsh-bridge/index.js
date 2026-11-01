@@ -13,7 +13,7 @@
 // %APPDATA%\com.desktoppet.pet\agent\inbox。与宿主
 // `src-tauri/src/services/agent/inbox.rs::inbox_dir` 的前两级完全一致，第三级是宿主的
 // `app_data_dir_standalone()`（identifier 见 `src-tauri/tauri.conf.json`）。
-import { appendFile, mkdir, stat } from "node:fs/promises";
+import { appendFile, mkdir, rename, stat, unlink } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 import { eventLine, isSubagent, sessionEndLine, sessionStartLine } from "./mapping.js";
 
@@ -142,13 +142,14 @@ export function resolveInbox(config, env = process.env, pathApi = { isAbsolute, 
  *
  * G6-11 的三道上限都在这一层：桌宠侧没有「拒绝接收」的回执，桥如果无脑追加，
  * 一次跑飞的事件流就能把磁盘写满；而卸载/断开之后桥仍可能活着（桥住在 DSH 里），
- * 上限是它最后一道自保。超限只报告一次并丢掉那一条，绝不反过来弄坏会话。
+ * 上限是它最后一道自保。单行超限、排队超限丢掉那一条；文件到上限则轮换成 `.1`
+ * 再接着追加（N2：旧实现到上限就永久丢行，宿主清空文件后桥也永远不知道）。
  */
 export function createSink(inbox, report) {
   const chains = new Map();
   const pending = new Map();
-  const sizes = new Map();
   const reported = new Set();
+  const rotated = new Set();
   let ready = false;
 
   const ensureDir = async () => {
@@ -157,12 +158,21 @@ export function createSink(inbox, report) {
     ready = true;
   };
 
-  const sizeOf = async (path) => {
-    if (sizes.has(path)) return sizes.get(path);
-    return stat(path).then(
+  // N2：每次写前都 stat，不缓存。宿主在超过 2MiB 时会把收件文件清空，
+  // 而「只增不减」的缓存会让桥把盘上已经 0 字节的文件记成 2MiB —— 之后
+  // 每一行都撞 8MiB 上限，桥永久静默，桌宠那头却一条也收不到。
+  const sizeOf = async (path) =>
+    stat(path).then(
       (info) => info.size,
       () => 0,
     );
+
+  // 到上限不是「永久拒收」而是轮换：`<phase>.jsonl` → `<phase>.jsonl.1` 后重新追加，
+  // 只留一份旧文件（桌宠的收件侧本来就按行追读，旧文件看一眼就够）。
+  // 轮换失败不抛：下一次 stat 仍会看到真实大小，最坏只是继续追加。
+  const rotate = async (path) => {
+    await unlink(`${path}.1`).catch(() => {});
+    await rename(path, `${path}.1`).catch(() => {});
   };
 
   const once = (kind, err) => {
@@ -190,10 +200,12 @@ export function createSink(inbox, report) {
         await ensureDir();
         const size = await sizeOf(path);
         if (size + bytes > MAX_FILE_BYTES) {
-          once("file-limit", new Error(`${path} 已到 ${MAX_FILE_BYTES} 字节上限`));
-          return;
+          await rotate(path);
+          if (!rotated.has(path)) {
+            rotated.add(path);
+            report(`${path} 已到 ${MAX_FILE_BYTES} 字节上限，轮换为 ${path}.1 后继续追加`);
+          }
         }
-        sizes.set(path, size + bytes);
         await appendFile(path, text, "utf8");
       })
       .catch((err) => once(err?.code ?? "unknown", err))

@@ -69,9 +69,12 @@
 审计给的两个做法是二选一：① 要求显式总开关 `PET_AGENT_TEST_ISOLATION=1`；② 命中时输出 `override=`。
 **选②：变量在所有构建里照旧生效，但凡是换了根的进程都要自己把它说出来。**
 
-- 可见处：`agent_hooks_status` 的 `everywhere.overrides`（数组）、启动清理与 `--pet-hook-cleanup`
-  的摘要行、安装自检的日志增量说明，都按同一份 `adapters::active_overrides()` 输出
-  `override=<名字列表>`。设置页与 e2e 的隔离守卫读的是同一份回报，不再各自拼 env 去猜。
+- 可见处：`agent_hooks_status` 的 `everywhere.overrides`（数组）、启动时的换根日志
+  （`linkage::startup` 的 `log::warn!("hook 路径被环境变量改写: override=…")`）、清理分支
+  打在 stdout 的摘要行（`override=<名字列表|none>`），都按同一份
+  `adapters::active_overrides()` 输出。设置页与 e2e 的隔离守卫读的是同一份回报，不再各自拼
+  env 去猜。**装后自检（`agent_hooks::self_check`）不输出 `override=`**：它只报盘上核对与
+  日志增量的结果，换根信息要去 `everywhere.overrides` 或启动日志里读（N9④ 纠偏）。
 
 否决①的理由：总开关只是把「静默」从命中挪到未命中 —— 没设开关时变量失效、宿主静默退回真实
 home，而那个方向的副作用恰好是本 ADR 要避免的「用户以为关了、我们却还在动他的配置」。
@@ -83,13 +86,18 @@ home，而那个方向的副作用恰好是本 ADR 要避免的「用户以为�
 所以「同一时间只联动一个」「卸载要摘全部四家」这两条不变量在 e2e 里按这份回报判定，
 不再让套件自己拼 env 去猜。
 
-## 补记（2026-10-28，G2-09 复核 + G2-11：再启用的同意与无日志自检口径）
+## 补记（2026-10-28，G2-09 复核 + G2-11：再启用的确认门与无日志自检口径；2026-11-01 N8 纠偏）
 
-确认门（`[need-confirm]`）是「拨开用户总开关」的前置条件，只有**用户动作**能替用户同意：
+确认门（`[need-confirm]`）只认**宿主能证明是用户动作**的那条路径：
 
-- 用户在设置页重新勾选启用插件（`plugin_enabled_set`）视为对恢复总开关的同意 —— 停用时
-  `uninstall_restoring_switch` 把开关还原成用户原来的 false，再启用必须能把它装回来，
-  否则「停用→再启用」走一次就永久丢掉安装（G2-09 / t38-A）。
+- **「重新勾选启用插件」不算同意**（N8 纠偏，2026-11-01）：`plugin_enabled_set` 与启停清单
+  迁移都调 `linkage::reconcile(...)`，自动路径的安装确认位恒为 `false`（`linkage::apply` 里
+  `install(adapter, &files, Some(data.as_path()), false)`）。需要用户拍板的客户端（ZCode /
+  Codex 的 hooks 总开关是这样写的）只会拿到 `[need-confirm]` 报告，配置文件一个字都不动。
+  用户要装回总开关，得自己在设置页按「安装」并在确认条上按「仍要打开」
+  （`agent_hooks_install(confirm=true)`）。
+- 先前那版把 `plugin_enabled_set` 传成 `UserConfirmed`、把「勾一下插件」当同意，等价于静默
+  拨开用户关掉的 hook 总开关；该枚举已删除 —— **只有显式带 `confirm=true` 的按钮路径是同意**。
 - 启动补写、启停清单迁移、插件目录扫描三条自动路径都不是用户动作，仍走严格确认门：
   需要确认的客户端拿到 `[need-confirm]` 报告，配置文件一个字都不动。
 

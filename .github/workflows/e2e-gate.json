@@ -1,5 +1,10 @@
 {
-  "comment": "E2E gate config for .github/workflows/e2e.yml (G1-05/G1-06/G1-09). Floors are ~80% of the 2026-10-28 measured baselines: verify 485/0, verify:agent 303/4 (the 4 reds are the pre-t38 state: t38's fix is not merged here yet, refresh this baseline after t37 backfills it and never record it as green meanwhile), verify:worker 66/0, verify:todo 31/0, verify:game 15/0, verify:goat-gauge 76/0, verify:drag 41/0, verify:dsh 43/0. add assertions freely, but cutting a big group must lower the floor in the same commit, never silently.",
+  "comment": "E2E 门的唯一配置源（G1-05 / G1-06 / G1-09 / N2 / N4）。改这里的规矩：加断言不用动它；砍掉一大组断言必须同一次提交里把 minAssertions 往下调，并在 PR 里写清为什么；新增或下线套件要同时改 modes、package.json 和 tools/check-e2e-gate.mjs 的离线核对。套件读数（N/0）只许写在本文件的 floorBasis 里 —— 别再抄进 CONVENTIONS / AGENTS / RELEASE-NOTES，同一提交出现两个基线就是 N4 那种自相矛盾。",
+  "version": 2,
+  "modes": {
+    "core": ["verify", "verify:agent", "verify:worker", "verify:todo", "verify:game", "verify:goat-gauge", "verify:drag", "verify:dsh"],
+    "extended": ["verify:skin", "verify:astock", "verify:http", "verify:release"]
+  },
   "minAssertions": {
     "verify": 400,
     "verify:agent": 250,
@@ -10,21 +15,41 @@
     "verify:drag": 32,
     "verify:dsh": 34
   },
-  "skipMarkers": [
-    "跳过"
-  ],
-  "knownEnvFailures": [
+  "floorBasis": {
+    "verify": "485/0（2026-11-01 本机复跑一致；2026-10-28 首测同读数）",
+    "verify:agent": "318/0（2026-11-01 本机 E2E 四套全绿；比 307/0 多 11 条是 t9 新增的确认链断言）。303/4 是 t38 修复前的历史读数；307/0 没有对应 run 或提交，作废（N4）。",
+    "verify:worker": "66/0（2026-10-28）",
+    "verify:todo": "31/0（2026-10-28）",
+    "verify:game": "15/0（2026-10-16 run 38832007396）",
+    "verify:goat-gauge": "76/0（2026-10-28）",
+    "verify:drag": "41/0（2026-10-28）",
+    "verify:dsh": "43/0（2026-10-28）"
+  },
+  "floorPending": {
+    "verify:skin": "extended 模式：还没有本地基线读数。第一次跑绿后用当次 passed 数回填 minAssertions，并在卡 F2 里留 run 号。",
+    "verify:astock": "extended 模式：要联网取行情，先确认离线夹具够用再定下限（卡 F2）。",
+    "verify:http": "extended 模式：依赖外网白名单域名，先定「哪些域名缺席算环境缺失」再定下限（卡 F2）。",
+    "verify:release": "extended 模式：要打包产物（npx tauri build），在 core 门里跑不起；下限待补（卡 F2）。"
+  },
+  "allowedSkips": [
     {
-      "suite": "verify",
-      "match": "默认值本身必须能设",
-      "reason": "Ctrl+Alt+P is already registered by another app on this runner; set PET_HOTKEY_DEFAULT (E02) or free the key",
-      "expires": "2026-12-31"
+      "suite": "verify:goat-gauge",
+      "match": "在线组",
+      "reason": "在线组要真实 GOAT_GAUGE_KEY 与 GOAT_GAUGE_ONLINE=1，CI runner 不配密钥；离线组的判据仍须全绿",
+      "expires": "2027-06-30"
     },
     {
       "suite": "verify",
-      "match": "D07 预置 fixture 缺失",
-      "reason": "preseeded fixtures missing; start the instance with PET_E2E_PRESEED=1 (D07) instead of waiving this",
-      "expires": "2026-12-31"
+      "match": "迁移原样回读断言",
+      "reason": "CI 每次都是 fresh 实例：宿主清单文件还没写过时迁移不落盘，这条断言只在已有清单的环境里有意义",
+      "expires": "2027-06-30"
+    },
+    {
+      "suite": "verify",
+      "match": "ble_disconnect 空操作断言",
+      "reason": "runner 上没有已连接的心率设备；套件按设计不去动别人的设备，有设备在场时这条会真跑",
+      "expires": "2027-06-30"
     }
-  ]
+  ],
+  "knownEnvFailures": []
 }

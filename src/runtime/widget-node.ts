@@ -36,6 +36,8 @@ export class WidgetRenderSession {
   private seq = 0;
   private pending: WidgetOp[] = [];
   private flushScheduled = false;
+  /** 停用终态：置位后所有写入都是空操作（避免插件残留回调把已下线的 widget 复活） */
+  private disposed = false;
   private readonly nodes = new Map<number, WidgetNode>();
   private readonly handlers = new Map<number, Map<string, (event: WidgetEvent) => void>>();
 
@@ -59,6 +61,9 @@ export class WidgetRenderSession {
   }
 
   enqueue(op: WidgetOp): void {
+    // 停用后的迟到写入一律丢弃（附录2 N7）：插件留下的定时器 / await 回来时仍会调
+    // `el.textContent = ...`，这些 op 发出去只会落在一个已经不存在的插槽上。
+    if (this.disposed) return;
     this.pending.push(op);
     if (this.flushScheduled) return;
     this.flushScheduled = true;
@@ -68,6 +73,10 @@ export class WidgetRenderSession {
   /** 立即发出攒着的 ops。宿主在 `mount()` 返回后调一次，保证首屏不等到下一个微任务。 */
   flush(): void {
     this.flushScheduled = false;
+    if (this.disposed) {
+      this.pending = [];
+      return;
+    }
     while (this.pending.length) {
       const ops = this.pending.splice(0, WIDGET_MAX_OPS_PER_MESSAGE);
       this.sink({ t: "ops", seq: this.seq++, ops });
@@ -108,10 +117,18 @@ export class WidgetRenderSession {
 
   /** 停用时丢掉 handler 与未发出的 ops：Worker 即将 terminate，留着只会让人以为还能回事件 */
   discard(): void {
+    // disposed 是「终态」标记，不是清空动作（附录2 N7）：清空之后插件残留的回调
+    // 还能再 enqueue 并触发一次 flush，等于让已经下线的 widget 复活一次
+    this.disposed = true;
     this.handlers.clear();
     this.nodes.clear();
     this.pending = [];
     this.flushScheduled = false;
+  }
+
+  /** 是否已停用（诊断与单测用；停用后 enqueue/flush 都是空操作） */
+  get isDisposed(): boolean {
+    return this.disposed;
   }
 }
 

@@ -3,7 +3,7 @@
 // 十条规则（R-A…R-F 口径见 .dispatch/arch-p2/work/T04/check-docs-rules.md（工作区、不入库）与卡 R7 §3；R-G 见卡 R8 §2；R-H 见清单 R4；R-I/R-J 见清单 G8-01）：
 //   R-A 正式文档里的 md 相对链接可达（http(s):/mailto:/纯 #片段 除外）
 //   R-B ARCHITECTURE.md §4 树对 src-tauri/src/services/ 的覆盖双向成立
-//   R-C README「目录速览」的 plugins/ 行点名四个插件 id
+//   R-C README「目录速览」的 plugins/ 行点名五个插件 id
 //   R-D 正式文档里的路径形反引号引用（七前缀）在磁盘上存在
 //   R-E md 链接文字若是 .md 路径，其文件名必须与目标文件名一致
 //   R-F AGENTS.md 字节数 ≤ 6000（上限由 PM 定，勿改回 5000）
@@ -188,7 +188,7 @@ function ruleB() {
 }
 
 // ---- R-C：README「目录速览」plugins/ 行点名四个插件 ----
-const PLUGIN_IDS = ['com.pet.hr-ble', 'com.pet.agent-bridge', 'com.pet.todo', 'com.pet.astock'];
+const PLUGIN_IDS = ['com.pet.hr-ble', 'com.pet.agent-bridge', 'com.pet.todo', 'com.pet.astock', 'com.pet.goat-gauge'];
 function ruleC() {
   const ls = linesOf('README.md');
   const start = ls.findIndex((l) => /^##\s*目录速览/.test(l));
@@ -518,22 +518,83 @@ function ruleI(docs) {
   return { name: 'R-I', ok: failures.length === 0, failures, detail: `checked=${checked} broken=${failures.length}` };
 }
 
-// ---- R-J：HOST-BACKLOG 状态板卡号不许重复（清单 G8-01）----
-// 状态板是「一卡一行」的台账：同一卡号两行会让状态列自相矛盾（2026-10-28 清账前有两行 S3）。
-// 只扫状态板小节，不把卡面正文里的同名引用算进来。
-function boardCardIds(text) {
-  const ids = [];
-  let inBoard = false;
-  for (const line of text.split(/\r?\n/)) {
-    if (/^##\s+/.test(line)) {
-      inBoard = line.includes('状态板');
+// ---- R-J：HOST-BACKLOG 状态板：卡号不许重复 + 表格结构（清单 G8-01 / N8）----
+// 状态板是「一卡一行」的台账：同号两行会让状态列自相矛盾（2026-10-28 清账前有两行 S3）。
+// 只扫状态板小节，不把卡面正文里的同名引用算进来。另查两类结构缺陷：
+//   - 表格中间的空行会把 GFM 表截成两段（2026-10-29 前 :54 的空行让 E02～B11 整段不渲染）；
+//   - 未转义的竖线会挤乱列数（B5 的 session/created|event|disposed 就是一行多出两列）。
+// 列数判据 = 「每行切出的单元格数 == 表头单元格数」；已转义的竖线不算分隔符。
+const BOARD_HEADING = /^##\s+.*状态板/;
+function splitTableRow(line) {
+  const cells = [];
+  let cur = '';
+  for (let i = 0; i < line.length; i += 1) {
+    if (line[i] === '\\' && i + 1 < line.length) {
+      cur += line[i] + line[i + 1];
+      i += 1;
       continue;
     }
-    if (!inBoard) continue;
-    const m = /^\|\s*([A-Z][A-Za-z0-9]*)\s*\|/.exec(line);
-    if (m) ids.push(m[1]);
+    if (line[i] === '|') {
+      cells.push(cur);
+      cur = '';
+      continue;
+    }
+    cur += line[i];
   }
-  return ids;
+  cells.push(cur);
+  if (cells.length > 0 && cells[0].trim() === '') cells.shift();
+  if (cells.length > 0 && cells[cells.length - 1].trim() === '') cells.pop();
+  return cells;
+}
+const isSeparatorRow = (cells) => cells.length > 0 && cells.every((c) => /^:?-+:?$/.test(c.trim()));
+function boardSection(text) {
+  const lines = text.split(/\r?\n/);
+  let start = -1;
+  let end = lines.length;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!/^##\s+/.test(lines[i])) continue;
+    if (start < 0) {
+      if (BOARD_HEADING.test(lines[i])) start = i;
+      continue;
+    }
+    end = i;
+    break;
+  }
+  return start < 0 ? null : { lines, start, end };
+}
+function analyzeBoard(text) {
+  const sec = boardSection(text);
+  const out = { ids: [], blanks: [], misaligned: [], rows: 0, headerCols: 0 };
+  if (!sec) return out;
+  let headerIdx = -1;
+  let lastRowIdx = -1;
+  for (let i = sec.start + 1; i < sec.end; i += 1) {
+    if (!sec.lines[i].startsWith('|')) continue;
+    if (headerIdx < 0) {
+      headerIdx = i;
+      out.headerCols = splitTableRow(sec.lines[i]).length;
+    }
+    lastRowIdx = i;
+    if (i === headerIdx) continue;
+    const cells = splitTableRow(sec.lines[i]);
+    if (isSeparatorRow(cells)) continue;
+    out.rows += 1;
+    const m = /^[A-Z][A-Za-z0-9]*$/.exec((cells[0] ?? '').trim());
+    if (m) out.ids.push(m[0]);
+  }
+  if (headerIdx < 0) return out;
+  for (let i = headerIdx + 1; i <= lastRowIdx; i += 1) {
+    const line = sec.lines[i];
+    if (line.trim() === '') {
+      out.blanks.push(i + 1);
+      continue;
+    }
+    if (!line.startsWith('|')) continue;
+    const cells = splitTableRow(line);
+    if (isSeparatorRow(cells)) continue;
+    if (cells.length !== out.headerCols) out.misaligned.push({ lineNo: i + 1, cols: cells.length });
+  }
+  return out;
 }
 function duplicateIds(ids) {
   const seen = new Set();
@@ -545,33 +606,60 @@ function duplicateIds(ids) {
   return [...dup].sort();
 }
 function ruleJ() {
-  const wrap = (rows) => `## 1. 状态板\n\n${rows}\n`;
-  const badRows = [
-    '| S3 | 发布旧版 | 已完成 | — | `abc1234` | — |',
-    '| S3 | Worker 卡 | 已放行 | — | `def5678` | — |',
-  ].join('\n');
-  const goodRows = [
-    '| S3 | 发布旧版 | 已完成 | — | `abc1234` | — |',
-    '| B7 | Worker 卡 | 已放行 | — | `def5678` | — |',
-  ].join('\n');
-  const badDup = duplicateIds(boardCardIds(wrap(badRows)));
-  const goodDup = duplicateIds(boardCardIds(wrap(goodRows)));
-  if (badDup.length !== 1 || badDup[0] !== 'S3' || goodDup.length !== 0) {
+  const header = '| 卡 | 标题 | 类型 | 状态 | 依赖 | 提交 | 评审 |\n|---|---|---|---|---|---|---|';
+  const wrap = (rows) => `## 1. 状态板\n\n${header}\n${rows}\n`;
+  const good = wrap(
+    '| S3 | 发布旧版 | 已完成 | — | — | `abc1234` | — |\n| B7 | Worker 卡 | 已放行 | — | — | `def5678` | — |',
+  );
+  const dup = wrap(
+    '| S3 | 发布旧版 | 已完成 | — | — | `abc1234` | — |\n| S3 | Worker 卡 | 已放行 | — | — | `def5678` | — |',
+  );
+  const blank = wrap(
+    '| S3 | 发布旧版 | 已完成 | — | — | `abc1234` | — |\n\n| B7 | Worker 卡 | 已放行 | — | — | `def5678` | — |',
+  );
+  const shifted = wrap('| S3 | 发布旧版 | 已完成 | — | — | a|b | `abc1234` | — |');
+  const escapedPipe = String.fromCharCode(92) + '|';
+  const escaped = wrap('| S3 | 发布旧版 | 已完成 | — | ' + escapedPipe + ' | `abc1234` | — |');
+  const goodBoard = analyzeBoard(good);
+  const dupBoard = analyzeBoard(dup);
+  const blankBoard = analyzeBoard(blank);
+  const shiftedBoard = analyzeBoard(shifted);
+  const escapedBoard = analyzeBoard(escaped);
+  const selftest =
+    goodBoard.ids.length === 2 &&
+    duplicateIds(goodBoard.ids).length === 0 &&
+    goodBoard.blanks.length === 0 &&
+    goodBoard.misaligned.length === 0 &&
+    duplicateIds(dupBoard.ids).length === 1 &&
+    blankBoard.blanks.length === 1 &&
+    shiftedBoard.misaligned.length === 1 &&
+    escapedBoard.misaligned.length === 0 &&
+    escapedBoard.ids.length === 1;
+  if (!selftest) {
     return {
       name: 'R-J',
       ok: false,
-      failures: ['R-J 自检未通过：正反例判据失效（重复卡号必须红、唯一卡号必须绿）'],
+      failures: ['R-J 自检未通过：正反例判据失效（重号 / 表内空行 / 列数 / 转义竖线）'],
       detail: 'selftest-failed',
     };
   }
   const rel = 'docs/process/HOST-BACKLOG.md';
-  const ids = boardCardIds(read(rel));
-  const dups = duplicateIds(ids);
+  const board = analyzeBoard(read(rel));
+  const failures = [];
+  for (const id of duplicateIds(board.ids)) {
+    failures.push(`${rel} 状态板卡号重复: ${id}（一卡一行；重号请并入或改号）`);
+  }
+  for (const lineNo of board.blanks) {
+    failures.push(`${rel}:${lineNo} 状态板表格内出现空行（GFM 会截断表格，删掉空行）`);
+  }
+  for (const row of board.misaligned) {
+    failures.push(`${rel}:${row.lineNo} 状态板行列数 ${row.cols} != 表头 ${board.headerCols}（单元格里的竖线要写成反斜杠+竖线）`);
+  }
   return {
     name: 'R-J',
-    ok: dups.length === 0,
-    failures: dups.map((id) => `${rel} 状态板卡号重复: ${id}（一卡一行；重号请并入或改号）`),
-    detail: `rows=${ids.length} dups=${dups.length}`,
+    ok: failures.length === 0,
+    failures,
+    detail: `rows=${board.rows} dups=${duplicateIds(board.ids).length} blanks=${board.blanks.length} misaligned=${board.misaligned.length}`,
   };
 }
 

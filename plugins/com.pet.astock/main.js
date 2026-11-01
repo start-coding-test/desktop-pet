@@ -312,7 +312,10 @@ export async function activate(context) {
     }
   }
 
-  ctx.bus.subscribe(TOPIC_CMD, (p) => void handleCmd(p));
+  // 指令处理是异步的：不接住 reject 的话，一条坏指令会变成未处理拒绝（G5-11）
+  ctx.bus.subscribe(TOPIC_CMD, (p) => {
+    void handleCmd(p).catch((err) => ctx.log?.("指令处理失败", err));
+  });
 
   pushState();
   await syncOverlay();

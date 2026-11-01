@@ -55,14 +55,14 @@ Tauri 2 + TypeScript/Vite 实现的桌面宠物框架：宠物本体只提供窗
 
 ## 开发环境
 
-- Node.js ≥ 20 与 npm
+- Node.js 24.x（`package.json` 的 `engines` 锁 `>=24 <25`，`.npmrc` 开了 `engine-strict=true`：Node 22 会在 `npm ci` 直接失败，而不是跑到一半报 IPC 假红）与 npm
 - Rust stable（`x86_64-pc-windows-msvc`）+ Visual Studio Build Tools（C++ 工作负载）
 - Windows 10 1809+（WebView2 Runtime）
 
 ## 常用命令
 
 ```bash
-npm install            # 首次安装前端依赖
+npm install            # 首次安装前端依赖（Node 24；engine-strict 会拒绝 22）
 npm run tauri dev      # 开发运行：宠物窗 + 前端热更新
 npm run tauri build    # 打包发布
 
@@ -72,8 +72,24 @@ npm run verify:agent   # Agent 事件链路断言（脚本自己写收件目录�
 npm run verify:game    # 游戏模式断言（会起一扇铺满显示器的深灰窗口约 10~16 秒：非置顶、任务栏可见，会自动关）
                    # 注意：该脚本会反复抢前台，其他置顶程序可能短暂闪动
 npm run verify:skin    # 桌宠资源安装链路（会真的连 petdex.dev 下载图集，临时装一个第二形象后删掉）
+npm run verify:drag    # 拖动态断言（真实 OS 拖拽与 DPI≠100% 仍要人工过一遍）
+npm run verify:dsh     # DSH 桥端到端（需要 PET_DSH_HOME 指向一个临时目录）
+npm run verify:astock  # A股盯盘（盘中/盘后形态不同，条数会浮动，按标题集合比）
+npm run verify:http    # http 能力 / charset / 重定向
+npm run verify:todo    # 待办链路
+npm run verify:worker  # L1 Worker 插件宿主
 npm run verify:release # 验打包产物的 CSP，每波次收尾手工跑一次
+
+npm run unit           # 离线单测（2238+ 条，ts-loader 转译 .ts，不需要起窗口）
+npm run check:docs     # 文档一致性门（R-A…R-J）
+npm run check:shape    # 命令层形状门（S1/S2/S3）
+npm run check:e2e-gate # E2E 门配置自检（floor / allowlist / 套件清单）
+npm run lint           # biome lint
 ```
+
+E2E 门的判据只有一份：`.github/workflows/e2e-gate.json`；`.github/workflows/e2e.yml` 与
+`e2e-extended.yml` 都只执行它，harness 用 `E2E-SUMMARY suite=… passed=… failed=… skipped=…`
+交接读数，skip 必须逐条登记（见 [e2e 门与 skip 口径](docs/process/CONVENTIONS.md)）。
 
 ## 目录速览
 
@@ -83,9 +99,9 @@ npm run verify:release # 验打包产物的 CSP，每波次收尾手工跑一次
 - `src/overlay/` 与 `src/consent/` 悬浮窗页（按插件各开一扇）与权限同意框页
 - `src-tauri/` Rust 宿主：窗口（宠物/悬浮/托盘）、单实例、自启，加原生能力服务（BLE/存储/HTTP 代理/通知/权限/启停/快捷键/全屏/hook/形象）
 - `packages/sdk/` 插件 SDK：类型声明、manifest schema、能力与 topic 名单（单一事实源）
-- `plugins/` 示例插件：`com.pet.hr-ble`（心率蓝牙）、`com.pet.agent-bridge`（Agent 桥）、`com.pet.todo`（待办）、`com.pet.astock`（A股盯盘）
+- `plugins/` 示例插件：`com.pet.hr-ble`（心率蓝牙）、`com.pet.agent-bridge`（Agent 桥）、`com.pet.todo`（待办）、`com.pet.astock`（A股盯盘）、`com.pet.goat-gauge`（GOAT 用量）
 - `tests/unit/` 与 `tests/e2e/` 单测与 `verify-*.mjs` 端到端断言
-- `tools/` 开发辅助：`dev-debug.mjs`（供断言脚本连 CDP）、图标生成脚本
+- `tools/` 开发辅助：`dev-debug.mjs`（供断言脚本连 CDP）、`check-docs.mjs`（文档一致性门）、`check-command-shape.mjs`（命令形状门）、`check-e2e-gate.mjs`（E2E 门配置自检）、图标生成脚本
 - `docs/` 文档：`docs/architecture/`（本架构）、`docs/plugin-dev/`（SDK 与插件流程）、`docs/process/`（评审与派单）、`docs/adr/`（决策记录）
 - `release-package/` 便携包产物（不进版本库；插件是磁盘加载，改 `plugins/` 不需要重编本体）
 

@@ -3,6 +3,7 @@
 // Worker 路线（ADR-0008，旧写法→契约写法的对照表见 PLUGIN_SDK.md 5.1）：这里没有
 // document / window，节点一律由调用点传入的 ctx.dom 建、事件走 node.on、画布由 ctx.onCanvas 交接。
 import { TOPIC_BPM, TOPIC_CMD, TOPIC_DEVICES, TOPIC_STATUS, TOPIC_WIDGET } from "./topics.js";
+import { stripSignalSuffix } from "./label.js";
 
 // 每个挂载实例（badge/overlay/settings）各自一份清理表，互不干扰
 const scopes = new WeakMap();
@@ -75,6 +76,8 @@ function mountBadge(root, ctx, cleanups) {
   cleanups.push(
     ctx.bus.subscribe(TOPIC_WIDGET, (d) => {
       connected = d?.connected === true;
+      // 断开就把最后一次读数清掉：否则重新连上、心跳还没来时，徽标会先把旧数字显示一遍
+      if (!connected) num.textContent = "--";
       sync();
     }),
   );
@@ -294,6 +297,15 @@ function mountChart(root, ctx, cleanups) {
       draw();
     }),
   );
+  // 断开要跟界面一致：波形与读数退回空态，别把最后一段活曲线留在「已断开」的窗上
+  cleanups.push(
+    ctx.bus.subscribe(TOPIC_WIDGET, (d) => {
+      if (d?.connected === true) return;
+      history.length = 0;
+      num.textContent = "--";
+      draw();
+    }),
+  );
   draw();
 }
 
@@ -337,6 +349,8 @@ function mountSettings(root, ctx, cleanups) {
   devicesRow.append(devicesSel);
   // 设备项的引用自己存着（去重与「按值找名」都不再查询 DOM）
   const deviceOptions = [placeholder];
+  /** 设备 id → 干净设备名（不含 RSSI 后缀）：连接时发真名，不发选项文本（G5-12） */
+  const deviceNames = new Map();
 
   const actionsRow = ctx.dom.createElement("div");
   actionsRow.className = "row";
@@ -390,17 +404,21 @@ function mountSettings(root, ctx, cleanups) {
     statusEl.textContent = text;
     statusEl.className = "status" + (level === "info" ? "" : ` ${level}`);
   }
+  /** 面板上当前是否正显示「已连接 …」：断开推送来时要把它换掉，别留在旧状态 */
+  let shownConnected = false;
 
   // Worker 里读不到真元素：select 的当前值靠宿主在 change 快照里回推，这里记一份给连接按钮用
   let selectedDeviceId = "";
+  /** 用户刚点过、还等着推送追上的那个模式单选框（编辑锁，N 类问题同 Bug4） */
+  let modeLock = null;
   scanBtn.on("click", () => ctx.bus.publish(TOPIC_CMD, { action: "scan" }));
   connectBtn.on("click", () => {
     if (!selectedDeviceId) {
       setStatus("请先扫描并选择设备", "error");
       return;
     }
-    // 设备名就在选中项的文本里，点连接时现取（引用都存着，不用查询）
-    const name = deviceOptions.find((o) => o.value === selectedDeviceId)?.textContent ?? null;
+    // 设备名取「扫描时留下的干净名字」，不取选项文本（那里带着「（-60 dBm）」后缀，G5-12）
+    const name = deviceNames.get(selectedDeviceId) ?? null;
     ctx.bus.publish(TOPIC_CMD, { action: "connect", deviceId: selectedDeviceId, deviceName: name });
   });
   disconnectBtn.on("click", () => ctx.bus.publish(TOPIC_CMD, { action: "disconnect" }));
@@ -409,7 +427,10 @@ function mountSettings(root, ctx, cleanups) {
   });
   for (const radio of modeRadios) {
     radio.on("change", () => {
-      if (radio.checked) ctx.bus.publish(TOPIC_CMD, { action: "mode", value: radio.value });
+      // 只认「被选中」的那一次，并把锁记下：用户刚点的选项不许被在途的旧快照冲回去
+      if (!radio.checked) return;
+      modeLock = radio;
+      ctx.bus.publish(TOPIC_CMD, { action: "mode", value: radio.value });
     });
   }
 
@@ -417,9 +438,12 @@ function mountSettings(root, ctx, cleanups) {
     ctx.bus.subscribe(TOPIC_DEVICES, (d) => {
       // 设备 id 来自广播：只做值比对，文本一律走 textContent
       if (deviceOptions.some((o) => o.value === d.id)) return;
+      const cleanName = stripSignalSuffix(d.name);
+      // 名字单独记一份干净的：选项文本为了好挑设备带着 RSSI，但连接时不能用它当名字（G5-12）
+      deviceNames.set(d.id, cleanName ?? "未命名设备");
       const opt = ctx.dom.createElement("option");
       opt.value = d.id;
-      opt.textContent = `${d.name ?? "未命名设备"}${d.rssi != null ? `（${d.rssi} dBm）` : ""}`;
+      opt.textContent = `${cleanName ?? "未命名设备"}${d.rssi != null ? `（${d.rssi} dBm）` : ""}`;
       deviceOptions.push(opt);
       devicesSel.append(opt);
     }),
@@ -433,10 +457,22 @@ function mountSettings(root, ctx, cleanups) {
     ctx.bus.subscribe(TOPIC_WIDGET, (d) => {
       if (!d || typeof d !== "object") return;
       const want = d.mode === "overlay" ? "overlay" : "badge";
-      for (const radio of modeRadios) {
-        radio.checked = radio.value === want;
+      // 编辑锁：用户刚点过某个模式，等推送追上那一项才放锁；在途旧帧不许把点过的选项冲回去
+      if (modeLock) {
+        if (modeLock.checked && modeLock.value === want) modeLock = null;
+      } else {
+        for (const radio of modeRadios) {
+          if (radio.checked !== (radio.value === want)) radio.checked = radio.value === want;
+        }
       }
-      if (d.connected) setStatus(`已连接 ${d.deviceName ?? "设备"}`, "ok");
+      // 连接状态文案跟着推送走：断开时别把「已连接 X」留在面板上
+      if (d.connected) {
+        shownConnected = true;
+        setStatus(`已连接 ${d.deviceName ?? "设备"}`, "ok");
+      } else if (shownConnected) {
+        shownConnected = false;
+        setStatus("设备已断开", "error");
+      }
     }),
   );
 }

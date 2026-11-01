@@ -465,6 +465,70 @@ try {
   await rm(dir, { recursive: true, force: true });
 }
 
+// N2：上限不能变成「永久静默」。宿主在超过 2MiB 时会把收件文件清空，
+// 桥如果拿缓存当盘上大小，就会从那一刻起每行都撞 8MiB 上限、一条也写不进去；
+// 而真正到了 8MiB 也不该拒收，轮换一份 `.1` 接着写就行。
+group("createSink：轮换与外部清空（N2）");
+
+const NL = String.fromCharCode(10);
+const capDir = await mkdtemp(join(tmpdir(), "pet-dsh-bridge-cap-"));
+try {
+  const notes = [];
+  const sink = bridge.createSink(capDir, (message) => notes.push(message));
+
+  // 先让盘上文件接近上限，再让宿主把它清空（enforce_inbox_cap 的 fs::write(path, b"")）
+  const prePath = join(capDir, "pre.jsonl");
+  await writeFile(prePath, "x".repeat(bridge.MAX_FILE_BYTES - 100), "utf8");
+  sink.write(line("s2", { type: "tool/call", time: 1, data: { name: "read", arguments: "{}" } }));
+  await sink.idle();
+  check(
+    "写前按盘上真实大小计（接近上限仍能追加）",
+    statSync(prePath).size > bridge.MAX_FILE_BYTES - 100,
+  );
+
+  await writeFile(prePath, "", "utf8");
+  const after = line("s2", { type: "tool/call", time: 2, data: { name: "grep" } });
+  sink.write(after);
+  await sink.idle();
+  check(
+    "宿主清空文件后桥继续写（不拿缓存判满）",
+    (await readFile(prePath, "utf8")).trim() === JSON.stringify(after),
+  );
+
+  // 真到 8MiB：轮换成 `<file>.1` 再追加，不是永久丢掉后面的行
+  const fullPath = join(capDir, "stop.jsonl");
+  await writeFile(fullPath, "y".repeat(bridge.MAX_FILE_BYTES), "utf8");
+  const tail = line("s2", { type: "turn/end", time: 3, data: { reason: { kind: "completed" } } });
+  sink.write(tail);
+  await sink.idle();
+  eq("到上限时旧文件轮换为 .1", (await readdir(capDir)).includes("stop.jsonl.1"), true);
+  check(
+    "轮换后新行照常落盘（不是永久拒收）",
+    (await readFile(fullPath, "utf8")).trim() === JSON.stringify(tail),
+  );
+  check(
+    "轮换会说明一次（不静默丢行）",
+    notes.some((message) => message.includes("轮换")),
+  );
+
+  // 排队上限：同一 tick 里堆满 MAX_PENDING，再来的那条只报告、不排队
+  const backlogNotes = [];
+  const queued = bridge.createSink(capDir, (message) => backlogNotes.push(message));
+  const queuedLine = mapping.sessionStartLine({ id: "q" }, 1);
+  for (let i = 0; i <= bridge.MAX_PENDING; i += 1) queued.write(queuedLine);
+  await queued.idle();
+  const rows = (await readFile(join(capDir, "session-start.jsonl"), "utf8"))
+    .split(NL)
+    .filter((row) => row !== "");
+  eq("排队超过 MAX_PENDING 的那条不落盘", rows.length, bridge.MAX_PENDING);
+  check(
+    "积压会报告一次并点明上限",
+    backlogNotes.some((message) => message.includes(String(bridge.MAX_PENDING))),
+  );
+} finally {
+  await rm(capDir, { recursive: true, force: true });
+}
+
 group("apply：订阅三件事，子代理不转发，停用时先冲刷");
 
 const applyDir = await mkdtemp(join(tmpdir(), "pet-dsh-bridge-apply-"));

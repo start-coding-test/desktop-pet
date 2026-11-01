@@ -224,13 +224,18 @@ async function freshEvaluate(targetUrl, expression, timeoutMs = 20_000) {
  * 只在 GITHUB_ACTIONS=true 时输出，本地跑与 verify:release 的终端输出不变。
  * 注意：注解参数里的 `%`、换行必须转义，否则会被截断或吞掉。
  */
-function announceSummary(title, pass, fail, failures) {
+function announceSummary(title, pass, fail, failures, skipped = 0) {
   if (process.env.GITHUB_ACTIONS !== "true") return;
   const esc = (s) => String(s).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
   // 失败项带「期望/实得」原文（每条截 240 字），评审方经公开 API 就能读到 FAIL 断言，不必再向执行者要日志
   const cut = (s) => (String(s).length > 240 ? String(s).slice(0, 240) + "…" : String(s));
-  const msg = `${title} | ${pass} passed, ${fail} failed` + (failures.length ? ` | 失败项: ${failures.slice(0, 8).map(cut).join(" ; ")}` : "");
-  console.log(`::${fail ? "error" : "notice"} title=E2E 汇总::${esc(msg)}`);
+  const msg =
+    `${title} | ${pass} passed, ${fail} failed` +
+    (skipped ? `, ${skipped} skipped` : "") +
+    (failures.length ? ` | 失败项: ${failures.slice(0, 8).map(cut).join(" ; ")}` : "");
+  // 跳过不算绿也不算红：用 warning 单独标出来，别让「有跳过」的 run 靠 notice 混成通过
+  const kind = fail ? "error" : skipped ? "warning" : "notice";
+  console.log(`::${kind} title=E2E 汇总::${esc(msg)}`);
 }
 
 /**
@@ -248,11 +253,25 @@ function announceCrash(title, err) {
   }
 }
 
+/**
+ * 套件标识：CI 门按它核对每个套件的读数，所以必须与 package.json 里的 npm script 名一致。
+ * 显式传 > npm 的 lifecycle 变量（`npm run verify:drag` 时为 `verify:drag`）> 标题兜底。
+ */
+function suiteId(explicit, title) {
+  if (explicit) return String(explicit);
+  if (process.env.npm_lifecycle_event) return String(process.env.npm_lifecycle_event);
+  return String(title)
+    .toLowerCase()
+    .replace(/[^\w:-]+/g, "-");
+}
+
 /** 断言收集器：全部跑完再统一报告，非零退出码反映给 CI/npm */
-export function createReport(title) {
+export function createReport(title, suite) {
   let pass = 0;
   let fail = 0;
   const failures = [];
+  const skips = [];
+  const id = suiteId(suite, title);
   console.log(`\n=== ${title} ===`);
   let crashHooked = false;
   const hookCrash = () => {
@@ -263,6 +282,8 @@ export function createReport(title) {
   };
   hookCrash();
   return {
+    /** 本报告对应的套件 id（= npm script 名），门用它定位 E2E-SUMMARY */
+    suite: id,
     group: (name) => console.log(`\n-- ${name}`),
     check(label, want, got) {
       const ok = JSON.stringify(want) === JSON.stringify(got);
@@ -274,10 +295,27 @@ export function createReport(title) {
       }
     },
     info: (label, value) => console.log(`  · ${label}: ${value}`),
+    /**
+     * 结构化跳过（G1-05/N2 的修法）。以前前置不满足时只打一行中文 info 就正常退出，
+     * CI 侧要判「这条 run 是不是空转」只能搜日志里的「跳过」二字 —— 普通文案里一出现
+     * 「跳过」就误判（verify:drag 的分组标题、verify:goat-gauge 的在线组都踩过）。
+     * 现在跳过有固定前缀、独立计数，并被写进下面那行机器读数；门只认前缀与计数，不再猜文案。
+     * 语义边界：跳过**不是通过**。CI 里每条 SKIP 都要在 e2e-gate.json 的 allowedSkips 里
+     * 登记（suite + 文案子串 + 理由 + 到期日），没登记的跳过仍然判红。
+     */
+    skip(label, reason = "") {
+      skips.push({ label: String(label), reason: String(reason) });
+      console.log(`  SKIP ${label}${reason ? ` — ${reason}` : ""}`);
+    },
     summary() {
-      console.log(`\n${pass} passed, ${fail} failed`);
+      console.log(`\n${pass} passed, ${fail} failed` + (skips.length ? `, ${skips.length} skipped` : ""));
+      if (skips.length) {
+        console.log("跳过项：\n  " + skips.map((s) => `${s.label}${s.reason ? ` — ${s.reason}` : ""}`).join("\n  "));
+      }
       if (failures.length) console.log("失败项：\n  " + failures.join("\n  "));
-      announceSummary(title, pass, fail, failures);
+      // 机器读数：CI 门唯一解析的一行。缺了它门会判红 —— 「没读到汇总」不许被当成通过。
+      console.log(`E2E-SUMMARY suite=${id} passed=${pass} failed=${fail} skipped=${skips.length}`);
+      announceSummary(title, pass, fail, failures, skips.length);
       return fail;
     },
   };

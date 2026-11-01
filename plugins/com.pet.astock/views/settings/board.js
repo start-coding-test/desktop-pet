@@ -6,6 +6,7 @@ import { drawKline, drawTrend } from "../../charts.js";
 import { KLINE_PERIODS, sourceLabelOf } from "../../market.js";
 import { TOPIC_CMD } from "../../topics.js";
 import { button, fmtPct, fmtPrice, tag, text, toneOf } from "../dom.js";
+import { syncSelect } from "./lock.js";
 import { kltDisplay, kltOptionValue, pickLimit, rawPctOf } from "./util.js";
 
 /**
@@ -27,6 +28,8 @@ export function mountBoard(ctx, state, cleanups) {
   const chartBox = tag(dom, "div", "chart");
   chartBox.append(canvas);
   let chartKind = "trend";
+  /** 用户刚改过、推送里的 klt 还没追上的时候先别回显（G5-04：以前每帧无条件写，选了又被写回） */
+  const locks = new Set();
   /** 宿主交接来的可画对象（Worker 路线是 OffscreenCanvas）；没有它之前什么都画不了 */
   let canvasOff = null;
   /** 最近一次 layout 推送（尺寸 / dpr / 各画布量得的宽高） */
@@ -38,7 +41,10 @@ export function mountBoard(ctx, state, cleanups) {
     opt.textContent = p.label;
     kltSel.append(opt);
   }
-  kltSel.on("change", () => ctx.bus.publish(TOPIC_CMD, { action: "klt", value: Number(kltSel.value) }));
+  kltSel.on("change", () => {
+    locks.add(kltSel);
+    ctx.bus.publish(TOPIC_CMD, { action: "klt", value: Number(kltSel.value) });
+  });
   panelRefresh.on("click", () => ctx.bus.publish(TOPIC_CMD, { action: "panel" }));
 
   const tabButtons = [];
@@ -117,7 +123,7 @@ export function mountBoard(ctx, state, cleanups) {
       `${limitText} · 分时 ${live.trend?.points?.length ?? 0} 点 · K线 ${live.kline?.bars?.length ?? 0} 根`;
     panelSub.className = `muted ${toneOf({ pct })}`;
     panelErr.textContent = live.error ? `盘面数据拉取失败：${live.error}` : "";
-    if (Number.isFinite(Number(live.klt))) kltSel.value = String(live.klt);
+    if (Number.isFinite(Number(live.klt))) syncSelect(kltSel, String(live.klt), locks);
     drawChart();
     state.depth.render(live);
   }

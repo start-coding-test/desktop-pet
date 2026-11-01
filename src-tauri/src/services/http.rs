@@ -23,7 +23,14 @@ pub struct HttpState {
     proxy: Mutex<Option<CachedSettings>>,
 }
 
+/// idle 档：DNS/连接/写/读**每一步**最多等这么久。它管的是「卡住多久算断」，
+/// 不是「整条请求能花多久」—— 慢速滴灌的响应每次都能在 idle 内到一字节，
+/// 没有下面那条绝对 deadline 就能无限拖。这一档同时作为「单请求墙钟上界」传给
+/// ureq（`send_within` 的 `per_request`），所以卡死的一跳不会把整条链拖满 30 秒。
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// 绝对 deadline：一次插件请求（含全部重定向跳）总共只能花这么久（验收 N3）。
+/// 链上每一跳是 `min(剩余预算, TIMEOUT)` —— 前几跳慢慢花，最后一跳就得在剩下的预算内完成。
+const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_BODY_BYTES: usize = 1 << 20; // 1 MiB：防止某个大响应吃掉内存
 /// 重定向由我们自己逐跳跟：ureq 自动跟的话只校验首跳域名，
 /// 拿到一个已授权域名的插件就能弹到任意主机（内网、169.254.169.254）
@@ -319,7 +326,11 @@ fn check_granted(state: &PermissionState, plugin_id: &str, host: &str) -> Result
 }
 
 /// 逐跳发送并校验域名。重定向不再由 ureq 自动跟随：每一跳的新 host 都要重新过一次授权，
-/// 换主机时还把 authorization / cookie 摘掉，免得凭据跟着跳转漏给另一个域名。
+/// 跳出**起始源**之后 authorization / cookie / referer / origin 一律摘掉（且不再补回）。
+///
+/// 为什么按「起始源」而不是「上一跳」判（验收 N2 的原失败用例）：
+/// 起始 A → B → B 这条链里，第二跳的 host 与第一跳的 B 相同，逐跳比较会判成「同源」，
+/// 于是把 A 的 Authorization 又发给了 B。跨源这件事一旦发生就不可逆。
 fn send_following_redirects(
     route: &Route,
     granted: &[String],
@@ -328,11 +339,39 @@ fn send_following_redirects(
     headers: &[(String, String)],
     body: Option<&str>,
 ) -> Result<HttpResponse, HostError> {
+    let deadline = Instant::now()
+        .checked_add(REQUEST_DEADLINE)
+        .unwrap_or_else(Instant::now);
+    send_within(
+        route, granted, url, method, headers, body, deadline, TIMEOUT,
+    )
+}
+
+/// 与 [`send_following_redirects`] 完全同一条路径，只是 deadline 与「单请求上限」由调用方给。
+/// 唯一目的是让两类超时都可测：单测给几十/几百毫秒的预算，不必真等生产那 30 秒与 10 秒，
+/// 也不会因为「等满生产超时」把测试拖成分钟级。
+///
+/// 两类超时的关系：`per_request` 是**每一跳请求**的墙钟上限（idle 档的上界，
+/// 覆盖 DNS/连接/写/读任一阶段的卡死），`deadline` 是**整条链**的绝对上限
+/// （重定向每多跳一次就少一份预算）。实际传给库的是两者中更紧的那个。
+#[allow(clippy::too_many_arguments)]
+fn send_within(
+    route: &Route,
+    granted: &[String],
+    url: &str,
+    method: &str,
+    headers: &[(String, String)],
+    body: Option<&str>,
+    deadline: Instant,
+    per_request: Duration,
+) -> Result<HttpResponse, HostError> {
     let mut current = tauri::Url::parse(url)
         .map_err(|e| HostError::new(INVALID_ARG, format!("URL 非法: {e}")))?;
     let mut method = method.to_string();
     let mut body = body;
-    let mut last_host = String::new();
+    let origin = origin_key(&current);
+    // 跨源一旦发生就永久生效：这两个开关只置 true，不因为跳回原源而回退
+    let mut stripped = Stripped::default();
 
     for hop in 0..=MAX_REDIRECTS {
         let host = host_key(&current)?;
@@ -342,23 +381,51 @@ fn send_following_redirects(
                 format!("未授权访问 {host}：需要 manifest 声明 http 且已同意该域名"),
             ));
         }
-        let cross_host = hop > 0 && host != last_host;
-        last_host = host;
+        if origin_key(&current) != origin {
+            stripped.credentials = true;
+            stripped.origin_headers = true;
+        }
+        // 绝对 deadline 先于发请求判：链上每一跳之前都看一眼，总预算花完就不再发出下一跳
+        let left = match remaining(deadline, Instant::now()) {
+            Some(left) => left,
+            None => return Err(deadline_error()),
+        };
+        // 单请求上限 = 剩余预算与 idle 档里更紧的那个：
+        // 预算还剩很多时受 idle 档管（10 秒），预算见底时受 deadline 管（最后一跳不许超支）
+        let budget = left.min(per_request);
 
         // 每一跳都用**该跳的目标**重新决定走不走代理：公网 → 内网的重定向不能沿用上一跳的代理路线
         let agent = route.agent_for(&current);
-        let mut req = agent.request(&method, current.as_str());
+        let mut req = agent.request(&method, current.as_str()).timeout(budget);
         for (name, value) in headers {
-            if is_valid_header_name(name) && !(cross_host && is_credential_header(name)) {
-                req = req.set(name, value);
+            if !is_valid_header_name(name) {
+                continue;
             }
+            if stripped.credentials && is_credential_header(name) {
+                continue;
+            }
+            if stripped.origin_headers && is_origin_scoped_header(name) {
+                continue;
+            }
+            req = req.set(name, value);
         }
         let resp = match body {
             Some(text) => req.send_string(text),
             None => req.call(),
-        }
-        // 走代理时 ureq 的报错会把代理端点（可能连凭据一起）带出来 ⇒ 出口前先洗一遍（B10 行为 3）
-        .map_err(|e| HostError::new(NETWORK, route.redact(format!("请求失败: {e}"))))?;
+        };
+        let resp = match resp {
+            Ok(resp) => resp,
+            Err(e) => {
+                // 走代理时 ureq 的报错会把代理端点（可能连凭据一起）带出来 ⇒ 出口前先洗一遍（B10 行为 3）
+                let text = route.redact(format!("请求失败: {e}"));
+                // 预算已经花完 ⇒ 如实报「总时限」，不要把 deadline 的锅记在 idle 超时上
+                return Err(if remaining(deadline, Instant::now()).is_none() {
+                    deadline_error()
+                } else {
+                    HostError::new(NETWORK, text)
+                });
+            }
+        };
 
         let status = resp.status();
         if !(300..400).contains(&status) {
@@ -397,6 +464,45 @@ fn send_following_redirects(
     ))
 }
 
+/// 跨源之后不再回填的两类头。摘掉是**终态**：跳回原源也不补回 —— 那条路径上的「原源」
+/// 已经知道这趟请求跨过域，补回就是把凭据又交出去一次。
+#[derive(Default)]
+struct Stripped {
+    credentials: bool,
+    origin_headers: bool,
+}
+
+/// 源 = scheme + host + 端口（不含路径）。跨源判定与浏览器同口径；
+/// `host_key` 只在非默认端口时带端口，所以 `https://a` 与 `https://a:443` 是同一个源。
+fn origin_key(url: &tauri::Url) -> String {
+    format!(
+        "{}://{}",
+        url.scheme(),
+        host_key(url).unwrap_or_else(|_| String::new())
+    )
+}
+
+/// 绝对 deadline 的剩余预算。`None` = 已经花完。
+fn remaining(deadline: Instant, now: Instant) -> Option<Duration> {
+    let left = deadline.saturating_duration_since(now);
+    if left.is_zero() {
+        None
+    } else {
+        Some(left)
+    }
+}
+
+/// 总时限的失败形状。刻意不接收 URL / 查询串 —— 这条文案会进插件日志与设置页。
+fn deadline_error() -> HostError {
+    HostError::new(
+        NETWORK,
+        format!(
+            "请求超过总时限 {} 秒，已放弃（链上每一跳都受这条 deadline 约束）",
+            REQUEST_DEADLINE.as_secs()
+        ),
+    )
+}
+
 /// G3-02：https → http 的降级重定向判定（scheme 大小写不敏感）。
 /// 纯函数，好让「降级一律拒」这条规则有离线单测，不依赖真网络。
 fn is_scheme_downgrade(from: &str, to: &str) -> bool {
@@ -416,6 +522,15 @@ fn is_credential_header(name: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "authorization" | "cookie" | "proxy-authorization"
     )
+}
+
+/// 跨源后同样不能带过去的「来源标记」：Referer 会把内网/私有页面的完整路径泄给目标站，
+/// Origin 是浏览器自己在跨源请求上会重算的东西——宿主原样转发就等于替插件伪造了来源。
+///
+/// 策略口径（与 docs/adr/0011 一致）：宿主**不重写**这两类头，只做「同源才转发」；
+/// 插件若想要跨源也发 Referer，就自己按目标域名拼一个新值传进来（那一跳起就是新的 origin）。
+fn is_origin_scoped_header(name: &str) -> bool {
+    matches!(name.to_ascii_lowercase().as_str(), "referer" | "origin")
 }
 
 /// 从 Content-Type 里取 `charset=` 参数值（去空白与引号，大小写保持原样）。
@@ -1025,7 +1140,6 @@ mod tests {
             "[::1]:80",
             "[::]:80",
             "[fe80::1]:80",
-            "[fd00::1]:80",
             "[::ffff:127.0.0.1]:80",
         ]
         .iter()
@@ -1034,6 +1148,16 @@ mod tests {
         for addr in bad {
             let err = guard_addresses(vec![addr]).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{addr}");
+        }
+        // N1 的反向钉子：ULA 与 fake-ip 是 TUN 连通档，守卫**不许**整批拒掉这些解析结果，
+        // 否则 Clash/mihomo TUN 用户的每条插件请求都会在解析处死掉。
+        for addr in ["[fd00::1]:80", "[fc00::1]:443", "198.18.0.1:80"] {
+            let parsed: std::net::SocketAddr = addr.parse().unwrap();
+            assert_eq!(
+                guard_addresses(vec![parsed]).unwrap(),
+                vec![parsed],
+                "{addr} 属于 TUN 连通档，解析守卫必须放行"
+            );
         }
         // 混合解析结果（公网 + 内网）也整批拒：不做「挑一个公网的用」
         let mixed = vec![public, "10.0.0.5:80".parse().unwrap()];
@@ -1104,7 +1228,11 @@ mod tests {
             "[::ffff:127.0.0.1]:443",
         ] {
             let err = guard_resolution("example.com:443", vec![addr(address)]).unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{address}");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "{address}"
+            );
         }
         // 混合解析（一公一私）整批拒：不做「挑一个公网的用」
         let mixed = vec![addr("93.184.216.34:443"), addr("10.0.0.5:443")];
@@ -1149,5 +1277,273 @@ mod tests {
             .expect("读正文");
         assert!(body.contains("doctype"), "{body}");
         server.join().expect("服务线程结束");
+    }
+
+    // ---- N2 / N3：跨源凭据与两类超时的真路径测试 ----------------------------
+    //
+    // 这三条都**真起本地 TCP 服务**（绑 127.0.0.1 随机端口、不出机器），
+    // 因为要证的东西是「实际发出了哪些头」「多久返回」，纯函数假测不出来。
+
+    fn bind_local() -> (std::net::TcpListener, u16) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 本地端口");
+        let port = listener.local_addr().expect("取本地端口").port();
+        (listener, port)
+    }
+
+    /// 在给定 listener 上服务 `times` 个请求：把每个请求的原文交给 `responder` 换响应，
+    /// 返回收集到的请求原文。串行 accept，正好对上「逐跳跟重定向」这一条路径。
+    fn serve_on<F>(
+        listener: std::net::TcpListener,
+        times: usize,
+        responder: F,
+    ) -> std::thread::JoinHandle<Vec<String>>
+    where
+        F: Fn(usize, &str) -> String + Send + 'static,
+    {
+        use std::io::Write;
+        std::thread::spawn(move || {
+            let mut seen = Vec::with_capacity(times);
+            for index in 0..times {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut raw = String::new();
+                let mut buf = [0u8; 2048];
+                while !raw.contains("\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => raw.push_str(&String::from_utf8_lossy(&buf[..n])),
+                        Err(_) => break,
+                    }
+                }
+                let _ = stream.write_all(responder(index, &raw).as_bytes());
+                seen.push(raw);
+            }
+            seen
+        })
+    }
+
+    fn redirect_to(location: &str) -> String {
+        format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    fn ok_body(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn has_header(raw: &str, name: &str) -> bool {
+        raw.lines().skip(1).any(|line| {
+            line.split_once(':')
+                .is_some_and(|(key, _)| key.trim().eq_ignore_ascii_case(name))
+        })
+    }
+
+    fn local_caps(ports: &[u16]) -> Vec<String> {
+        let mut caps = granted(&[crate::plugin_caps::HTTP]);
+        for port in ports {
+            caps.push(crate::plugin_caps::http_host_key(&format!(
+                "127.0.0.1:{port}"
+            )));
+        }
+        caps
+    }
+
+    fn sensitive_headers() -> Vec<(String, String)> {
+        vec![
+            (
+                "Authorization".to_string(),
+                "Bearer super-secret".to_string(),
+            ),
+            ("Cookie".to_string(), "session=abcdef".to_string()),
+            (
+                "Referer".to_string(),
+                "http://127.0.0.1:1/private/report".to_string(),
+            ),
+            ("Origin".to_string(), "http://127.0.0.1:1".to_string()),
+            ("X-Trace".to_string(), "keep-me".to_string()),
+        ]
+    }
+
+    /// N2 的原失败用例：A → B → B。
+    /// 旧实现按「上一跳 host」判跨源，第三跳回到同一个 B 就被判成同源，
+    /// 把起始源 A 的 Authorization / Cookie 又发给了 B。
+    #[test]
+    fn cross_origin_redirect_strips_credentials_on_every_later_hop() {
+        let (listener_b, port_b) = bind_local();
+        let (listener_a, port_a) = bind_local();
+
+        // B：第一跳 302 到自己的另一个路径（同源），第二跳 200
+        let b_next = format!("http://127.0.0.1:{port_b}/two");
+        let b = serve_on(listener_b, 2, move |index, _| {
+            if index == 0 {
+                redirect_to(&b_next)
+            } else {
+                ok_body("done")
+            }
+        });
+        // A：302 跨源到 B
+        let a_to_b = format!("http://127.0.0.1:{port_b}/one");
+        let a = serve_on(listener_a, 1, move |_, _| redirect_to(&a_to_b));
+
+        let state = HttpState::new();
+        let route = state.route_at(Instant::now(), ProxySettings::default);
+        let caps = local_caps(&[port_a, port_b]);
+        let response = send_following_redirects(
+            &route,
+            &caps,
+            &format!("http://127.0.0.1:{port_a}/start"),
+            "GET",
+            &sensitive_headers(),
+            None,
+        )
+        .expect("A→B→B 这条链应当走通");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, "done");
+
+        let a_seen = a.join().expect("A 线程结束");
+        let b_seen = b.join().expect("B 线程结束");
+        // 起始源那一跳带着凭据与来源头（同源，正常）
+        assert!(has_header(&a_seen[0], "authorization"), "{}", a_seen[0]);
+        assert!(has_header(&a_seen[0], "cookie"), "{}", a_seen[0]);
+        assert!(has_header(&a_seen[0], "referer"), "{}", a_seen[0]);
+        // 跨源之后每一跳都不许再有：第二跳 B→B 是同源，正是旧实现回填凭据的地方
+        for (index, raw) in b_seen.iter().enumerate() {
+            for name in ["authorization", "cookie", "referer", "origin"] {
+                assert!(
+                    !has_header(raw, name),
+                    "B 第 {} 跳不该带 {name}（跨源后永久摘除）：{raw}",
+                    index + 1
+                );
+            }
+            assert!(has_header(raw, "x-trace"), "非敏感头要照常转发：{raw}");
+        }
+    }
+
+    /// 同一源内的重定向**不该**丢凭据（否则登录后的跳转全掉线）
+    #[test]
+    fn same_origin_redirect_keeps_credentials() {
+        let (listener, port) = bind_local();
+        let next = format!("http://127.0.0.1:{port}/next");
+        let server = serve_on(listener, 2, move |index, _| {
+            if index == 0 {
+                redirect_to(&next)
+            } else {
+                ok_body("ok")
+            }
+        });
+
+        let state = HttpState::new();
+        let route = state.route_at(Instant::now(), ProxySettings::default);
+        let response = send_following_redirects(
+            &route,
+            &local_caps(&[port]),
+            &format!("http://127.0.0.1:{port}/login"),
+            "GET",
+            &sensitive_headers(),
+            None,
+        )
+        .expect("同源重定向应当走通");
+        assert_eq!(response.status, 200);
+
+        let seen = server.join().expect("服务线程结束");
+        for (index, raw) in seen.iter().enumerate() {
+            for name in ["authorization", "cookie", "referer", "origin"] {
+                assert!(
+                    has_header(raw, name),
+                    "同源第 {} 跳必须保留 {name}：{raw}",
+                    index + 1
+                );
+            }
+        }
+    }
+
+    /// N3 的总时限：预算 150ms、服务端 600ms 才回 ⇒ 必须在预算处截断，
+    /// 且报的是「总时限」而不是笼统的 idle 超时。
+    #[test]
+    fn absolute_deadline_bounds_the_whole_chain() {
+        let (listener, port) = bind_local();
+        let server = serve_on(listener, 1, move |_, _| {
+            std::thread::sleep(Duration::from_millis(600));
+            ok_body("late")
+        });
+        let state = HttpState::new();
+        let route = state.route_at(Instant::now(), ProxySettings::default);
+        let started = Instant::now();
+        let result = send_within(
+            &route,
+            &local_caps(&[port]),
+            &format!("http://127.0.0.1:{port}/slow"),
+            "GET",
+            &[],
+            None,
+            started + Duration::from_millis(150),
+            // idle 档给足 5 秒 ⇒ 先触发的只可能是绝对 deadline
+            Duration::from_secs(5),
+        );
+        let elapsed = started.elapsed();
+        let err = match result {
+            Err(err) => err,
+            Ok(resp) => panic!("150ms 预算下必须失败，却拿到了 {}", resp.status),
+        };
+        assert!(
+            err.message.contains("总时限"),
+            "必须是总时限错误，实际：{}",
+            err.message
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "总时限必须真的截断，实际等了 {elapsed:?}"
+        );
+        let _ = server.join();
+    }
+
+    /// N3 的 idle 档：单请求上限先触发时，报的必须是「请求失败」而不是总时限 ——
+    /// 两类超时各报各的，才能从错误里看出到底卡在哪。
+    /// （生产是 10 秒 idle / 30 秒总时限，这里等比缩到 200ms / 5s，走的是同一条代码路径。）
+    #[test]
+    fn idle_per_request_cap_is_reported_as_request_failure_not_deadline() {
+        let (listener, port) = bind_local();
+        let server = serve_on(listener, 1, move |_, _| {
+            std::thread::sleep(Duration::from_millis(700));
+            ok_body("too late")
+        });
+        let state = HttpState::new();
+        let route = state.route_at(Instant::now(), ProxySettings::default);
+        let started = Instant::now();
+        let result = send_within(
+            &route,
+            &local_caps(&[port]),
+            &format!("http://127.0.0.1:{port}/silent"),
+            "GET",
+            &[],
+            None,
+            started + Duration::from_secs(5),
+            Duration::from_millis(200),
+        );
+        let err = match result {
+            Err(err) => err,
+            Ok(resp) => panic!("200ms 单请求上限下必须失败，却拿到了 {}", resp.status),
+        };
+        assert!(
+            !err.message.contains("总时限"),
+            "这是 idle 档超时，不该记成总时限：{}",
+            err.message
+        );
+        assert!(
+            err.message.contains("请求失败"),
+            "idle 超时的文案要保留底层原因：{}",
+            err.message
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "idle 超时也要在秒级内返回，实际 {:?}",
+            started.elapsed()
+        );
+        let _ = server.join();
     }
 }

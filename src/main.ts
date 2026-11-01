@@ -1,9 +1,18 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
+import { markBootReady, showFatalError } from "./boot-error";
 import { loadSpriteSet, FRAME_SIZE, type SpriteSet } from "./pet/sprites";
 import { activeSkin } from "./pet/skins";
 import { DragDirectionTracker, PetStateMachine, type PokeZone } from "./pet/state-machine";
 import { DragController } from "./pet/drag-controller";
+import {
+  WindowMoveTracker,
+  cssScreenPoint,
+  dragEndState,
+  normalizeDpr,
+  pressAnchor,
+  type DragAnchor,
+} from "./pet/drag-geometry";
 import { pickLine } from "./pet/dialogue";
 import { registerPetController } from "./pet/host";
 import { installClickThrough } from "./pet/click-through";
@@ -128,29 +137,77 @@ function setStatus(pluginId: string, text: string | null): string | null {
 // 按下后移动超过阈值才启动系统级拖拽（拖拽会吞掉后续鼠标事件），
 // 否则抬起视为「戳一戳」：按部位触发反应 + 台词气泡
 /**
+ * 按下时的锚点（窗口物理位置 + 指针在窗口内的偏移）。拖动起点、方向、收尾全靠它，
+ * 不再拿 `screenX/screenY` 当窗口坐标 —— 那是 WebView 的 CSS 视口口径，跨 DPI 会差一个倍率（G6-05）。
+ */
+let dragAnchor: DragAnchor | null = null;
+/** 最近一次观测到的真实窗口位置（onMoved / outerPosition 维护）：拖动期唯一还在动的观测 */
+let lastWindowPos: { x: number; y: number } | null = null;
+/** 最近一次的指针窗口内坐标（缩放变化 / 取消按下时重算按下点用） */
+let lastPointer: { x: number; y: number } | null = null;
+/** 方向判定器（阈值 DRAG_DIRECTION_MIN_PX、去抖 DRAG_DIRECTION_COOLDOWN_MS 都在状态机侧） */
+const dragTracker = new DragDirectionTracker();
+/** 窗口位移采样：物理像素 → CSS px，跨 DPI 时重建基线（附录2 N1/G6-05） */
+const moveTracker = new WindowMoveTracker(normalizeDpr(window.devicePixelRatio));
+
+/**
+ * 按下 / 移动点统一成 CSS 屏幕坐标：真实窗口位置 ÷ dpr + 窗口内偏移。
+ * 拿不到窗口位置（监听还没回来）时退回窗口内坐标 —— 此时只能判阈值，判不了「窗口在哪」。
+ */
+function pointerPoint(clientX: number, clientY: number): { x: number; y: number } {
+  if (!lastWindowPos) return { x: clientX, y: clientY };
+  return cssScreenPoint({
+    windowX: lastWindowPos.x,
+    windowY: lastWindowPos.y,
+    clientX,
+    clientY,
+    dpr: normalizeDpr(window.devicePixelRatio),
+  });
+}
+
+/**
  * 按下 → 起拖 → 收尾的判定全在 DragController 里（G6-01/G6-02/G6-08）。
  * 放成可注入时钟的纯逻辑：拖动期 blur 的 100ms 宽限、真机吞 mouseup 的 250ms 静默兜底
  * 都只能在 node 里用假时钟验，摊在 main.ts 顶层（摸 document）就永远只能正则匹配源码。
+ * 几何口径另拆到 drag-geometry（锚点 / 落点 / 位移采样），同样纯函数可离线验。
  */
 const drag = new DragController({
   now: () => performance.now(),
+  // 停手（静默）不再当松手：先回落方向态，还在窗口上就继续拖（附录2 N1）
+  pauseInsteadOfSilent: true,
   onBegin: () => {
     // 先把此刻姿势记成松手后的复原目标，再交给系统拖拽。
     // 从这里往后 webview 收不到 mousemove，方向只能从窗口位移推（见 onWindowMoved）。
     pet?.beginDrag();
     dragTracker.begin();
+    moveTracker.reset(lastWindowPos?.x ?? null, normalizeDpr(window.devicePixelRatio));
     void petWindow.startDragging();
   },
+  onPause: () => {
+    // 停手：方向态回落常态（拖动会话还活着；窗口再动就把方向接回来）
+    pet?.dragDirection(null);
+    dragTracker.begin();
+  },
   onEnd: () => {
-    // 松手复原：拖动前是 waiting 就回 waiting，是插件插播就回那条（由状态机的快照决定）
-    pet?.endDrag();
-    dragTracker.begin(); // 清掉这次拖动残留的净位移，下一次从头攒
+    finishDrag();
   },
 });
-/** 窗口最近的物理 x（onMoved / outerPosition 维护）：拖动期算水平增量只靠它 */
-let lastWindowX: number | null = null;
-/** 方向判定器（阈值 DRAG_DIRECTION_MIN_PX、去抖 DRAG_DIRECTION_COOLDOWN_MS 都在状态机侧） */
-const dragTracker = new DragDirectionTracker();
+
+/** 收尾：复原姿势 + 用真实窗口位置重建位移基线（不用 screenX/screenY） */
+function finishDrag(): void {
+  const anchor = dragAnchor;
+  dragAnchor = null;
+  moveTracker.reset(lastWindowPos?.x ?? null, normalizeDpr(window.devicePixelRatio));
+  if (anchor && lastWindowPos) {
+    // 结束状态由「真实落点」算：真机松手时既没有可信的 mouseup，screenX/screenY 也不再更新
+    const end = dragEndState(anchor, lastWindowPos.x, lastWindowPos.y);
+    // 松手后没人给我们发 mousemove：窗口真被拖走了，光标才肯定不在立绘上，这时清掉悬停高亮
+    if (end.distanceCss > 0) document.documentElement.classList.remove("over-pet");
+  }
+  // 松手复原：拖动前是 waiting 就回 waiting，是插件插播就回那条（由状态机的快照决定）
+  pet?.endDrag();
+  dragTracker.begin(); // 清掉这次拖动残留的净位移，下一次从头攒
+}
 
 function insideSprite(clientX: number, clientY: number): boolean {
   const r = spriteRect();
@@ -159,13 +216,27 @@ function insideSprite(clientX: number, clientY: number): boolean {
 
 document.addEventListener("mousedown", (e) => {
   if (e.button !== 0) return;
-  drag.pressDown(e.screenX, e.screenY); // 上一趟拖拽的 mouseup 没收到时先按「松手」收尾
+  lastPointer = { x: e.clientX, y: e.clientY };
+  // 抓「真实窗口位置 + 窗口内偏移」当拖动起点：起拖时保留当前偏移，窗口不跳一下（附录2 N1）
+  dragAnchor = lastWindowPos
+    ? pressAnchor({
+        windowX: lastWindowPos.x,
+        windowY: lastWindowPos.y,
+        clientX: e.clientX,
+        clientY: e.clientY,
+        dpr: normalizeDpr(window.devicePixelRatio),
+      })
+    : null;
+  const p = pointerPoint(e.clientX, e.clientY);
+  drag.pressDown(p.x, p.y); // 上一趟拖拽的 mouseup 没收到时先按「松手」收尾
 });
 
 document.addEventListener("mousemove", (e) => {
+  lastPointer = { x: e.clientX, y: e.clientY };
   document.documentElement.classList.toggle("over-pet", insideSprite(e.clientX, e.clientY));
   // 起拖判定与「松键了但没收到 mouseup」的补救都在控制器里
-  drag.pointerMove(e.screenX, e.screenY, e.buttons);
+  const p = pointerPoint(e.clientX, e.clientY);
+  drag.pointerMove(p.x, p.y, e.buttons);
 });
 
 // 按下后指针移出窗口、或在窗口外抬起、或失焦：都必须复位，否则 press 会一直挂着
@@ -218,33 +289,35 @@ function onceOnly(unlisten: () => void): () => void {
 }
 
 /** 拖动期的窗口位移 → 方向态。非拖动期只更新基线，不碰状态机 */
-function onWindowMoved(x: number): void {
-  const prev = lastWindowX;
-  lastWindowX = x;
+function onWindowMoved(pos: { x: number; y: number }): void {
+  // 窗口位置是拖动期唯一可信的观测：它给的是真实（物理）窗口坐标，
+  // 不是 WebView 的 screenX/screenY，跨 DPI 不用再猜倍率（附录2 N2）
+  lastWindowPos = pos;
   // 真实位移同时喂给静默兜底：窗口还在动就说明 DragController 的拖拽还活着（G6-02）
   if (drag.isEngaged) drag.windowMoved();
-  // 第一个采样只用来铺基线：没有上一个点就算不出位移。
-  // 拖动中几乎每帧都有事件，所以这最多丢掉开头一帧的量，紧接着的位移照样把方向判出来。
-  if (!drag.isEngaged || prev === null || !pet) return;
-  // onMoved 给的是物理像素，阈值口径是 CSS px：除 dpr 让 200% 缩放下手感一致
-  const dx = (x - prev) / (window.devicePixelRatio || 1);
-  pet.dragDirection(dragTracker.sample(dx, performance.now()));
+  if (!drag.isEngaged || !pet) return;
+  // onMoved 给的是物理像素、阈值口径是 CSS px：由采样器换算；
+  // 缩放（dpr）中途变了就只重建基线，不把旧倍率的位移混进方向判定（G6-05）
+  const sample = moveTracker.sample(pos.x, normalizeDpr(window.devicePixelRatio));
+  if (sample.rescaled || sample.dxCss === 0) return;
+  pet.dragDirection(dragTracker.sample(sample.dxCss, performance.now()));
 }
 
 async function installDragTracking(): Promise<void> {
   if (dragTrackingDisposed || dragTrackingPending || unlistenMoved) return; // 重复 activate 不叠加监听
   dragTrackingPending = true;
   try {
-    const un = await petWindow.onMoved(({ payload }) => onWindowMoved(payload.x));
+    const un = await petWindow.onMoved(({ payload }) => onWindowMoved(payload));
     if (dragTrackingDisposed) {
       un(); // 等监听挂上的这段时间窗口已经开始拆了：挂上就立刻摘掉
       return;
     }
     unlistenMoved = onceOnly(un);
     // 先订阅再读一次位置：反过来的话，两步之间的窗口移动会丢基线；
-    // 只在不被事件填过时才采用（事件载荷比这次 IPC 更新）
+    // 只在不被事件填过时才采用（事件载荷比这次 IPC 更新）。纵向也记，收尾要用整份位置。
     const pos = await petWindow.outerPosition();
-    if (lastWindowX === null) lastWindowX = pos.x;
+    if (!lastWindowPos) lastWindowPos = { x: pos.x, y: pos.y };
+    moveTracker.reset(lastWindowPos.x, normalizeDpr(window.devicePixelRatio));
   } catch (err) {
     console.error("[pet] 监听窗口移动失败", err);
   } finally {
@@ -293,6 +366,27 @@ let last = performance.now();
 let rafId = 0;
 
 function tick(now: number): void {
+  try {
+    paint(now);
+  } catch (err) {
+    // 一帧画挂不许把整个渲染循环带走（G4-10）：原来异常会跳过下一帧的 rAF，画面永久冻住
+    console.error("[pet] 渲染帧失败", err);
+  } finally {
+    rafId = requestAnimationFrame(tick);
+  }
+}
+
+/** 立刻重绘一帧（不等下一次 rAF）：resize / 改缩放之后画面要马上按新尺寸画出（G4-08） */
+function paintNow(): void {
+  try {
+    paint(performance.now());
+  } catch (err) {
+    console.error("[pet] 重绘失败", err);
+  }
+}
+
+function paint(now: number): void {
+  if (!pet) return;
   const dt = Math.min((now - last) / 1000, 0.1);
   last = now;
   // 拖动期的 blur 宽限与「静默 250ms 按松手收尾」都按渲染帧裁决（G6-01/G6-02）
@@ -335,8 +429,6 @@ function tick(now: number): void {
     f.nh * size,
   );
   ctx.restore();
-
-  rafId = requestAnimationFrame(tick);
 }
 
 let stopThrough: (() => void) | null = null;
@@ -387,6 +479,13 @@ function watchDpr(): void {
     () => {
       // 帧是源矩形切片，与 dpr 无关：改缩放只需要按新的 devicePixelRatio 重设画布
       fitCanvas();
+      syncLayout();
+      // 倍率变了，按下点的 CSS 口径也跟着变：用最后一个指针位置重锚，免得这趟拖动跳一格（G6-05）
+      if (lastPointer) {
+        const p = pointerPoint(lastPointer.x, lastPointer.y);
+        drag.reanchor(p.x, p.y);
+      }
+      paintNow(); // 改缩放后至少立刻重绘一次，不等下一帧（G4-08）
       watchDpr();
     },
     { once: true },
@@ -425,6 +524,7 @@ async function init(): Promise<void> {
   window.addEventListener("resize", () => {
     fitCanvas();
     syncLayout();
+    paintNow(); // 窗口缩放后立刻重绘一次（G4-08）：只改画布不重绘会留旧尺寸残影
   });
   // dpr 变化（换显示器 / 改系统缩放）靠这条媒体查询感知，resize 事件不一定触发
   watchDpr();
@@ -432,4 +532,14 @@ async function init(): Promise<void> {
   window.setTimeout(() => sayRandom(pickLine("waving")), 700);
 }
 
-void init();
+void init().then(
+  () => {
+    // 装配完成：之后插件域的未捕获错误只进日志/横幅，不再盖整窗红条（G4「错误分类」）
+    markBootReady();
+  },
+  (error) => {
+    // 形象/首帧都装不起来的窗口是真起不来：直接亮兜底条，别让它静默半死
+    console.error("[pet] 启动失败", error);
+    showFatalError(error);
+  },
+);

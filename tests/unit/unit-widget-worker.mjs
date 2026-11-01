@@ -146,16 +146,37 @@ describe("区域边界：ctx.host 只在 settings 区存在", () => {
     assert.deepEqual(Object.keys(cap.ctx().host.agentHooks).sort(), fromProto);
   });
 
-  it("旧三方法仍按零参数下发（加透传不该把它们变成带参调用）", async () => {
+  it("零参方法仍然零参（status/uninstall 不带参，install 走下面两条单独钉）", async () => {
     const cap = captureCtx(() => undefined);
     const h = harness({ module: cap.module, region: "settings" });
     await h.boot();
-    for (const name of ["status", "install", "uninstall"]) {
+    for (const name of ["status", "uninstall"]) {
       void cap.ctx().host.agentHooks[name]();
       const call = h.sent.filter((m) => m.t === "call").at(-1);
       assert.equal(call.method, `agentHooks.${name}`);
       assert.deepEqual(call.args, [], `${name} 多带了参数`);
     }
+  });
+
+  it("install(true) 把确认位一起交给宿主（否则「仍要打开」是死按钮）", async () => {
+    // 2026-11-01 本机 E2E 实红：settings 区 ctx 用零参工厂转发 install，confirm 被吞，
+    // 宿主永远只回 [need-confirm]，用户点多少次「仍要打开」都装不上。
+    const cap = captureCtx(() => undefined);
+    const h = harness({ module: cap.module, region: "settings" });
+    await h.boot();
+    void cap.ctx().host.agentHooks.install(true);
+    const call = h.sent.filter((m) => m.t === "call").at(-1);
+    assert.equal(call.method, "agentHooks.install");
+    assert.deepEqual(call.args, [true]);
+  });
+
+  it("install 不带 confirm 时补 false（第一趟要停在确认门，不能默认放行）", async () => {
+    const cap = captureCtx(() => undefined);
+    const h = harness({ module: cap.module, region: "settings" });
+    await h.boot();
+    void cap.ctx().host.agentHooks.install();
+    const call = h.sent.filter((m) => m.t === "call").at(-1);
+    assert.deepEqual(call.args, [false]);
   });
 
   it("set('zcode', true) 把两个参数一起交给宿主", async () => {

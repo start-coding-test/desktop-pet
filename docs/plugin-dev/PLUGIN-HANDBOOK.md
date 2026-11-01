@@ -52,6 +52,11 @@ npm run verify         # 终端 2：宿主回归（147 条）
 4. **设置页必须回显当前配置。** 面板是在另一个窗口新建的，拿不到插件的历史数据；直接渲染默认值会造成
    「配置没保存」的错觉，而且用户动一个开关会把没显示的另一项写回默认。做法：每次状态变化都 `ctx.widget.update(全量配置)`，
    面板挂载时订阅 `<id>:widget` 并据此设控件。宿主的 `bus_peek` 回灌**只在你真的推送过之后**有效。
+   回显还要带**防冲写守卫**：控件正被用户编辑（`activeElement` 命中、或本地的「刚选/刚输入」标记未消费）时，
+   不要把远端状态整片写回控件 —— 否则一次状态推送会把用户敲了一半的阈值、刚选的 `<select>` 抹回旧值
+   （Bug4 的形态，`com.pet.astock` 与 `com.pet.goat-gauge` 的设置页都踩过；`verify:astock` / `verify:goat-gauge`
+   各有一条「改了未应用 → 推送不冲掉」的断言）。目前这份守卫在两处插件里是复制的，**共享 helper 还没抽**
+   （见 [HOST-BACKLOG](../process/HOST-BACKLOG.md) R5）；照抄时把「哪些控件算正在编辑」写成常量，别散在回调里。
 5. **自己的 `setInterval` / `setTimeout` 自己在 `deactivate()` 里清。** 宿主只回收总线订阅和 widget。
 6. **不要用 `requestAnimationFrame` 给插件逻辑计时**：宠物因游戏模式隐身时 rAF 可能仍在跑也可能被节流。用 `setInterval` 或事件驱动。
 7. **`ctx.bus.subscribe` 这个 API 本身就要在 manifest 声明 `bus:subscribe`**，不声明会在激活时被拒

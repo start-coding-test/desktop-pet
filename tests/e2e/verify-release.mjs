@@ -244,11 +244,20 @@ try {
         return { ok: false, url, reason: String(e) };
       }
     })()`);
-    r.check("打包版能真实读到 pet.json（connect-src 未收紧）", true, petJsonProbe?.ok === true);
+    // G7-08：这条探针要验的是「connect-src 没把 petskin 协议掐掉」，不是「当前皮肤一定带 v3 清单」。
+    // 以前要求 ok===true（即 HTTP 2xx），换一份没有 pet.json 的皮肤就常年红；现在分两档：
+    //   * fetch 抛错 / 拿不到 status ⇒ CSP 或协议真被拒 → 红；
+    //   * 404 ⇒ 允许（这份皮肤没有 v3 清单），200 ⇒ 必须是合法 JSON。
+    const petJsonReachable = petJsonProbe && (petJsonProbe.ok === true || petJsonProbe.status === 404);
     r.check(
-      "pet.json 是合法 JSON",
+      "打包版能真实请求 pet.json（connect-src 未收紧；404 表示这份皮肤没有 v3 清单）",
       true,
-      petJsonProbe?.parsed !== null && typeof petJsonProbe?.parsed === "object",
+      petJsonReachable,
+    );
+    r.check(
+      "pet.json 若随皮肤下发必须是合法 JSON（200 时）",
+      true,
+      petJsonProbe?.status !== 200 || (petJsonProbe?.parsed !== null && typeof petJsonProbe?.parsed === "object"),
     );
     const petManifestVersion = petJsonProbe?.parsed?.desktopPet?.version ?? null;
     r.info(

@@ -418,7 +418,11 @@ mod tests {
             std::fs::create_dir_all(isolated.join(leaf)).unwrap();
         }
         // 逐项覆盖变量会把 targets() 整条绕开，这里只验「home 根换根」这一条口径
-        for name in ["PET_AGENT_CONFIG_FILES", "PET_AGENT_CODEX_FILES", "PET_AGENT_WORKBUDDY_FILES"] {
+        for name in [
+            "PET_AGENT_CONFIG_FILES",
+            "PET_AGENT_CODEX_FILES",
+            "PET_AGENT_WORKBUDDY_FILES",
+        ] {
             std::env::remove_var(name);
         }
 
@@ -430,7 +434,9 @@ mod tests {
             "设了 PET_AGENT_HOME 就必须报生效 home"
         );
         assert_eq!(
-            value["defaultHome"].as_str().expect("defaultHome 必须是字符串"),
+            value["defaultHome"]
+                .as_str()
+                .expect("defaultHome 必须是字符串"),
             default.display().to_string(),
             "原始 home 留在 defaultHome 里，供排查时对照"
         );
@@ -453,7 +459,10 @@ mod tests {
                 );
             }
         }
-        assert!(with_files > 0, "至少一家真的报出候选文件，否则这条断言是空转");
+        assert!(
+            with_files > 0,
+            "至少一家真的报出候选文件，否则这条断言是空转"
+        );
 
         std::env::set_var("PET_AGENT_HOME", "   ");
         let blank = everywhere(&default);

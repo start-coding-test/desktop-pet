@@ -31,9 +31,24 @@ export function reloadIdsFrom(payload: unknown): string[] {
   return idListFrom(payload, "reloadIds");
 }
 
+/**
+ * 取 id 列表：只认**非空**字符串，按首次出现去重（附录2 N6）。
+ *
+ * 同一个 id 在载荷里出现两次是常态（一次覆盖可能被 watcher 的两条路径各报一遍）：
+ * 不去重会让上层把同一个插件重启两遍，第二遍往往撞在刚拆了一半的会话上；
+ * 空串/空白 id 直接丢掉 —— 它在会话表里会注册出一个键为空的条目，既查不到也删不掉。
+ */
 function idListFrom(payload: unknown, key: "ids" | "reloadIds"): string[] {
   const list = (payload as Record<string, unknown> | null | undefined)?.[key];
-  return Array.isArray(list) ? list.filter((x): x is string => typeof x === "string") : [];
+  if (!Array.isArray(list)) return [];
+  const out: string[] = [];
+  for (const item of list) {
+    if (typeof item !== "string") continue;
+    const id = item.trim();
+    if (!id || out.includes(id)) continue;
+    out.push(id);
+  }
+  return out;
 }
 
 /**

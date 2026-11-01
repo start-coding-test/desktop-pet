@@ -28,15 +28,24 @@
 ## 0.2.4（2026-10-28，修复轮）
 
 - 提交：`7448b3f`（DSH 桥，第五家）、`02e5102`（0.2.3）、`4df82f9`（收件目录回退修复轮）、
-  `b6d98cd`（release）、`993e1f2`（B6 拖动态）。
+  `b6d98cd`（release）。**不在 0.2.4 包内的 tag 后提交**：`993e1f2`（B6 拖动态；不是 `b6d98cd` 的祖先）、
+  `f2e9fd0`（文档）、`a18ec21`（F01′–F06 修复轮）。
 - tag：`v0.2.4`（annotated → `b6d98cd`）**已打**；GitHub Release **未建**（管理员）。
-- CI / E2E 门：**未跑**（E2E 只在本地跑过：`verify` 485/0、`verify:agent` 307/0（t38 修复后复验）、
-  `verify:drag` 41/0、`verify:dsh` 43/0；CI 侧未见绿）。
+- CI / E2E 门：`b6d98cd` 的 CI 绿（run `40643854516`，success）；E2E 门（`e2e.yml`）**未触发**。
+  本地读数（工作区、不是 tag 字节）：`verify` 485/0、`verify:agent` 303/4（t38 修复前记录）、
+  `verify:drag` 41/0、`verify:dsh` 43/0；基线见 `.github/workflows/e2e-gate.json`。
+  tag 后 `a18ec21` 的 CI **红在 Rust fmt**（run `40725727745` / `40725728961`），修复见 HOST-BACKLOG R1。
 - 已知事实：0.2.3 安装器**作废**（内嵌收件目录修复前的桥）；0.2.4 修复轮含收件目录回退、CRLF 判据、
   四家卸载断言、13 条恒真断言转真与发版口径纠偏。
 - 产物：`release-package/DesktopPet_0.2.4_x64-setup.exe`、`release-package/DesktopPet-0.2.4/`
   （本地产物、`.gitignore` 覆盖，不作为入库证据）；SHA256 **待补录**（本机未复跑产物校验）。
 - 未验：真机安装/覆盖升级、DSH 真机 `install_bundle` 一次后桌宠联动。
+- **工作区（2026-11-01 修复轮，不是 0.2.4 包字节、未提交、未推送）**：Rust fmt 已收口 ——
+  `cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check` 退出 0、0 处差异，写模式 fmt 前后
+  `git diff -- src-tauri/src` 指纹一致（零字节改动）；离线门 `npm run unit` 2636/0、
+  `cargo test` 428/0、`check:docs` / `check:shape` / `check:e2e-gate` / `lint` / `build` 全部退出 0；
+  clippy `-D warnings` 退出 0。**这一步不等于发版前置**：第 1 条（CI 绿）与第 2 条（E2E 门）仍缺新 run，
+  本轮没有推送，所以 0.2.4 的 CI/E2E 读数保持原样（CI 绿 run `40643854516`；E2E 门未触发；本轮 0 条 E2E 读数）。
 
 ## 0.2.3（作废）
 

@@ -125,10 +125,10 @@ group("astock 自选表：行情推送不冲掉正在输入的阈值（Bug4）")
   // 编辑标记不悬空：删行后重建成新行，回显照常写
   list.render({ watch: [item(77)], quotes: {} });
   const rebuilt = ops();
-  // 注意判据落在**哪只节点**上：`replaceChildren` 之后旧虚拟节点 id 作废（widget-node.ts 每次 create 都
-  // nextId++，replace 只发结构 op；「值搬移只能在 Worker 侧自己记」见 HANDOFF §4.3），所以重加回来的行是
-  // 新节点，回显必须写在新节点上。原先这条断言尾参里写的是首帧的 `upperId`（旧节点），拿死 id 读 op 流
-  // 永远是空数组 —— 只因它当年被放在第三参（detail）里、断言的是常量真，才一直绿。
+  // 注意判据落在**哪只节点**上：结构 op（replace）只换节点、不会搬旧 id（widget-node.ts 每次 create 都
+  // nextId++），所以删空再建回来的行是新节点，回显必须写在新节点上。F03′ 之后设置页的「回显守卫」只保证
+  // 不冲掉正在输入的文本与刚选的开关，不改变节点身份；原先这条断言尾参里写的是首帧的 `upperId`（旧节点），
+  // 拿死 id 读 op 流永远是空数组 —— 只因它当年被放在第三参（detail）里、断言的是常量真，才一直绿。
   const rebuiltUpperId = byPlaceholder(rebuilt, "涨到") ?? upperId;
   check("删空再建回来时新行照常回显 77", valueOps(rebuilt, rebuiltUpperId).some((o) => o.value === "77"), JSON.stringify(valueOps(rebuilt, rebuiltUpperId)));
 }

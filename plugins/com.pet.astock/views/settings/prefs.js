@@ -6,6 +6,7 @@
 import { MARKET_HOSTS, MARKET_SOURCES, sourceLabelOf } from "../../market.js";
 import { TOPIC_CMD } from "../../topics.js";
 import { button, clockOf, input, PHASE_TEXT, tag, text } from "../dom.js";
+import { syncCheck, syncRadioGroup, syncSelect } from "./lock.js";
 import { cardXOf, cardYOf, intervalOf, modeOf, netText, prefChecked, statusText } from "./util.js";
 
 const INDEXES = [
@@ -27,6 +28,8 @@ const MODE_TEXT = { badge: "宠物旁小字", overlay: "桌面盯盘卡（位置
  */
 export function mountPrefs(ctx, state) {
   const dom = ctx.dom;
+  /** 用户刚碰过、推送里的配置还没追上的控件（G5-04 / N5）：回显先绕开它们，见 lock.js */
+  const locks = new Set();
   /* ---------- 显示方式 ---------- */
   const modeInputs = {};
   const radios = tag(dom, "div", "radios");
@@ -35,7 +38,9 @@ export function mountPrefs(ctx, state) {
     box.setAttribute("name", "astock-mode"); // radio 分组靠 name attribute；契约里它走 attr 而不是 property
     box.value = value;
     box.on("change", () => {
-      if (box.checked) ctx.bus.publish(TOPIC_CMD, { action: "config", value: { mode: value } });
+      if (!box.checked) return;
+      locks.add(box); // 先上锁：下面这次发布落地前的推送不许把刚选的项冲回去
+      ctx.bus.publish(TOPIC_CMD, { action: "config", value: { mode: value } });
     });
     const label = tag(dom, "label");
     label.append(box, text(dom, MODE_TEXT[value])); // 契约里没有文本节点，行内文字一律包一层 span
@@ -94,15 +99,29 @@ export function mountPrefs(ctx, state) {
   const testBtn = button(dom, "试一条提醒");
   testBtn.on("click", () => ctx.bus.publish(TOPIC_CMD, { action: "testAlert" }));
 
+  // 复选框都是「勾上就立即发配置」：先上锁再发布，免得旧配置的推送把勾选状态冲回去（G5-04）
   const alertsBox = input(dom, "checkbox");
-  alertsBox.on("change", () => ctx.bus.publish(TOPIC_CMD, { action: "config", value: { alertsOn: alertsBox.checked } }));
+  alertsBox.on("change", () => {
+    locks.add(alertsBox);
+    ctx.bus.publish(TOPIC_CMD, { action: "config", value: { alertsOn: alertsBox.checked } });
+  });
   const petBox = input(dom, "checkbox");
-  petBox.on("change", () => ctx.bus.publish(TOPIC_CMD, { action: "config", value: { petOn: petBox.checked } }));
+  petBox.on("change", () => {
+    locks.add(petBox);
+    ctx.bus.publish(TOPIC_CMD, { action: "config", value: { petOn: petBox.checked } });
+  });
   const showIndexBox = input(dom, "checkbox");
-  showIndexBox.on("change", () => ctx.bus.publish(TOPIC_CMD, { action: "config", value: { showIndex: showIndexBox.checked } }));
+  showIndexBox.on("change", () => {
+    locks.add(showIndexBox);
+    ctx.bus.publish(TOPIC_CMD, { action: "config", value: { showIndex: showIndexBox.checked } });
+  });
   // 后备数据源开关（G5-08）：关掉后只打东财主源与各自主入口，别家域名一次都不碰
   const fallbackBox = input(dom, "checkbox");
-  fallbackBox.on("change", () => ctx.bus.publish(TOPIC_CMD, { action: "config", value: { allowFallback: fallbackBox.checked } }));
+  fallbackBox.on("change", () => {
+    // 这条以前每帧被无条件写（N5）：勾掉后备源后，下一帧推送还没追上就被写回勾上
+    locks.add(fallbackBox);
+    ctx.bus.publish(TOPIC_CMD, { action: "config", value: { allowFallback: fallbackBox.checked } });
+  });
   const indexSel = tag(dom, "select");
   for (const idx of INDEXES) {
     const opt = tag(dom, "option");
@@ -110,7 +129,10 @@ export function mountPrefs(ctx, state) {
     opt.textContent = idx.name;
     indexSel.append(opt);
   }
-  indexSel.on("change", () => ctx.bus.publish(TOPIC_CMD, { action: "config", value: { indexSecid: indexSel.value } }));
+  indexSel.on("change", () => {
+    locks.add(indexSel); // 同上：选完指数后旧配置的推送不许把下拉写回去
+    ctx.bus.publish(TOPIC_CMD, { action: "config", value: { indexSecid: indexSel.value } });
+  });
 
   const alertList = tag(dom, "div", "alerts");
   const netLine = tag(dom, "div", "muted");
@@ -153,15 +175,20 @@ export function mountPrefs(ctx, state) {
       netLine.textContent = netText(net, sourceLabelOf);
     }
 
-    for (const [value, box] of Object.entries(modeInputs)) box.checked = modeOf(cfg) === value;
+    // 一组开关走「追上即放」的回显（G5-04）：用户刚点过的先别动，等推送追上来
+    syncRadioGroup(
+      Object.entries(modeInputs),
+      modeOf(cfg),
+      locks,
+    );
     if (!editing) intervalInput.value = String(intervalOf(cfg));
     if (!cardXField.editing()) cardXField.el.value = String(cardXOf(cfg));
     if (!cardYField.editing()) cardYField.el.value = String(cardYOf(cfg));
-    alertsBox.checked = prefChecked(cfg.alertsOn);
-    petBox.checked = prefChecked(cfg.petOn);
-    showIndexBox.checked = prefChecked(cfg.showIndex);
-    fallbackBox.checked = cfg.allowFallback !== false;
-    if (cfg.indexSecid) indexSel.value = cfg.indexSecid;
+    syncCheck(alertsBox, prefChecked(cfg.alertsOn), locks);
+    syncCheck(petBox, prefChecked(cfg.petOn), locks);
+    syncCheck(showIndexBox, prefChecked(cfg.showIndex), locks);
+    syncCheck(fallbackBox, cfg.allowFallback !== false, locks);
+    if (cfg.indexSecid) syncSelect(indexSel, String(cfg.indexSecid), locks);
   };
 
   const renderAlerts = (d) => {

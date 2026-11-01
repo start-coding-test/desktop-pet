@@ -65,17 +65,30 @@ hook 文件的明确契约时走过（还要备份、原子替换、同意框）
 桥跑在**另一个应用**（DSH）的进程里，宿主与它是两个互不信任的故障域：
 
 1. **收件目录 = 外部输入**。桥写进 `inbox/<phase>.jsonl` 的每一行都按不可信数据处理：逐行
-   JSON 解析、字段白名单、未知 `phase` 丢弃、`agent` 只认 `phases::AGENT_IDS`（`dsh`），
-   落盘路径不由行内容决定（见 `src-tauri/src/services/agent/inbox.rs` 顶部注释）。宿主**不**从
-   这些行里取 hook 配置、命令、插件 id 或任何要执行/拼路径的字段。
-2. **桥拿不到宠物能力**。它没有 `invoke` 通道、不持有插件 id、不参与权限同意；能写哪里只由
-   宿主在启动时传进去的 `inboxDir` 决定。桥也不需要 `pet.*` 任何能力。
+   JSON 解析、字段白名单、未知 `phase` 丢弃、按行里的 `agent` 过滤来源。
+   - 写侧只有宿主自己（`inbox::hook_ingest`）取「命令行校验过的 agent」，不读 payload；桥的
+     收件行 `agent` 固定写 `dsh`。
+   - 读取侧（`src-tauri/src/services/agent/watcher.rs::line_agent`）**原样取行里的 `agent`**，
+     缺字段按 `phases::DEFAULT_AGENT`（`qoder`，兼容 A01 及更早的旧行）；这条过滤只决定
+     「进不进状态机与广播」，**不是身份认证**。因此同用户的任意进程都能往收件目录里伪造任意
+     来源的行（含 `dsh`）—— 这是本方案接受的残余风险：伪造者已经拿到该用户的文件权限，同一层
+     就能直接改桌宠的配置与账本；宿主不去猜「这一行是不是桥写的」。
+   - 宿主**不**从这些行里取 hook 配置、命令、插件 id 或任何要执行/拼路径的字段；收件的落盘
+     路径只由 phase 名与固定目录拼出来（`inbox::line_for`）。
+2. **桥拿不到宠物能力**。它没有 `invoke` 通道、不持有插件 id、不参与权限同意；桥也不需要
+   `pet.*` 任何能力。**能写哪里不经过宿主**：桥自己按三级顺序解析收件目录 —— `config.inboxDir`
+   → 环境变量 `PET_AGENT_INBOX` → `%APPDATA%/<identifier>/agent/inbox`（`integrations/dsh-bridge`
+   的 `resolveInbox`，落到与宿主 `inbox::inbox_dir` 同一个目录）。宿主既不传这个路径、也不校验
+   它；解析失败或写不进去的后果只是桌宠看不到事件（桥按「绝不影响会话」处理）。
 3. **安装/卸载的信任方向**：宿主只往安装目录投 bundle、只读 `profiles/*/package.json` 判断
    「装没装」（不执行 profile 里的代码）；真正的安装/卸载由用户在 DSH 里做。因此**卸载桌宠
    不等于卸载桥**——`agent_hooks_uninstall` 会在响应里带 `bridgeHint` 说明桥还挂在几个 profile，
    要用户自己去 DSH 卸（G6-11）。
 4. **失败边界**：桥的任何异常都不得反向破坏会话（capture never break session）；写侧有上限
-   （单行 32KiB / 单文件 8MiB / 排队 256 行），超限丢弃并只报一次，避免桥在 DSH 里把磁盘写满。
+   （单行 32KiB / 单文件 8MiB / 排队 256 行）。单行超限与排队超限丢掉那一条并只报一次；文件到
+   8MiB 则轮换成 `<phase>.jsonl.1` 后再继续追加（N2 纠偏：此前是永久丢行）。每次写前都按盘上
+   真实大小 `stat`，因为宿主在收件文件超过 2MiB 时会把它清空（`inbox::enforce_inbox_cap`），
+   缓存的大小必须服从盘上的事实 —— 否则桥会在宿主清空之后一直以为自己已经写满、彻底静默。
 5. **数据边界**：会话的 prompt / tool 输入会以明文 JSONL 落到桌宠的 appData 收件目录，离开
    DSH 的进程与它的数据目录。这是「桥」这个方案的固有代价，设置页在接入前必须写清（用户
    知情后再装），也是把 `PET_DSH_HOME`/`PET_AGENT_INBOX` 纳入隔离口径的原因（G2-06）。

@@ -126,9 +126,12 @@ permission_request(pluginId, pluginName, capabilities)   ← pluginName 由前�
 3. **回环与私网永不走代理**（第一道否决，压过 `ProxyOverride` 与 `<-host>` 强制项）：`localhost`、
    无点主机名、mDNS 的 `.local`（组播解析，交给 HTTP 代理本来就连不通）、`::1`、`0.0.0.0`，
    以及字面 IPv4 的 `127/8`、`10/8`、`172.16/12`、`192.168/16`、`169.254/16`、`100.64/10`（CGNAT）、
-   `192.0.0/24`、`198.18/15`、`224/4` 起；IPv4-mapped 的 IPv6 写法（`::ffff:127.0.0.1`、
+   `192.0.0/24`、`224/4` 起；IPv4-mapped 的 IPv6 写法（`::ffff:127.0.0.1`、
    `::ffff:7f00:1`）折回 IPv4 判。运行时的反向证据是 `verify` 里那条真打
    `http://localhost:1420/…` 的断言：这道否决一旦失效，那一跳就会红。
+   （2026-11-01 验收补：`198.18.0.0/15` 与 IPv6 `fc00::/7` 已从这一档**移出** —— 见文末
+   「补记（2026-11-01）：TUN fake-ip 与 ULA 的放行档」，否则 Clash/mihomo 的 fake-ip 会让
+   每个插件请求都被当成内网攻击而整批拒绝。）
 4. **不夸口的地方**（必须连着上面一条一起读）：否决只看**字面**主机名/IP。一个解析到内网 IP 的
    公网域名**不在本节的防护内** —— 挡住它的是本 ADR 的逐域名授权（`http:169.254.169.254` 这类
    默认没人授权），不是 B10。要做「先解析再判私网」需要引入 DNS 解析（新依赖 + 新的时序攻击面），
@@ -192,11 +195,20 @@ permission_request(pluginId, pluginName, capabilities)   ← pluginName 由前�
    已发出的凭据，所以是**不跟随**。纯函数 `is_scheme_downgrade` 带离线单测。
 3. **解析后再判私网（G3-03）**。**直连** agent 挂 `GuardedResolver`：每次 DNS 解析结果里只要
    有一个 IP 落到回环/私网/链路本地（复用 `http_proxy::is_public_ip` 那套 `127/8`、`10/8`、
-   `172.16/12`、`192.168/16`、`169.254/16`、`100.64/10`、`192.0.0/24`、`198.18/15`、`224/4`、
-   `::1`、`fc00::/7`、`fe80::/10` 与 IPv4-mapped 判定）就整批拒绝，不做「挑一个公网的用」
+   `172.16/12`、`192.168/16`、`169.254/16`、`100.64/10`、`192.0.0/24`、`224/4`、
+   `::1`、`fe80::/10`（含 `fe90::`/`fea0::`/`febf::` 整段）、`fec0::/10` 站点本地、`ff00::/8` 组播、
+   `64:ff9b::/96` 与 `64:ff9b:1::/48` 里嵌入私网 v4 的写法、`2002::/16` 里嵌入私网 v4、
+   `::a.b.c.d` 与 IPv4-mapped 判定）就整批拒绝，不做「挑一个公网的用」
    （那会给 DNS 轮询留后门）。**代理 agent 不挂**：它解析的是代理端点（常见 `127.0.0.1:7897`），
    挂上等于把用户自己的系统代理当成内网攻击拒掉；而走代理时目标主机由代理侧解析，
    本机没有可判的 IP。这条残余与第 4 条必须连着读。
+   **放行档（2026-11-01 补，别改回去）**：`198.18.0.0/15`（RFC 2544 基准段，同时是 Clash/mihomo
+   TUN fake-ip 与 Surge 的默认段）与 IPv6 `fc00::/7`（ULA，`fc00::`/`fd00::` 都算）按**公网**处理，
+   既不进「永不走代理」档、也不被 `GuardResolver` 拒。理由：开了 TUN + fake-ip 的用户机器上，
+   域名解析回来就是这个段，判成内网等于把所有插件 http 请求打死；而真正要挡的私网
+   （`10/8`、`172.16/12`、`192.168/16`、`127/8`、`169.254/16`、`fe80::/10`、`fec0::/10`）
+   一个都没放宽。这两档都有单测（`tun_fake_ip_range_is_public`、
+   `ipv6_ula_allowed_but_link_local_site_local_and_multicast_blocked`）。
 4. **残余（本次未收口，别当成已解决）**：
    - **`plugin_id` 仍由调用方自报**：同 realm 的插件可以 `import` 到宿主壳模块直接
      `invoke("store_get", { pluginId: "com.pet.other" })`；窗口是 `pet`/`settings` 时第 1 条放行。
@@ -240,3 +252,54 @@ permission_request(pluginId, pluginName, capabilities)   ← pluginName 由前�
   钉住放行档与拒档（含混合解析、mapped 私网），并覆盖「本地名解析到内网/云元数据/混合解析
   一律拒」的回环复核（复审 32-F1）；`guard_addresses_rejects_private_and_loopback_batches`
   钉住批量判定；`http_proxy::is_loopback_literal` 另有 v4/v6/mapped 的离线单测。
+
+### 补记（2026-11-01，验收 a18ec21）：TUN fake-ip / ULA 放行档、跨源头策略与超时拓扑
+
+三件事一起记，因为它们都发生在同一条出站路径（`services/http.rs`）上，且都容易被下一个人改回去。
+
+1. **TUN fake-ip 与 IPv6 ULA 属放行档（P1 修复）**。用户开着 Clash/mihomo 的 TUN + fake-ip
+   （默认 `198.18.0.1/16`，Surge 用 `198.18.0.0/15`）时，域名经系统代理解析回来就是
+   `198.18.x.x`；`fc00::/7` 同理是内网 DNS64/NAT64 与 ULA 的常见段。这两档此前落在
+   `is_private_v4` / `ipv6_form` 的拒档里 ⇒ 每个插件 http 请求都以
+   「拒绝连接内网地址 198.18.x.x（疑似 DNS rebinding）」整批失败，而 fake-ip 段恰恰不是
+   攻击面（它由本机 TUN 接管，指向公网真实端点）。现在的口径：
+   - 放行：`198.18.0.0/15`、`fc00::/7`（**只**这两档）。
+   - 仍拒：`127/8`、`10/8`、`172.16/12`、`192.168/16`、`169.254/16`、`100.64/10`、`192.0.0/24`、
+     `0.0.0.0/8`、`224/4`；IPv6 `::1`、`::`、`fe80::/10`（掩到 `fe80`–`febf`）、`fec0::/10`
+     站点本地、`ff00::/8` 组播、`64:ff9b::/96`+`64:ff9b:1::/48` 里嵌入私网 v4、
+     `2002::/16`（6to4）嵌入私网 v4、`::a.b.c.d`、IPv4-mapped 私网。
+   - 单测：`http_proxy::tun_fake_ip_range_is_public`、`fake_ip_target_is_not_machine_local_so_it_can_use_proxy`、
+     `private_loopback_and_link_local_v4_stay_blocked`、
+     `ipv6_ula_allowed_but_link_local_site_local_and_multicast_blocked`；
+     走代理与直连两条路都覆盖了（`loopback_and_private_never_use_proxy` 现在正反都断言：
+     `198.18.0.12`、`[fd00::21]` 必须拿代理 agent，`10.x`/`127.x` 必须不拿）。
+2. **跨源之后敏感头一律摘掉，且不再回填（P2 修复）**。旧实现按「上一跳」比 host
+   （`hop > 0 && host != last_host`），于是 `A → B → B` 这条链的第二跳会被判成「同源」，
+   把 A 的 `Authorization`/`Cookie` 又发给 B。现在的口径：
+   - 跨源判定用**起始源**（`scheme://host:port`，`origin_key`），一旦跨出去，
+     `stripped.credentials` / `stripped.origin_headers` 就永久置位，跳回原源也不回退 ——
+     「跨过域」这件事已经发生，补回就是再漏一次。
+   - `authorization`、`cookie`、`proxy-authorization` 跨源后不发（凭据档）；
+     `referer`、`origin` 跨源后不发（来源档）。宿主**从不改写**这几个头的值，只决定发不发：
+     改写 Referer 需要一个「该泄露到什么粒度」的策略表，本仓没有这份表，硬编一个就是假修复。
+   - 同源重定向仍然原样带着它们（否则正常登录跳转就断了）。
+   - 单测：`cross_origin_redirect_strips_credentials_on_every_later_hop`（A→B→B，第三跳不许有
+     authorization/cookie/referer/origin，非敏感头 `x-trace` 要活着）、
+     `same_origin_redirect_keeps_credentials`。
+   - 与代理的关系：代理环境变量/系统代理**不是**这条的修复手段，也不改变这条判定 ——
+     头是宿主加的，摘不摘只在宿主侧决定（走代理时那几跳同样适用）。
+3. **超时是两档，不是一档（P2 修复）**。`TIMEOUT`（10 秒）是 **idle/单请求墙钟**上限：
+   `AgentBuilder::timeout_connect/timeout_read/timeout_write` 管「卡住多久算断」，
+   每跳再用 `Request::timeout(min(剩余, TIMEOUT))` 压一道；`REQUEST_DEADLINE`（30 秒）是
+   **整条链的绝对 deadline**（含全部重定向跳）。为什么两档都要：idle 超时管不了「慢速滴灌」——
+   每 9 秒来一个字节的响应永远不会触发 idle，只靠它能把一次插件请求拖到分钟级，
+   而 IPC 与插件回调都在等。链上每一跳之前重算 `remaining(deadline, now)`，
+   花完就直接返回「请求超过总时限 30 秒」，不再发下一跳；没有新开线程也没有新依赖
+   （`Instant` 透传，`Request::timeout` 是 ureq 自带能力）。
+   单测：`absolute_deadline_bounds_the_whole_chain`（150ms 预算 + 慢服务，断言文案是总时限
+   且总耗时 < 3 秒，不引入分钟级测试）、
+   `idle_per_request_cap_is_reported_as_request_failure_not_deadline`（200ms idle + 700ms 慢服务，
+   断言报的是「请求失败」而不是「总时限」—— 两档不许互相冒充）。
+4. **同上一条一起读的残余**：`http` 的逐域名授权、DNS rebinding 守卫、跨源头策略都在宿主侧，
+   而**同 realm 的插件自报 `plugin_id`** 那条老缺口（ADR-0006 / 本 ADR 第 4 条）本轮**仍未收口**：
+   上面这些修复都不改变「宠物窗里的插件能冒充别的插件 id」这件事，别把它写成已解决。

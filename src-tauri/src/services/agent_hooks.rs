@@ -405,7 +405,11 @@ pub struct FileCheck {
 /// 报告能对得上而盘上不对的形状有两种：写到了别的路径（候选列表只说「会写哪里」，
 /// 报告说的也是同一批候选），或者 exe 换过路径导致旧命令还在。两者都会让状态页显示
 /// 「已安装」而事件其实不来 —— 这正是 G2-11 要判红的假绿，所以自检必须落在盘上而不是报告上。
-pub fn verify_installed(adapter: &dyn AgentAdapter, files: &[PathBuf], exe: &Path) -> Vec<FileCheck> {
+pub fn verify_installed(
+    adapter: &dyn AgentAdapter,
+    files: &[PathBuf],
+    exe: &Path,
+) -> Vec<FileCheck> {
     let display = exe.display().to_string();
     // JSON 里的 Windows 路径是双反斜杠，直接按显示串找会永远找不到（假红）：
     // 用 serde 转义一次，按配置文件里真实会出现的写法比对。
@@ -829,8 +833,7 @@ mod tests {
                     fs::create_dir_all(parent).unwrap();
                 }
             }
-            let reports =
-                install_files(*adapter, &files, exe, Some(dir.as_path()), true);
+            let reports = install_files(*adapter, &files, exe, Some(dir.as_path()), true);
             assert!(
                 any_installed(&reports),
                 "{}：夹具要先装上，否则自检看到的是「文件不存在」",
@@ -845,7 +848,8 @@ mod tests {
                 &format!("--agent {}", adapter.id()),
             );
             assert_eq!(
-                check["status"], "unverified",
+                check["status"],
+                "unverified",
                 "{}：没有可查日志时只能报 unverified，不能报 ok 或 null：{check}",
                 adapter.id()
             );
@@ -1049,7 +1053,14 @@ mod tests {
             r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"x.exe --pet-hook pre --agent zcode"}]}]}}"#,
         )
         .unwrap();
-        let tampered = self_check(&ZCODE, &ZCODE.targets(&dir), exe, None, &dir, "--agent zcode");
+        let tampered = self_check(
+            &ZCODE,
+            &ZCODE.targets(&dir),
+            exe,
+            None,
+            &dir,
+            "--agent zcode",
+        );
         assert_eq!(tampered["status"], "problem", "{tampered}");
         assert!(
             tampered["detail"].as_str().unwrap_or("").contains("7 条"),
@@ -1065,7 +1076,14 @@ mod tests {
             Some(dir.join("ledger-old").as_path()),
             true,
         );
-        let moved = self_check(&ZCODE, &ZCODE.targets(&dir), exe, None, &dir, "--agent zcode");
+        let moved = self_check(
+            &ZCODE,
+            &ZCODE.targets(&dir),
+            exe,
+            None,
+            &dir,
+            "--agent zcode",
+        );
         assert_eq!(moved["status"], "problem", "{moved}");
         assert!(
             moved["detail"].as_str().unwrap_or("").contains("exe"),
@@ -1074,7 +1092,14 @@ mod tests {
 
         // 装完候选文件消失 = 配置没落盘
         fs::remove_file(&file).unwrap();
-        let gone = self_check(&ZCODE, &ZCODE.targets(&dir), exe, None, &dir, "--agent zcode");
+        let gone = self_check(
+            &ZCODE,
+            &ZCODE.targets(&dir),
+            exe,
+            None,
+            &dir,
+            "--agent zcode",
+        );
         assert_eq!(gone["status"], "problem", "{gone}");
 
         // 没有可查日志的客户端（Qoder）：盘上核对通过，但日志自检没做 → 只能报 unverified

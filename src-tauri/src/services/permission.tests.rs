@@ -1049,3 +1049,29 @@ fn the_other_command_signatures_declare_host_error() {
         "permission_revoke 的 Err 侧必须是 HostError"
     );
 }
+
+/// 验收 N5：清理孤儿授权时**只**取消已经不装的插件的挂起请求，
+/// 仍然装着的插件把同意框开到一半，不能被这轮清扫顺手关掉。
+/// 也就是说「保留待授权项」是这条路径的契约，不是巧合。
+#[test]
+fn prune_keeps_pending_requests_of_installed_plugins() {
+    let known: HashSet<String> = ["todo".to_string(), "com.pet.hr-ble".to_string()]
+        .into_iter()
+        .collect();
+    let pending = vec![
+        "todo".to_string(),
+        "zz.gone".to_string(),
+        "com.pet.hr-ble".to_string(),
+        "zz.gone".to_string(),
+    ];
+    assert_eq!(
+        orphan_pending_ids(&pending, &known),
+        vec!["zz.gone".to_string()],
+        "只取消不在盘的那个，且去重"
+    );
+    // 全都在装 ⇒ 一个都不许清（清掉就是把用户眼前的同意框凭空收走）
+    assert!(
+        orphan_pending_ids(&pending[..1], &known).is_empty(),
+        "有装的插件的待授权项必须保留"
+    );
+}

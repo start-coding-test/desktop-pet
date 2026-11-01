@@ -28,8 +28,11 @@ const EMPTY_ROW = "\u0000empty";
  * @returns {{release: boolean, write: boolean, ledger: string}}
  */
 export function echoStep({ editing = false, value = "", want = "", ledger = null, force = false } = {}) {
-  // 「存」之后强制对齐一次：不信任框里的草稿，也不信任台账
-  if (force) return { release: false, write: true, ledger: want };
+  // 「存」之后强制对齐一次：不信任框里的草稿，也不信任台账。
+  // 但**编辑锁优先**（N3 回归）：用户在点「存」之后又动了手时，这一步不能再写 ——
+  // 否则刚敲的字符被在途的旧帧冲掉，而且 editing 永远等不到「追上」，锁卡死，
+  // 后面宿主怎么改都进不来。force 在这种情形下只有当帧作废，下一帧按编辑中的口径走。
+  if (force && !editing) return { release: false, write: true, ledger: want };
   if (editing) {
     // 追上即放开：这时写回的就是用户自己填的那串，冲不掉任何东西
     if (value === want) return { release: true, write: false, ledger: want };
@@ -48,6 +51,30 @@ export function echoStep({ editing = false, value = "", want = "", ledger = null
 export function savedLedger(boxes = {}) {
   const str = (v) => String(v ?? "").trim();
   return { upper: str(boxes.upper), lower: str(boxes.lower), pctNum: str(boxes.pct) };
+}
+
+/**
+ * 阈值提交前的自检（G5-10）：宿主只做「非正数 / 不是数字 → 清空」的收口，
+ * 所以「跌到 20 / 涨到 10」这种自相矛盾的输入原来会被静默发出去，下一帧把两格都清掉，
+ * 用户看到的是自己填的东西凭空消失。这里先把不能成立的情况拦下来、给一句人话提示，
+ * 并且**不放锁、不记账**：框里留着用户填的串，改完还能接着存。
+ * @param {{upper?: string, lower?: string}} input 两个输入框的当前串
+ * @returns {string | null} 提示文案；能成立时返回 null
+ */
+export function thresholdProblem({ upper = "", lower = "" } = {}) {
+  const parse = (raw) => {
+    const text = String(raw ?? "").trim();
+    return text === "" ? null : Number(text);
+  };
+  const up = parse(upper);
+  const low = parse(lower);
+  for (const n of [up, low]) {
+    if (n === null) continue;
+    if (!Number.isFinite(n)) return "阈值要填数字";
+    if (n <= 0) return "阈值要大于 0";
+  }
+  if (up !== null && low !== null && low > up) return "「跌到」不能高于「涨到」";
+  return null;
 }
 
 /**
@@ -215,6 +242,13 @@ export function mountWatchList(ctx, state) {
       // 「不用写」，框里就留着那串没生效的草稿（G5-01）。
       // 提交前不放开 —— 否则一次 tick 就把没存过的输入冲掉（Bug4 报的就是这个）。
       const saved = savedLedger({ upper: upper.value, lower: lower.value, pct: pct.value });
+      // 不能成立的组合先拦下来（G5-10）：不发指令、不放锁、不动台账，
+      // 框里那串留着让用户改；否则宿主把它们清空后看起来就像「点了存但没生效」。
+      const problem = thresholdProblem({ upper: saved.upper, lower: saved.lower });
+      if (problem) {
+        state.status?.set?.(problem, "error");
+        return;
+      }
       for (const [key, want] of Object.entries(saved)) row.last[key] = want;
       for (const box of [upper, lower, pct]) {
         editing.delete(box);
@@ -302,7 +336,12 @@ export function mountWatchList(ctx, state) {
         if (!kept.has(id)) {
           // 被删的行：连节点与编辑标记一起丢，别留悬空的 Set 成员
           rows.delete(id);
-          for (const node of [row.upper, row.lower, row.pct, row.limitBox]) editing.delete(node);
+          for (const node of [row.upper, row.lower, row.pct, row.limitBox]) {
+            editing.delete(node);
+            // 待办里的 forced 也要清（G5-01 回归）：节点作废后再也不会被 syncValue 消费，
+            // 留着只会随着删行次数一直涨
+            forced.delete(node);
+          }
         }
       }
       order = wanted.slice();

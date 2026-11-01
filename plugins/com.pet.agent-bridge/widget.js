@@ -151,8 +151,12 @@ function mountHookPanel(root, ctx, reportName) {
   let currentMode = "hook";
   // 上一次 set/install 带回的提示与自检结果；跟着 render 走，避免刷新一次就丢
   let lastHint = null;
+  // N5：宿主说「桥还挂在 N 个 profile 里」的那句话只出现在返回值里 —— 不记下来用户就看不见
+  let lastBridgeHint = null;
+  /** @type {{ text: string, status: string } | null} 自检结论：文案 + 原始状态（只有 problem 才红） */
   let lastCheck = null;
-  let pendingSwitch = null;
+  /** @type {null | (() => void)} 等用户拍板的那一次重试（切换或安装，都走同一个确认按钮） */
+  let pendingConfirm = null;
   // 动作区的两个文案随形态变（hook：安装/卸载；bridge：接入/断开）。
   // 按钮节点在下面才建，这里先占位，避免 render 引用到还没初始化的 const。
   /** @type {(mode: "hook" | "bridge") => void} */
@@ -227,11 +231,14 @@ function mountHookPanel(root, ctx, reportName) {
     // 「hook 命令指向 …」只对文件形态有意义：桥形态下这些条目根本不存在
     if (currentMode !== "bridge" && info.exe) lines.push(`hook 命令指向 ${info.exe}`);
     if (lastHint) lines.push(`生效条件：${lastHint}`);
-    if (lastCheck) lines.push(lastCheck);
+    // N5：桥是 DSH 进程里的 bundle，宿主摘不到 —— 这句话必须留在面板上，不然用户以为卸干净了
+    if (lastBridgeHint) lines.push(lastBridgeHint);
+    if (lastCheck) lines.push(lastCheck.text);
     // 面板文本先落地，四选一后画：清单万一为空或形状不对，也不该把状态回显一起冻住
     st.textContent = lines.join("\n");
-    st.classList.toggle("warn", st.dataset.state === "repair");
-    st.classList.toggle("bad", Boolean(lastCheck) && lastCheck.startsWith("自检"));
+    st.classList.toggle("warn", st.dataset.state === "repair" || lastCheck?.status === "pending");
+    // N4：红色**只**给「自检发现问题」。上一版按「以『自检』开头」判，结果「自检通过」也标红。
+    st.classList.toggle("bad", lastCheck?.status === "problem");
     paintActions(currentMode);
     paintPicker();
   };
@@ -244,31 +251,58 @@ function mountHookPanel(root, ctx, reportName) {
       st.textContent = `读取状态失败：${err instanceof Error ? err.message : String(err)}`;
     }
   };
-  const run = async (label, fn) => {
+  // 动作按钮的统一外壳（安装/卸载/接入/断开）。第一趟不带确认；宿主回 `[need-confirm]`
+  // 时把宿主那句说明原样显示出来，并把「仍要打开」挂到**这次动作**上 —— 点它再带
+  // confirm:true 跑同一件事（N3）。上一版把 `[need-confirm] …` 整串当失败文案打到面板上，
+  // ZCode 需要确认时用户就永远装不上，只能看见一个机器前缀。
+  const run = async (label, fn, confirm = false) => {
     hideConsent();
     st.dataset.state = "loading";
     st.textContent = `${label}中…`;
     try {
-      const result = await fn();
+      const result = await fn(confirm);
       // install/uninstall/set 的返回里带 hint 与 selfCheck：先记下再拉 status 重渲染
       // （条数与状态一律以宿主的 status() 为准，界面不缓存自己算的数）
       if (result && typeof result === "object") {
         if (result.hint) lastHint = String(result.hint);
+        // G6-11/N5：卸载/切换会把「桥还挂在 N 个 profile 里」放在 bridgeHint 里，必须留下来
+        lastBridgeHint = typeof result.bridgeHint === "string" ? result.bridgeHint : null;
         lastCheck = describeCheck(result.selfCheck);
       }
       await refresh();
     } catch (err) {
+      const raw = String(err?.message ?? err ?? "");
+      // 与 switchTo 同一条判断：只看 ASCII 前缀，不猜中文（契约见 linkage::NEED_CONFIRM）
+      if (raw.startsWith("[need-confirm]")) {
+        st.dataset.state = "consent";
+        st.textContent = `${raw.slice("[need-confirm]".length).trim()}\n（还没动手；「仍要打开」才会真的${label}）`;
+        showConsent(() => run(label, fn, true));
+        return;
+      }
       st.dataset.state = "error";
-      st.textContent = `${label}失败：${err instanceof Error ? err.message : String(err)}`;
+      st.textContent = `${label}失败：${raw}`;
     }
   };
 
-  // 装后自检的三种结果要说人话，尤其「没查」不能被显示成「查过且没问题」
+  // 装后自检的五种结论都要说人话，尤其「没查/查不动/待确认」不能被显示成「查过且没问题」。
+  // 返回 { text, status }：文案进面板，status 决定颜色（只有 problem 才红，见 render）。
   const describeCheck = (raw) => {
     if (!raw || typeof raw !== "object") return null;
-    if (raw.status === "problem") return `自检发现问题：${raw.detail}\n日志原文：${raw.line}`;
-    if (raw.status === "unavailable") return `自检未做：${raw.detail}`;
-    if (raw.status === "ok") return `自检通过：${raw.detail}`;
+    const status = String(raw.status ?? "");
+    const detail = typeof raw.detail === "string" ? raw.detail : "";
+    if (status === "problem") {
+      // 日志原文挂在 raw.log.line（agent_hooks::self_check 的形状）；盘上核对失败时**没有**
+      // 日志可引 —— 这时不许拼出「日志原文：undefined」（N4）。
+      const line = raw.log && typeof raw.log.line === "string" ? raw.log.line : "";
+      const text = line ? `自检发现问题：${detail}，日志原文：${line}` : `自检发现问题：${detail}`;
+      return { text, status };
+    }
+    // pending = 日志里还有一条等用户确认的记录（不是失败，但也还没证明生效）
+    if (status === "pending") return { text: `自检待确认：${detail}`, status };
+    // unverified = 这家没有可查日志（或日志读不动）：只做了盘上核对，不能报「通过」
+    if (status === "unverified") return { text: `自检未复核：${detail}`, status };
+    if (status === "unavailable") return { text: `自检未做：${detail}`, status };
+    if (status === "ok") return { text: `自检通过：${detail}`, status };
     return null;
   };
 
@@ -281,6 +315,8 @@ function mountHookPanel(root, ctx, reportName) {
     try {
       const result = await api.set(id, confirm);
       lastHint = result?.hint ?? null;
+      // G6-11/N5：从 DSH 切走时桥仍挂在对方 profile 里，宿主把这句话放在 bridgeHint
+      lastBridgeHint = typeof result?.bridgeHint === "string" ? result.bridgeHint : null;
       lastCheck = describeCheck(result?.selfCheck);
       await refresh();
     } catch (err) {
@@ -292,7 +328,7 @@ function mountHookPanel(root, ctx, reportName) {
       if (raw.startsWith("[need-confirm]")) {
         st.dataset.state = "consent";
         st.textContent = `${raw.slice("[need-confirm]".length).trim()}\n（当前选中未变；「仍要打开」才会动手）`;
-        showConsent(id);
+        showConsent(() => switchTo(id, true));
         return;
       }
       st.dataset.state = "error";
@@ -310,17 +346,19 @@ function mountHookPanel(root, ctx, reportName) {
   consentBtn.type = "button";
   consentBtn.className = "hk-consent";
   consentBtn.textContent = "仍要打开";
+  // 槽位里存的是「带确认再跑一次」的闭包，不是 agent id：切换与安装都要能复用同一个按钮
   consentBtn.on("click", () => {
-    if (pendingSwitch) void switchTo(pendingSwitch, true);
+    const retry = pendingConfirm;
+    if (retry) void retry();
   });
   consentSlot.append(consentBtn);
   box.append(consentSlot);
-  const showConsent = (id) => {
-    pendingSwitch = id;
+  const showConsent = (retry) => {
+    pendingConfirm = retry;
     consentSlot.className = "hk-consent-slot on";
   };
   const hideConsent = () => {
-    pendingSwitch = null;
+    pendingConfirm = null;
     consentSlot.className = "hk-consent-slot";
   };
 
@@ -337,7 +375,9 @@ function mountHookPanel(root, ctx, reportName) {
     currentMode === "bridge"
       ? { install: "接入", uninstall: "断开" }
       : { install: "安装", uninstall: "卸载" };
-  const installBtn = button("安装", "hk-install", () => run(words().install, () => api.install()));
+  const installBtn = button("安装", "hk-install", () =>
+    run(words().install, (confirm) => api.install(confirm)),
+  );
   const uninstallBtn = button("卸载", "hk-uninstall", () => run(words().uninstall, () => api.uninstall()));
   actions.append(installBtn, uninstallBtn, button("刷新", "hk-refresh", () => refresh()));
   paintActions = (mode) => {

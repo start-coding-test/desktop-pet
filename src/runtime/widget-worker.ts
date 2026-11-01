@@ -51,7 +51,8 @@ export interface WorkerWidgetContext {
 
 export interface AgentHooksApi {
   status(): Promise<unknown>;
-  install(): Promise<unknown>;
+  /** 第二趟带 `confirm: true` 才是用户按了「仍要打开」；不带就按 false 走确认门 */
+  install(confirm?: boolean): Promise<unknown>;
   uninstall(): Promise<unknown>;
   /** 唯一一个带参数的：切换要同时交出「选哪家」和「用户已确认」 */
   set(agent: string, confirm?: boolean): Promise<unknown>;
@@ -115,7 +116,10 @@ export function createWidgetRuntime(deps: WidgetRuntimeDeps): WidgetRuntime {
       ctx.host = {
         agentHooks: {
           status: agent("agentHooks.status"),
-          install: agent("agentHooks.install"),
+          // confirm 必须原样带过去：ZCode 那类客户端的「仍要打开」全靠这一位才从
+          // [need-confirm] 变成真安装。零参工厂会把 true 吞掉 —— 设置页就永远停在确认门、
+          // 盘上一个字节都不写（2026-11-01 本机 E2E 实测到的死路，见 ACCEPTANCE 记录）。
+          install: (confirm?: boolean) => call("agentHooks.install", [confirm ?? false]),
           uninstall: agent("agentHooks.uninstall"),
           // 不能套上面那个零参工厂：set 少了 agent 与 confirm 就切不动，宿主只会收到一次 agent 为空的调用
           set: (agentId, confirm) => call("agentHooks.set", [agentId, confirm ?? false]),

@@ -12,7 +12,7 @@ import {
   isThrottleError,
 } from "./api.js";
 import { mergeChartBuckets, mergeUsagePages, nextPageCursor } from "./internal.js";
-import { internalFetchGate } from "./guards.js";
+import { internalFetchGate, snapshotGate } from "./guards.js";
 import { buildPanelPayload } from "./panel.js";
 import { mergeDaily, replaceChartDays } from "./daily.js";
 import { clearCookieAfterAuthFailure, COOKIE_EXPIRED_TEXT, maskCookie, migrateSecrets } from "./secrets.js";
@@ -52,6 +52,8 @@ let timer = 0;
 let overlayChain = Promise.resolve();
 let stopped = false;
 let busy = false;
+/** `refreshSnapshot` 已有一路在跑（N6）：入口在任何 await 之前看它，别和 Cookie 换数那一段叠着写状态。 */
+let snapshotBusy = false;
 /** `/internal` 自己有在飞的拉取时置位：定时刷新与手动刷新别把同一批页叠着打。 */
 let internalBusy = false;
 /** 宿主 agent:state 的最近一次运行态；没有事件时保持默认间隔。 */
@@ -219,6 +221,9 @@ function publishView() {
     alerts: snapshot?.alerts ?? [],
     config: cloneConfig(),
     cookie: { configured: !!cookie, state: cookieState, masked: maskCookie(cookie) },
+    // 宿主到底有没有给加密存储（G5-14）：设置页的说明文案得跟着这个变，
+    // 不能在不加密的机器上还写「DPAPI 按当前用户加密」。
+    secrets: { available: secretsReady },
     records,
     daily: usage.daily,
     charts: usage.charts_by_day,
@@ -439,8 +444,10 @@ async function handleRefreshError(err) {
 async function refreshInternal() {
   // 守卫（G5-05）：停用后 ctx 已清空、演示模式不该出网、刷新重叠不该叠着打 ——
   // 三种情况一律不发请求、不改 cookieState（以前可选链让这段「能跑」，却在空上下文上写状态）。
-  if (internalFetchGate({ ctx, cookie, demo: config.demo, busy, internalBusy })) return;
+  if (internalFetchGate({ ctx, cookie, demo: config.demo, busy, internalBusy })) return false;
   internalBusy = true;
+  /** 这一轮有没有提交新数据（N7：changed 才让明细页重发） */
+  let changed = false;
   try {
     const pages = [];
     const seen = new Set();
@@ -475,8 +482,10 @@ async function refreshInternal() {
       countedThroughMs = nextDaily.counted_through_ms;
       chartsByDay = replaceChartDays(chartsByDay, buckets);
       await persist(["records", "daily", "counted_through_ms", "charts_by_day"]);
+      changed = true;
     } else {
       records = merged;
+      changed = true;
     }
     cookieState = "ready";
   } catch (err) {
@@ -489,18 +498,37 @@ async function refreshInternal() {
       cookieState = "expired";
       lastError = COOKIE_EXPIRED_TEXT;
       status(lastError, "warn");
-      return;
+      return false;
     }
     cookieState = "error";
     lastError = err?.message ?? String(err);
   } finally {
     internalBusy = false;
   }
+  return changed;
 }
 
 async function refreshSnapshot() {
-  if (busy || !alive()) return;
-  if (cookie) await refreshInternal();
+  // 重入守卫（N6）：老写法只判 busy，而 busy 要等 Cookie 换数那一段 await 完才置位，
+  // 那段时间里第二路刷新能同时进来。snapshotBusy 在任何 await 之前置位、finally 里清掉。
+  if (snapshotGate({ reentrant: snapshotBusy, busy, alive: alive() })) return;
+  snapshotBusy = true;
+  try {
+    await runRefreshSnapshot();
+  } finally {
+    snapshotBusy = false;
+  }
+}
+
+/** refreshSnapshot 的本体；入口守卫与重入标记在外层，这里只管干活 */
+async function runRefreshSnapshot() {
+  let internalChanged = false;
+  if (cookie) {
+    // /internal 也会改 records/daily/charts：它变了就让明细页更新（N7）。
+    // 以前只有整轮快照成功才 publishPanel，Cookie-only 那条路径提前 return，明细页会停在旧数。
+    internalChanged = await refreshInternal();
+    if (internalChanged) publishPanel();
+  }
   if (!config.demo && !cred.apiKey) {
     viewState = "onboarding";
     publishView();
@@ -603,7 +631,7 @@ async function refreshSnapshot() {
     lastError = summaryFailed ? "用量汇总暂不可用，保留上次数据" : "";
     publishView();
     publishUsage(prev, snapshot);
-    if (historyChanged) publishPanel();
+    if (historyChanged || internalChanged) publishPanel();
     void syncOverlay();
     scheduleNext();
   } catch (err) {
@@ -621,7 +649,8 @@ async function handleCmd(cmd) {
       publishPanel();
       return;
     case "refresh": {
-      if (busy) {
+      // snapshotBusy 也要算（N6）：Cookie 换数那一段在飞时 busy 还是 false，别让手动刷新叠进去
+      if (busy || snapshotBusy) {
         status("正在刷新，请稍候", "info");
         return;
       }

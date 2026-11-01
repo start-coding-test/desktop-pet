@@ -448,9 +448,7 @@ pub fn is_loopback_literal(host: &str) -> bool {
         return true;
     }
     let lower = host.to_ascii_lowercase();
-    lower == "::1"
-        || lower == "0:0:0:0:0:0:0:1"
-        || mapped_v4(&lower).is_some_and(|v| v[0] == 127)
+    lower == "::1" || lower == "0:0:0:0:0:0:0:1" || mapped_v4(&lower).is_some_and(|v| v[0] == 127)
 }
 
 /// 点分四段（含前导零宽松解析失败即不认）才返回；主机名不是 IP 时返回 None。
@@ -480,7 +478,8 @@ fn is_private_v4(v: [u8; 4]) -> bool {
         || (a == 172 && (16..=31).contains(&b))
         || (a == 192 && b == 168)
         || (a == 192 && b == 0 && v[2] == 0) // 192.0.0.0/24 IETF 协议分配
-        || (a == 198 && (b == 18 || b == 19)) // 基准测试
+        // 198.18.0.0/15 是 RFC 2544 基准网段，Clash/mihomo TUN fake-ip 也使用它。
+        // 它不是 RFC1918 私网；放行后由 TUN/代理解析承接，不能用「私网例外」替换。
         || a >= 224 // 组播 / 保留（224.0.0.0/4 起）
 }
 
@@ -493,18 +492,48 @@ fn ipv6_form(host: &str) -> Option<bool> {
     if h == "::" || h == "::1" || h == "0:0:0:0:0:0:0:1" || h == "0:0:0:0:0:0:0:0" {
         return Some(true);
     }
-    // fc00::/7 唯一本地、fe80::/10 链路本地
-    if let Some(first) = h.split(':').next() {
-        if first.starts_with("fc")
-            || first.starts_with("fd")
-            || first.starts_with("fe8")
-            || first.starts_with("feb")
-        {
-            return Some(true);
-        }
+    let address = h.parse::<std::net::Ipv6Addr>().ok()?;
+    if address.is_loopback() || address.is_unspecified() || address.is_multicast() {
+        return Some(true);
     }
-    if let Some(mapped) = mapped_v4(&h) {
-        return Some(is_private_v4(mapped));
+    if let Some(v4) = address.to_ipv4_mapped() {
+        return Some(is_private_v4(v4.octets()));
+    }
+    let octets = address.octets();
+    // fc00::/7 ULA 与 198.18/15 一样是显式的 TUN 连通档，不能当作 RFC1918 私网拒绝。
+    if octets[0] & 0xfe == 0xfc {
+        return Some(false);
+    }
+    // fe80::/10 链路本地（含 fe80/fe90/fea0/feb0）一律不出宿主边界。
+    // 同一个 0xfe 段里还有 fec0::/10 的旧 site-local（0xfe + 11 打头）：它虽在 RFC 3879 废弃，
+    // 仍有系统把它当内网用，且绝不能出现在「公网」判定里 ⇒ 一并拒。
+    if octets[0] == 0xfe && octets[1] & 0xc0 == 0x80 {
+        return Some(true);
+    }
+    if octets[0] == 0xfe && octets[1] & 0xc0 == 0xc0 {
+        return Some(true);
+    }
+    // NAT64 well-known prefix 64:ff9b::/96：地址尾部 32 位就是真正要连的 IPv4，
+    // 所以必须先拆出来按 v4 规则判 —— 整段照抛会顺手掐掉合法的 NAT64 公网目标，
+    // 整段放行则 `64:ff9b::a9fe:a9fe`（= 169.254.169.254 云元数据）直接穿透。
+    if octets[..12] == [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0] {
+        return Some(is_private_v4([
+            octets[12], octets[13], octets[14], octets[15],
+        ]));
+    }
+    // 64:ff9b:1::/48 是 RFC 8215 的 local-use NAT64：它只在本域内有意义，视为内网。
+    if octets[..6] == [0x00, 0x64, 0xff, 0x9b, 0x00, 0x01] {
+        return Some(true);
+    }
+    // 6to4 2002::/16 与 IPv4-compatible ::/96（排除上面已判的 mapped/loopback）
+    // 都可能把私网 v4 藏进 IPv6；逐字节复用 v4 拒绝表。
+    if octets[0] == 0x20 && octets[1] == 0x02 {
+        return Some(is_private_v4([octets[2], octets[3], octets[4], octets[5]]));
+    }
+    if octets[..12].iter().all(|byte| *byte == 0) {
+        return Some(is_private_v4([
+            octets[12], octets[13], octets[14], octets[15],
+        ]));
     }
     Some(false)
 }
@@ -918,7 +947,6 @@ mod tests {
             "http://[::1]:8080/",
             "http://[::ffff:127.0.0.1]/",
             "http://[::ffff:7f00:1]/",
-            "http://[fd00::21]/",
             "http://[fe80::1]/",
             "http://printer.local/x",
         ] {
@@ -929,6 +957,20 @@ mod tests {
                 t.host
             );
             assert!(s.proxy_for(&t).is_none(), "{url} 走了代理：第一道否决失效");
+        }
+        // ULA（fc00::/7）与 fake-ip（198.18.0.0/15）**不在**这份否决表里：
+        // 它们是 TUN 的连通档，判成内网会让挂 TUN 的用户所有插件请求全灭（N1）。
+        for url in [
+            "http://[fd00::21]/",
+            "http://[fc00::1]/",
+            "http://198.18.0.12/",
+        ] {
+            let t = target(url);
+            assert!(
+                !is_local_or_private(&t),
+                "{url} 不该被判成内网（TUN 连通档）"
+            );
+            assert!(s.proxy_for(&t).is_some(), "{url} 该走系统代理");
         }
     }
 
@@ -1117,5 +1159,117 @@ mod tests {
         ] {
             assert!(!is_loopback_literal(host), "{host} 不是回环字面量");
         }
+    }
+
+    // ---- N1：TUN fake-ip / ULA 放行档，与「私网仍拒」两边的钉子 ----------------
+    //
+    // 这一组是验收报告里 P1 的原失败场景：Clash/mihomo TUN + fake-ip 把**所有**域名解析成
+    // 198.18.0.0/15 里的地址，只要 is_public_ip 把它当私网，插件每条 http 请求都会在
+    // GuardedResolver 处报「拒绝连接内网地址 198.18.x.x（疑似 DNS rebinding）」而全灭。
+
+    fn ip(text: &str) -> std::net::IpAddr {
+        text.parse().expect("测试用的 IP 字面量必须能解析")
+    }
+
+    #[test]
+    fn tun_fake_ip_range_is_public() {
+        for text in [
+            "198.18.0.1",
+            "198.18.255.255",
+            "198.19.0.1",
+            "198.19.255.254",
+        ] {
+            assert!(
+                is_public_ip(ip(text)),
+                "{text} 是 TUN fake-ip 档（198.18.0.0/15），必须允许出站"
+            );
+        }
+        // 边界外仍是普通公网地址（198.17/198.20 不在 198.18.0.0/15 里）
+        assert!(is_public_ip(ip("198.17.0.1")));
+        assert!(is_public_ip(ip("198.20.0.1")));
+    }
+
+    #[test]
+    fn fake_ip_target_is_not_machine_local_so_it_can_use_proxy() {
+        // fake-ip 目标不能被判成「本机/内网」：否则 Route::agent_for 会强制直连，
+        // 而 fake-ip 地址只有 TUN 才连通 —— 直连必死，等于没修。
+        assert!(!is_local_or_private(&target("http://198.18.0.12/")));
+        assert!(!is_local_or_private(&target("https://198.19.1.2:8443/")));
+        // 真私网/回环仍判私
+        for url in [
+            "http://10.1.2.3/",
+            "http://172.16.0.1/",
+            "http://192.168.1.1/",
+            "http://127.0.0.1:8080/",
+            "http://169.254.169.254/",
+            "http://100.64.0.1/",
+        ] {
+            assert!(is_local_or_private(&target(url)), "{url} 必须仍判私网");
+        }
+    }
+
+    #[test]
+    fn private_loopback_and_link_local_v4_stay_blocked() {
+        for text in [
+            "10.0.0.1",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.0.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "192.0.0.1",
+        ] {
+            assert!(!is_public_ip(ip(text)), "{text} 必须仍被拒");
+        }
+    }
+
+    #[test]
+    fn ipv6_ula_allowed_but_link_local_site_local_and_multicast_blocked() {
+        // fc00::/7 ULA：和 fake-ip 同属「显式放行的 TUN 连通档」
+        for text in ["fc00::1", "fd12:3456:789a::1", "fdff:ffff::1"] {
+            assert!(is_public_ip(ip(text)), "{text} 是 ULA，必须允许");
+        }
+        // fe80::/10 整段（fe80/fe9/fea/feb）、fec0::/10 site-local、ff00::/8 组播、回环
+        for text in [
+            "fe80::1",
+            "fe90::1",
+            "fea0::1",
+            "febf::1",
+            "fec0::1",
+            "feff::1",
+            "ff02::1",
+            "::1",
+            "::",
+            "fe80::1:2:3:4",
+        ] {
+            assert!(!is_public_ip(ip(text)), "{text} 必须仍被拒");
+        }
+        // 公网 v6 与 NAT64 里的公网 v4 目标照旧放行
+        assert!(is_public_ip(ip("2606:4700:4700::1111")));
+        assert!(
+            is_public_ip(ip("64:ff9b::808:808")),
+            "NAT64 包 8.8.8.8 应放行"
+        );
+        // NAT64 包里藏私网 v4、6to4 包私网 v4、IPv4-compatible 私网、mapped 私网 ⇒ 一律拒
+        assert!(!is_public_ip(ip("64:ff9b::a9fe:a9fe")));
+        assert!(!is_public_ip(ip("64:ff9b::7f00:1")));
+        assert!(
+            !is_public_ip(ip("64:ff9b:1::1")),
+            "RFC 8215 local-use 前缀视为内网"
+        );
+        assert!(
+            !is_public_ip(ip("2002:a00:1::1")),
+            "6to4 包 10.0.0.1 必须拒"
+        );
+        assert!(
+            is_public_ip(ip("2002:808:808::1")),
+            "6to4 包 8.8.8.8 应放行"
+        );
+        assert!(!is_public_ip(ip("::10.0.0.1")));
+        assert!(!is_public_ip(ip("::ffff:10.0.0.1")));
+        assert!(!is_public_ip(ip("::ffff:127.0.0.1")));
     }
 }

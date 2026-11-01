@@ -21,3 +21,21 @@ export function internalFetchGate(input = {}) {
   if (busy === true || internalBusy === true) return "busy";
   return null;
 }
+
+/**
+ * `refreshSnapshot` 的重入守卫（N6）。
+ *
+ * 老写法在函数入口只判 `busy`，而 `busy` 要等 Cookie 换数那一段
+ * （`await refreshInternal()`）跑完才置位 —— 这段时间里第二路刷新能同时进来，
+ * 两条链路各写一份 snapshot/history。这里把「已有一路在跑」单独记成 reentrant 标志，
+ * 由调用方在**任何 await 之前**置位；判定本身是纯函数，离线单测钉得住。
+ * @param {{reentrant?: boolean, busy?: boolean, alive?: boolean}} [input]
+ * @returns {null | "stopped" | "busy"} null 表示可以开始一轮刷新
+ */
+export function snapshotGate(input = {}) {
+  const { reentrant = false, busy = false, alive = true } = input;
+  if (alive !== true) return "stopped";
+  if (reentrant === true) return "busy";
+  if (busy === true) return "busy";
+  return null;
+}

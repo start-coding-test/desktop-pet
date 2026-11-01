@@ -14,6 +14,9 @@
 #   tools/check-nsis-cleanup.ps1 / tools/generate-app-icon.ps1 / tools/win-zorder.ps1
 #     —— PowerShell 5.1+/7 都接受 LF 行尾的 .ps1；三者在索引里本来就是 LF（i/lf），
 #        对它们声明 eol=crlf 只会平白改变检出字节，并不会修好任何东西。
+#   tests/e2e/harness/pet-window.ps1
+#     —— E2E 夹具脚本（G8-07 补登）：由 node 子进程调 PowerShell 执行窗口探测/拖拽，
+#        同样接受 LF；索引里是 LF，不单独声明 eol=crlf。
 #   src-tauri/windows/installer-hooks.nsi
 #     —— makensis 接受 LF 的 .nsi；索引里本来也是 LF，且 CI 的 tests/unit/unit-nsis-hook.mjs
 #        自己按 /\r?\n/ 切行，不挑行尾。

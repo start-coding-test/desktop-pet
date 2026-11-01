@@ -3,6 +3,7 @@
 // 设置面板（设置窗）通过 `${PID}:cmd` 下发指令，本插件执行并回发状态。
 // 悬浮窗只在「波形图模式 + 已连接设备」时显示，断开即自动关闭。
 import { TOPIC_BPM, TOPIC_CMD, TOPIC_DEVICES, TOPIC_STATUS } from "./topics.js";
+import { stripSignalSuffix } from "./label.js";
 
 let ctx = null;
 let config = { device: null, deviceName: null, mode: "badge" };
@@ -34,14 +35,18 @@ function status(text, level = "info") {
 
 async function persist() {
   try {
-    await ctx.storage.set("config", config);
+    await ctx?.storage.set("config", config);
   } catch (err) {
-    ctx.log("保存配置失败", err);
+    ctx?.log?.("保存配置失败", err);
   }
 }
 
-/** 悬浮窗显隐与「模式 + 连接状态」联动，同时把这份状态推给各区域界面 */
+/**
+ * 悬浮窗显隐与「模式 + 连接状态」联动，同时把这份状态推给各区域界面。
+ * 停用后（ctx 已置空）一律不动：host 回收订阅与 `void` 发起的异步链可能比赛，别在这里抛。
+ */
 async function syncOverlay() {
+  if (!ctx) return;
   if (config.mode === "overlay" && connected) {
     await ctx.overlay.show();
   } else {
@@ -81,7 +86,8 @@ async function handleCmd(cmd) {
       case "connect": {
         await ctx.ble.connect(cmd.deviceId);
         config.device = cmd.deviceId;
-        config.deviceName = cmd.deviceName ?? null;
+        // 名字只留干净的真名：设置面板的选项文本带着「（-60 dBm）」后缀，别把它当设备身份存下来（G5-12）
+        config.deviceName = stripSignalSuffix(cmd.deviceName);
         connected = true;
         retries = 0;
         await persist();
@@ -131,7 +137,8 @@ export async function activate(context) {
     if (saved && typeof saved === "object") {
       config = {
         device: typeof saved.device === "string" ? saved.device : null,
-        deviceName: typeof saved.deviceName === "string" ? saved.deviceName : null,
+        // 老版本可能把「（-60 dBm）」一起存进了名字：读回来时统一剥掉（G5-12）
+        deviceName: stripSignalSuffix(saved.deviceName),
         mode: saved.mode === "overlay" ? "overlay" : "badge",
       };
     }
@@ -140,15 +147,16 @@ export async function activate(context) {
   }
 
   // 事件接线（退订由宿主在停用时统一回收）
+  // 这些回调可能在停用过程中被最后一次事件唤醒：ctx 已置空时一律当空操作，别抛出去
   ctx.bus.subscribe("ble:heart-rate", (e) => {
-    ctx.bus.publish(TOPIC_BPM, { bpm: e.bpm });
+    ctx?.bus.publish(TOPIC_BPM, { bpm: e.bpm });
   });
   ctx.bus.subscribe("ble:device-found", (d) => {
-    ctx.bus.publish(TOPIC_DEVICES, d);
+    ctx?.bus.publish(TOPIC_DEVICES, d);
   });
   ctx.bus.subscribe("ble:disconnected", () => {
     connected = false;
-    void syncOverlay(); // 设备掉线自动关闭悬浮窗
+    void syncOverlay().catch(() => {}); // 设备掉线自动关闭悬浮窗
     status("设备连接已断开", "error");
     scheduleReconnect();
   });

@@ -147,28 +147,24 @@ mod tests {
     #[test]
     fn overlay_window_only_represents_its_registered_owner() {
         // 自己插件：放行
-        assert!(
-            owns_plugin_for_label("overlay-com.pet.todo", Some("com.pet.todo"), "com.pet.todo")
-                .is_ok()
-        );
-        // 冒用别的插件 id：拒，且是 denied 码
-        let err = owns_plugin_for_label(
+        assert!(owns_plugin_for_label(
             "overlay-com.pet.todo",
             Some("com.pet.todo"),
-            "com.pet.ble",
+            "com.pet.todo"
         )
-        .unwrap_err();
+        .is_ok());
+        // 冒用别的插件 id：拒，且是 denied 码
+        let err =
+            owns_plugin_for_label("overlay-com.pet.todo", Some("com.pet.todo"), "com.pet.ble")
+                .unwrap_err();
         assert_eq!(err.code, DENIED);
         assert!(err.message.contains("归属不符"), "实际: {err}");
         // 没登记归属的悬浮窗：同样拒
         assert!(owns_plugin_for_label("overlay-unknown", None, "com.pet.todo").is_err());
         // 同意框即使标签上有归属也不代表插件
-        let consent = owns_plugin_for_label(
-            "consent-com.pet.todo",
-            Some("com.pet.todo"),
-            "com.pet.todo",
-        )
-        .unwrap_err();
+        let consent =
+            owns_plugin_for_label("consent-com.pet.todo", Some("com.pet.todo"), "com.pet.todo")
+                .unwrap_err();
         assert_eq!(consent.code, DENIED);
         assert!(consent.message.contains("不能代表插件"), "实际: {consent}");
         // 宠物窗/设置窗不是悬浮窗，不适用「冒用别人 id」的判定

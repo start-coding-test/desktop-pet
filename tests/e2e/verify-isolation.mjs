@@ -178,16 +178,24 @@ const DENY_LOCK_SETTLE_MS = 5_000;
 const OBSERVE_MS = 1_200;
 
 /**
+ * `reportError` 的 console 行落在哪个文件 —— **只钉文件，不钉行号**。
+ * 2026-11-01 实红：t3 重排 `src/runtime/plugin-runtime.ts` 后该行从 :166 漂到 :212，
+ * 窗口切片整段变空（窗口 D/E 四条集体期望 1 实得 0），而发射点语义其实没变。
+ * 判据仍要求同一个文件 + 同一个文案（见 denyText），只是不再被无关编辑打断。
+ */
+const RUNTIME_REPORT_SITE = /src\/runtime\/plugin-runtime\.ts:\d+/;
+
+/**
  * D07 C6 + D09-D4 第 6 条：一行 noise 算不算「本卡该核销的运行时拒绝/停用噪音」。
- * 两种形状都必须认，只认 `:166` 的那一版对
+ * 两种形状都必须认，只认 `plugin-runtime.ts` 的那一版对
  * `Uncaught (in promise) HostError: … @ plugin-worker-protocol.ts` 是瞎的（D09 第一轮就是这样盲绿的）：
- *  - `reportError` 的 console 行（Vite 转换后固定在 plugin-runtime.ts:166）
+ *  - `reportError` 的 console 行（发射点固定在 plugin-runtime.ts，行号会随编辑漂移）
  *  - Worker RPC 里未捕获的 HostError 回包（plugin-worker-protocol.ts）
  * 纯函数、只吃 noise 行数组，好让套件里能用日志原文自测它（下面两条判据）。
  */
 function runtimeNoiseMatches(line, ids) {
   const shaped =
-    line.includes("plugin-runtime.ts:166") ||
+    RUNTIME_REPORT_SITE.test(line) ||
     (line.includes("Uncaught (in promise)") && line.includes("plugin-worker-protocol.ts"));
   return shaped && ids.some((id) => line.includes(id));
 }
@@ -218,7 +226,7 @@ function logConsoleLedger(label) {
   const noise = c?.noise ?? [];
   const since = noise.slice(consoleLedgerMark);
   const matched = (arr, id) =>
-    arr.filter((n) => n.includes(id) && (n.includes("plugin-runtime.ts:166") || n.includes("bus relay failed")));
+    arr.filter((n) => n.includes(id) && (RUNTIME_REPORT_SITE.test(n) || n.includes("bus relay failed")));
   const ids = ["zz.probe", "zz.consent", "zz.status"];
   const totals = Object.fromEntries(ids.map((id) => [id, matched(noise, id).length]));
   const deltas = Object.fromEntries(ids.map((id) => [id, matched(since, id).length]));
@@ -978,7 +986,7 @@ try {
       [hookStatus.v?.agent, hookStatus.v?.expectedPerFile, hookStatus.v?.managed],
     );
   } else {
-    r.info("跳过 agent 临时状态检查", "未设 PET_AGENT_CONFIG_FILES（非 E2E 启动）");
+    r.skip("agent 临时状态检查", "未设 PET_AGENT_CONFIG_FILES（非 E2E 启动）");
   }
 
   const INSTALL = `(async () => {
@@ -1191,7 +1199,8 @@ try {
   // 用原始 plugin_enabled_list 判「文件写过没有」：readEnabledIds 会把 null 归一成 []，分不出来
   const migList = (await invoke_("plugin_enabled_list")).v;
   if (migList === null) {
-    r.info("跳过迁移原样回读断言", "宿主清单还没写过（fresh 环境）——迁移这一步只在首启时才落盘");
+    // 结构化跳过（不是通过）：CI 门只认 SKIP 前缀，且每条都得在 e2e-gate.json 的 allowedSkips 登记。
+    r.skip("迁移原样回读断言", "宿主清单还没写过（fresh 环境）——迁移这一步只在首启时才落盘");
   } else {
     const forgedMigrate = await invoke_("plugin_enabled_migrate", { ids: ["zz.forged"] });
     const migAfter = (await invoke_("plugin_enabled_list")).v;
@@ -1403,7 +1412,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     r.check("没连设备时断开是幂等空操作", true, idleDisc.ok);
   } else {
     // 护栏：用户真连着心率设备时不替他把连接掐掉
-    r.info("跳过 ble_disconnect 空操作断言", `连接状态=${JSON.stringify(idleConn.v ?? idleConn.e ?? null)}（有设备在场就不动它）`);
+    r.skip("ble_disconnect 空操作断言", `连接状态=${JSON.stringify(idleConn.v ?? idleConn.e ?? null)}（有设备在场就不动它）`);
   }
   await grantProbeCap("ble:scan");
   const scanStart = await invoke_("ble_start_scan", { pluginId: PROBE_ID });
@@ -2787,9 +2796,9 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
         r.check("install 后他人 hook 条目逐字段未变（键序由宿主归一）", sampleForeign, foreignOf(text));
       }
     } else {
-      r.info(
-        "跳过写盘断言",
-        "hook 配置未指向 temp/：install 与「连带卸载」断言不做（会改写真实用户配置）；" +
+      r.skip(
+        "写盘断言（install 与连带卸载）",
+        "hook 配置未指向 temp/：断言不做（会改写真实用户配置）；" +
           '用 PET_AGENT_CONFIG_FILES="<temp>\\a.json;<temp>\\b.json" npm run dev:debug 启动可跑全量',
       );
     }
@@ -2818,8 +2827,8 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
         ].join("|"),
       );
     } else {
-      r.info(
-        "跳过「直调卸载再装回」断言",
+      r.skip(
+        "直调卸载再装回断言",
         underTemp
           ? `不带 pluginId 的卸载会扫四家，而这几种 agent 仍指向真实 home：${isolationGap.join(", ")}（缺 PET_AGENT_HOME 换根）`
           : "hook 配置未指向 temp/：直调卸载会改写真实用户配置，与本组 install 断言同一开关（PET_AGENT_CONFIG_FILES）",
@@ -2947,8 +2956,8 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
         r.check("卸载后他人 hook 条目逐字段未变（键序由宿主归一）", sampleForeign, foreignOf(text));
       }
     } else {
-      r.info(
-        "跳过「连带卸载」分支",
+      r.skip(
+        "连带卸载分支",
         underTemp
           ? `这条路径点确认后同样调 agent_hooks_uninstall 扫四家，未隔离：${isolationGap.join(", ")}`
           : "hook 配置未指向 temp/",
@@ -2992,7 +3001,7 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
     if (E2E_SETTINGS) {
       r.check("改键写进 PET_SETTINGS_DIR 的 settings.json", "Ctrl+Alt+F9", readE2eHotkey());
     } else {
-      r.info("未设 PET_SETTINGS_DIR：跳过隔离文件回读（本地裸跑）", "");
+      r.skip("隔离文件回读", "未设 PET_SETTINGS_DIR（本地裸跑）");
     }
     // 这条判据原来只印 `.v`：hostInvoke 的 reject 分支形状是 `{ok:false,e,code}`、根本没有 `v`，
     // 于是 run#153 只剩一句「实得 undefined」，宿主真正的拒绝文案被丢掉（L09）。
@@ -3889,7 +3898,8 @@ export function deactivate() { window.__probeDeactivated = (window.__probeDeacti
   const unexpected = c.noise.filter((n) => !n.includes("派发递归") && !n.includes("B3 崩溃探针"));
   // 有意拒绝组的 console 不能一律算“意外”：按插件 id + 文案原文 + 次数精确核销。
   // 这是新增的核销断言，不是白名单；数量/文案变化都会红。
-  const denyText = `${DENY_TEXT} @ http://localhost:1420/src/runtime/plugin-runtime.ts:166`;
+  // 前缀止于行号之前：卡「文案 + 发射文件」，不卡行号（行号会随 src/runtime 编辑漂移）。
+  const denyText = `${DENY_TEXT} @ http://localhost:1420/src/runtime/plugin-runtime.ts:`;
   const countDeny = (id) => unexpected.filter((n) => n.includes(id) && n.includes(denyText)).length;
   r.info(
     "有意拒绝 console 触发窗口",

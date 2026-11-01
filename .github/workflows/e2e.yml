@@ -3,10 +3,14 @@
 # **已证明：首次跑绿是 run 38776535438**（2026-10-16，开发机自托管 runner CHEN，套件 verify + verify:agent）。
 # 后续（2026-10-16，runner chen_work）：verify:game 15/0 是 run 38832007396；
 # 更早的 verify:agent 77/0 是 run 38832924368，跑的时候 Qoder 一直在调工具，证明 PET_AGENT_INBOX 隔离生效。
-# 当期基线（2026-10-28 复核，改基线要同步改 .github/workflows/e2e-gate.json 的 minAssertions）：
-#   verify 485/0、verify:agent 303/4（4 红是 t38 修复前的读数，不是全绿；待 t37 回填后更新）、
-#   verify:worker 66/0、verify:todo 31/0、verify:game 15/0、verify:goat-gauge 76/0、
-#   verify:drag 41/0、verify:dsh 43/0。
+# 断言下限、允许的 skip、环境豁免的唯一来源是 [.github/workflows/e2e-gate.json](e2e-gate.json)（离线用
+# `npm run check:e2e-gate` 核对）。读数和下限只许出现在那一个文件里 —— 以前这里和 gate 各写一份，
+# 同一提交因此出现 verify:agent 303/4 与 307/0 两个「基线」（复核报告 N4）。
+# 门怎么判：每个套件必须在末尾打出 `E2E-SUMMARY suite=<脚本名> passed=N failed=N skipped=N`
+# （tests/e2e/harness/cdp.mjs 的 report.summary() 负责），且断言数 ≥ 下限、failed=0、退出码=0、
+# 每条 skip 都登记在 allowedSkips 里且未过期，才给 GREEN。未登记的 skip 一律 SKIP-RED ——
+# 不再靠整份日志里搜「跳过」，那条判据会被普通中文文案和「不配 Key 就跑不了的在线组」误伤
+# （报告 N2 / G1-05；verify:pet-drag 的分组标题、verify:goat-gauge 的在线组就是这么被判红的）。
 # 旧文里「verify:agent 当期基线 148/0」是 A02 时期的读数，早被后面的组数顶过去了，别再拿它对账。
 #
 # 托管 runner 已证否（run 38757735230，2026-10-15，windows-latest）：编译、起 dev 实例都过，
@@ -44,16 +48,17 @@
 #   verify:release 自己起 release exe 并占 9224，还要 3~4 分钟 tauri build；
 #   verify:astock / verify:http / verify:skin 出网（行情、GBK 源、petdex.dev），数据形态随时段漂。
 #
-# 假绿门禁（G1-05 / G1-06，2026-10-28 加；配置在同目录 e2e-gate.json）：
-#   - **skip 即红**：套件日志里出现 skipMarkers（`跳过`）就当失败。以前「前置不满足 → 打一行 info → 退 0」
-#     会被当成通过，全 skip 的 run 也能出绿；现在空转的套件过不了门。
-#   - **断言数下限**：每个套件在 minAssertions 里钉一个下限，低于下限判红 —— 抓「只跑了几条就算过」。
-#     基线上面的 485/303/66/31/15/76/41/43 已留出余量做下限，新增断言不用改；砍掉大组才需要同步调。
-#     （verify:agent 的 303 里含 4 红，t38 修复未合入前它只当下限用，不代表这套件是绿的。）
-#   - **known-env-failures**：环境债（比如 runner 上 Ctrl+Alt+P 被占、preseed 夹具缺失）登记在
-#     e2e-gate.json 的 knownEnvFailures（suite + 失败项子串 + 到期日 + 理由）。命中时在 step summary
-#     里单独列成 ENV-RED 并打 warning 注解，但**整体仍然判红**：白名单只用来区分「环境债」与「回归」，
-#     不允许把红灯洗成绿灯；条目到期自动失效，失效后按回归处理。红灯合入仍需在 PR 里登记豁免与到期日。
+# 假绿门禁（G1-05 / G1-06，2026-10-28 加；配置在同目录 e2e-gate.json，2026-10-29 重写为 v2）：
+#   - **结构化 skip**：harness 的 `report.skip(label, reason)` 把跳过打成分级日志里的 `SKIP <label>`
+#     行，门只认这些行（不再整份日志搜「跳过」）。每条 skip 必须登记在 allowedSkips（含理由与到期日），
+#     否则 SKIP-RED。前置不满足仍然要抛错判红：skip 不是「前置缺失」的替代品。
+#   - **断言数下限**：minAssertions 钉每个套件的下限，低于下限判红；还没量过基线的套件写进
+#     floorPending（extended 模式），既不算绿也不假装有下限。
+#   - **known-env-failures**：环境债登记在 knownEnvFailures（suite + 失败项子串 + 到期日 + 理由）。
+#     命中时在 step summary 里单列 ENV-RED 并打 warning，但**整体仍然判红**：白名单只用来区分
+#     「环境债」与「回归」，不允许把红灯洗成绿灯。当前登记为空 —— verify 的两条历史条目在 CI 里
+#     本来就不会触发（GITHUB_ACTIONS 已经走 preseed，PET_HOTKEY_DEFAULT 也已在 job env 里设），
+#     留着只会让「缺夹具就别豁免」这句话自相矛盾（N5）。
 name: E2E（手动触发）
 
 # 这份门只需要读代码：不写任何状态、不发评论、不动包
@@ -67,6 +72,21 @@ on:
         description: "要跑的套件，逗号分隔，名字照 package.json 里的 npm script"
         required: false
         default: "verify,verify:agent"
+      mode:
+        description: "模式：core（默认，8 个离线套件）或 extended（另需打包产物/外网，见 e2e-gate.json 的 modes）"
+        required: false
+        default: "core"
+  # 给 e2e-extended.yml 复用同一套步骤与同一份 gate 配置，避免第二份判据漂移
+  workflow_call:
+    inputs:
+      suites:
+        required: false
+        type: string
+        default: "verify:skin,verify:astock,verify:http,verify:release"
+      mode:
+        required: false
+        type: string
+        default: "extended"
 
 concurrency:
   # 单实例锁 + 固定 CDP 端口：同一 ref 上并跑两个 e2e 只会互相抢 9223
@@ -97,6 +117,9 @@ jobs:
       # E02：E2E 机器的默认键 Ctrl+Alt+P 被占且无法释放；debug 构建改用空闲的默认键，
       # 让「默认值本身必须能设」「改回默认值」两条判据真正跑起来。release 不读这个变量。
       PET_HOTKEY_DEFAULT: "CommandOrControl+Alt+Q"
+      # N7：verify:dsh 的前置是 PET_DSH_HOME，缺了它套件按设计 exit 2（前置缺失必须是红，不能静默跳过）。
+      # 以前只有本地 tools/e2e-run.mjs 设过它，所以这条门里的 verify:dsh 必红；这里补上同一口径的临时 home。
+      PET_DSH_HOME: ${{ github.workspace }}\temp\dsh-home-e2e
 
     steps:
       - uses: actions/checkout@v4
@@ -169,80 +192,130 @@ jobs:
         shell: powershell
         env:
           SUITES: ${{ inputs.suites }}
+          MODE: ${{ inputs.mode }}
         run: |
-          # The allowlist is part of this gate (see the file header for why game/release/astock/http/skin
-          # stay out). It also pins the input to npm script names so the string never reaches the shell.
-          # G1-09: verify:drag is in - the drag fix is verifiable offline, and leaving it out meant it had
-          # no automatic entry point at all.
-          # t39: verify:dsh is in for the same reason - its 43/0 baseline needs a floor this gate can
-          # actually enforce; a floor for a suite outside this list would be documentation, not a gate.
-          $allowed = @("verify", "verify:agent", "verify:worker", "verify:todo", "verify:game", "verify:goat-gauge", "verify:drag", "verify:dsh")
-
-          # G1-05 / G1-06 gate config. Refuse to run without it: silently falling back to "no floors,
-          # no registry" is exactly the fake-green this gate exists to stop.
+          # Suite list, assertion floors, allowed skips and the expiry registry all live in
+          # .github/workflows/e2e-gate.json (checked offline by `npm run check:e2e-gate`). This step
+          # only applies them; it must never re-state a reading of its own (report N4).
+          # G1-09 / t39: verify:drag and verify:dsh are in core mode - leaving them out left the drag
+          # fix and the DSH bridge with no automatic entry point, and a floor outside the list is prose.
           $configPath = ".github/workflows/e2e-gate.json"
           if (-not (Test-Path $configPath)) {
-            throw "Missing $configPath - the E2E gate needs assertion floors and the known-env-failure registry"
+            throw "Missing $configPath - the E2E gate needs assertion floors and a skip registry"
           }
           $config = [System.IO.File]::ReadAllText((Resolve-Path $configPath).Path, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+          $mode = if ($env:MODE) { $env:MODE } else { "core" }
+          $modeProp = $config.modes.PSObject.Properties[$mode]
+          if (-not $modeProp) {
+            $known = ($config.modes.PSObject.Properties | ForEach-Object { $_.Name }) -join ", "
+            throw "Unknown E2E mode '$mode' in $configPath (configured: $known)"
+          }
+          $allowed = @($modeProp.Value)
           $floor = @{}
           foreach ($p in $config.minAssertions.PSObject.Properties) { $floor[$p.Name] = [int]$p.Value }
+          $pendingFloors = @{}
+          if ($config.floorPending) { foreach ($p in $config.floorPending.PSObject.Properties) { $pendingFloors[$p.Name] = [string]$p.Value } }
           foreach ($a in $allowed) {
-            if (-not $floor.ContainsKey($a)) { throw "Suite $a has no minAssertions entry in $configPath" }
+            if (-not $floor.ContainsKey($a) -and -not $pendingFloors.ContainsKey($a)) {
+              throw "Suite $a has neither minAssertions nor floorPending in $configPath"
+            }
+          }
+          # Registered skips: a skip is only tolerated when its label matches an entry that has a
+          # reason and has not expired. Everything else is SKIP-RED. The old gate grepped the whole log
+          # for the word for 'skip' in Chinese and turned two allowlisted suites permanently red
+          # (report N2 / G1-05: a group title and an online group that needs an API key).
+          $skipRules = @()
+          if ($config.allowedSkips) {
+            foreach ($s in $config.allowedSkips) {
+              $skipRules += [pscustomobject]@{ Suite = [string]$s.suite; Match = [string]$s.match; Reason = [string]$s.reason; Expires = [string]$s.expires }
+            }
           }
           $rules = @()
-          foreach ($k in $config.knownEnvFailures) {
-            $rules += [pscustomobject]@{ Suite = [string]$k.suite; Match = [string]$k.match; Reason = [string]$k.reason; Expires = [string]$k.expires }
+          if ($config.knownEnvFailures) {
+            foreach ($k in $config.knownEnvFailures) {
+              $rules += [pscustomobject]@{ Suite = [string]$k.suite; Match = [string]$k.match; Reason = [string]$k.reason; Expires = [string]$k.expires }
+            }
           }
-          $skipMarkers = @()
-          foreach ($m in $config.skipMarkers) { $skipMarkers += [string]$m }
           $today = (Get-Date).ToString("yyyy-MM-dd")
+          $requested = @()
+          foreach ($s in ($env:SUITES -split ",")) { if ($s.Trim()) { $requested += $s.Trim() } }
+          if ($requested.Count -eq 0) { throw "No suites requested (inputs.suites is empty)" }
 
           New-Item -ItemType Directory -Force -Path temp | Out-Null
           $failed = @()
           $debt = @()
           $rows = @()
 
-          foreach ($s in ($env:SUITES -split ",")) {
-            $name = $s.Trim()
-            if (-not $name) { continue }
-            if ($allowed -notcontains $name) { throw "Suite $name is not in this workflow's allowlist (allowed: $($allowed -join ', '))" }
+          foreach ($name in $requested) {
+            if ($allowed -notcontains $name) {
+              throw "Suite $name is not in mode '$mode' of $configPath (allowed: $($allowed -join ', '))"
+            }
             $slug = $name -replace ":", "-"
             $logWin = "temp\suite-$slug.log"
             $logFull = Join-Path (Get-Location).Path $logWin
 
             Write-Host ""
             Write-Host "===== npm run $name ====="
-            # Capture first, then replay, so the log can be scanned for skips, assertion counts and FAIL
-            # labels. Live streaming is not worth losing that: the replay keeps the same text in the log.
+            # Capture first, then replay, so the log can be scanned for the structured summary, SKIP
+            # lines and FAIL labels. Live streaming is not worth losing that.
             cmd /c "npm run $name > $logWin 2>&1"
             $code = $LASTEXITCODE
             $text = ""
             if (Test-Path $logFull) { $text = [System.IO.File]::ReadAllText($logFull, [System.Text.Encoding]::UTF8) }
             Write-Host $text
 
+            # report.summary() ends every suite with exactly one machine line:
+            #   E2E-SUMMARY suite=<npm script> passed=<n> failed=<n> skipped=<n>
+            # Matching by suite id means a nested or replayed run can never be mistaken for this one
+            # ("the last N passed, M failed in the log" could be, e.g. a crash restarted suite).
+            $summary = $null
+            foreach ($m in [regex]::Matches($text, "(?m)^E2E-SUMMARY suite=(\S+) passed=(\d+) failed=(\d+) skipped=(\d+)\s*$")) {
+              if ($m.Groups[1].Value -eq $name) { $summary = $m }
+            }
             $passed = 0
             $assertFailed = 0
-            $summaryHits = [regex]::Matches($text, "(?m)^\s*(\d+) passed, (\d+) failed")
-            if ($summaryHits.Count -gt 0) {
-              $lastHit = $summaryHits[$summaryHits.Count - 1]
-              $passed = [int]$lastHit.Groups[1].Value
-              $assertFailed = [int]$lastHit.Groups[2].Value
+            $summarySkip = 0
+            $hasSummary = $false
+            if ($summary) {
+              $hasSummary = $true
+              $passed = [int]$summary.Groups[2].Value
+              $assertFailed = [int]$summary.Groups[3].Value
+              $summarySkip = [int]$summary.Groups[4].Value
             }
             $assertions = $passed + $assertFailed
 
-            $skips = 0
-            foreach ($marker in $skipMarkers) {
-              if ($marker) { $skips += ([regex]::Matches($text, [regex]::Escape($marker))).Count }
+            # Structured skips only, in the shape r.skip() prints: "  SKIP <label> - <reason>".
+            $skipLabels = @()
+            foreach ($sm in [regex]::Matches($text, "(?m)^\s*SKIP\s+(.+?)\s*$")) { $skipLabels += $sm.Groups[1].Value }
+            $registeredSkips = 0
+            $badSkips = @()
+            foreach ($label in $skipLabels) {
+              $hit = $null
+              foreach ($rule in $skipRules) {
+                if ($rule.Suite -ne $name) { continue }
+                if (-not $rule.Reason) { continue }
+                if ($rule.Match -and -not $label.Contains($rule.Match)) { continue }
+                if ($rule.Expires -and ([string]::CompareOrdinal($rule.Expires, $today) -lt 0)) { continue }
+                $hit = $rule
+                break
+              }
+              if ($hit) { $registeredSkips++ } else { $badSkips += $label }
             }
 
             $failLines = @()
             foreach ($fm in [regex]::Matches($text, "(?m)^\s+FAIL\s+(.*)$")) { $failLines += $fm.Groups[1].Value.Trim() }
 
             $reasons = @()
+            if (-not $hasSummary) { $reasons += "no E2E-SUMMARY line for suite=$name (every suite must end through report.summary())" }
             if ($code -ne 0) { $reasons += "exit=$code" }
-            if ($skips -gt 0) { $reasons += "skipped=$skips (skip counts as red in CI)" }
-            if ($assertions -lt $floor[$name]) { $reasons += "assertions=$assertions below floor=$($floor[$name])" }
+            if ($assertFailed -ne 0) { $reasons += "failed=$assertFailed" }
+            if ($hasSummary -and $summarySkip -ne $skipLabels.Count) {
+              $reasons += "summary reports skipped=$summarySkip but $($skipLabels.Count) SKIP lines were logged"
+            }
+            if ($badSkips.Count -gt 0) { $reasons += "unregistered skips: " + ($badSkips -join " | ") }
+            if ($floor.ContainsKey($name) -and $assertions -lt $floor[$name]) {
+              $reasons += "assertions=$assertions below floor=$($floor[$name])"
+            }
 
             $debtHits = @()
             $regressions = @()
@@ -271,15 +344,19 @@ jobs:
 
             $verdict = "GREEN"
             if ($reasons.Count -gt 0) {
-              if ($regressions.Count -gt 0) { $verdict = "REGRESSION-RED" }
-              elseif ($skips -gt 0) { $verdict = "SKIP-RED" }
+              if ($badSkips.Count -gt 0) { $verdict = "SKIP-RED" }
+              elseif ($regressions.Count -gt 0) { $verdict = "REGRESSION-RED" }
               elseif ($debtHits.Count -gt 0) { $verdict = "ENV-RED" }
-              else { $verdict = "REGRESSION-RED" }
+              elseif (-not $hasSummary) { $verdict = "NO-SUMMARY-RED" }
+              else { $verdict = "FLOOR-RED" }
             }
 
-            $rows += [pscustomobject]@{ Suite = $name; Passed = $passed; Failed = $assertFailed; Skipped = $skips; Assertions = $assertions; Floor = $floor[$name]; Verdict = $verdict }
+            $floorText = "-"
+            if ($floor.ContainsKey($name)) { $floorText = [string]$floor[$name] }
+            elseif ($pendingFloors.ContainsKey($name)) { $floorText = "pending" }
+            $rows += [pscustomobject]@{ Suite = $name; Passed = $passed; Failed = $assertFailed; Skipped = $skipLabels.Count; Registered = $registeredSkips; Assertions = $assertions; Floor = $floorText; Verdict = $verdict }
             if ($verdict -eq "GREEN") {
-              Write-Host ("VERDICT GREEN: {0} ({1} assertions, floor {2})" -f $name, $assertions, $floor[$name])
+              Write-Host ("VERDICT GREEN: {0} ({1} assertions, floor {2}, {3} registered skips)" -f $name, $assertions, $floorText, $registeredSkips)
             } else {
               $failed += $name
               Write-Host ("VERDICT {0}: {1} | {2}" -f $verdict, $name, ($reasons -join "; "))
@@ -296,12 +373,12 @@ jobs:
           # Summary: one table for every requested suite plus a separate list for registered env debt,
           # so a red run is triaged without opening the job log (which is 403 for anonymous readers).
           $md = @()
-          $md += "### E2E gate"
+          $md += "### E2E gate ($mode mode)"
           $md += ""
-          $md += "| suite | passed | failed | skipped | assertions | floor | verdict |"
-          $md += "| --- | --- | --- | --- | --- | --- | --- |"
+          $md += "| suite | passed | failed | skipped | registered skips | assertions | floor | verdict |"
+          $md += "| --- | --- | --- | --- | --- | --- | --- | --- |"
           foreach ($r in $rows) {
-            $md += ("| {0} | {1} | {2} | {3} | {4} | {5} | {6} |" -f $r.Suite, $r.Passed, $r.Failed, $r.Skipped, $r.Assertions, $r.Floor, $r.Verdict)
+            $md += ("| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} |" -f $r.Suite, $r.Passed, $r.Failed, $r.Skipped, $r.Registered, $r.Assertions, $r.Floor, $r.Verdict)
           }
           if ($debt.Count -gt 0) {
             $md += ""
@@ -310,16 +387,16 @@ jobs:
           }
           if ($failed.Count -gt 0) {
             $md += ""
-            $md += "Result: RED (not green: $($failed -join ', ')) - a green gate requires every suite at/above floor with zero skips"
+            $md += "Result: RED (not green: $($failed -join ', ')) - green requires a structured summary, zero failures, every suite at or above its floor, and no unregistered skips"
           } else {
             $md += ""
-            $md += "Result: GREEN (no skips, every suite at or above its floor)"
+            $md += "Result: GREEN (every suite printed its summary, at or above its floor, no unregistered skips)"
           }
           if ($env:GITHUB_STEP_SUMMARY) { $md | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append }
           foreach ($lineOut in $md) { Write-Host $lineOut }
 
           if ($failed.Count -gt 0) {
-            $msg = "E2E suites not green: " + ($failed -join ", ")
+            $msg = "E2E suites not green ($mode mode): " + ($failed -join ", ")
             if ($debt.Count -gt 0) { $msg += ". Registered env debt (still red; needs a waiver with an expiry in the PR): " + ($debt -join " ; ") }
             throw $msg
           }

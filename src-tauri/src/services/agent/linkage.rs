@@ -427,7 +427,10 @@ pub fn consent_gate(consent: Option<usize>, confirm: bool) -> bool {
 /// 正文交给适配器（`AgentAdapter::consent_prompt`）：ZCode 的开关是我们去打开的，
 /// WorkBuddy 的 `disableAllHooks` 我们**不动**，两句话不能共用一个模板，否则界面会在骗用户。
 pub fn confirm_prompt(adapter: &dyn AgentAdapter, user_hooks: usize) -> HostError {
-    HostError::new(INVALID_STATE, agent_hooks::need_confirm(adapter, user_hooks))
+    HostError::new(
+        INVALID_STATE,
+        agent_hooks::need_confirm(adapter, user_hooks),
+    )
 }
 
 /// 卸完旧的了：该装、该停、还是没地方装。三个分支都可达，所以没有兜底分支。
@@ -478,12 +481,15 @@ pub fn switch_agent(
     let bridge = if adapter.installs_files() {
         None
     } else {
-        Some(bridge_presence(adapter, home, dsh_bridge::bundle_dir(app)?)?)
+        Some(bridge_presence(
+            adapter,
+            home,
+            dsh_bridge::bundle_dir(app)?,
+        )?)
     };
-    // 回滚要用（G2-10）：切换前联动的那个适配器与它的候选文件。必须在摘旧之前取，
-    // 之后状态文件里记的可能已经变了。
-    let previous = adapter_for(agent_choice(&data).as_deref());
-    let previous_files = previous.targets(home);
+    // 回滚要用（G2-10）：只有确实记录过已接线 Agent 才有可回滚的 previous。
+    // None 不能再走 adapter_for 的 Qoder 缺省：那是给旧配置清理用的，不是替用户装 Qoder 的同意。
+    let previous = rollback_previous(&data, home);
     let switches = recorded_switches(&data);
     // 摘全部家庭（G2-07），旧的那份开关记录已一次性用掉，顺手按路径删（G2-08）
     let removed = strip_everywhere(&data, home, &switches);
@@ -494,7 +500,10 @@ pub fn switch_agent(
         .cloned()
         .unwrap_or_default();
     // G6-11：从 DSH 断开时桥仍留在对方 profile 里 —— 结果里要说清，别让用户以为全卸干净了。
-    let bridge_hint = if !previous.installs_files() && adapter.id() != previous.id() {
+    let bridge_hint = if previous
+        .as_ref()
+        .is_some_and(|(previous, _)| !previous.installs_files() && adapter.id() != previous.id())
+    {
         bridge_residue_hint(app, home)
     } else {
         None
@@ -527,7 +536,7 @@ pub fn switch_agent(
         // 卸旧只成功了一部分：把旧的装回去（装回是幂等的：已摘的补上、还在的原样），
         // 不让用户停在「旧 hook 缺几条、新 hook 没装」的半装态（G2-10）
         SwitchPlan::StopAfterRemoveFailure => {
-            let back = rollback_to(app, &data, previous, &previous_files);
+            let back = rollback_to(app, &data, previous);
             Err(HostError::new(
                 INVALID_STATE,
                 format!("卸下旧的 hook 失败（{first_error}），未安装新的；{back}"),
@@ -535,7 +544,7 @@ pub fn switch_agent(
         }
         SwitchPlan::NothingToInstall => {
             // 没地方装也是切换失败：旧的已经摘了，同样要回滚，否则用户点完「切换」谁都不联动
-            let back = rollback_to(app, &data, previous, &previous_files);
+            let back = rollback_to(app, &data, previous);
             Err(HostError::new(
                 NOT_FOUND,
                 format!("没找到 {} 的配置目录；{back}", adapter.display_name()),
@@ -560,7 +569,7 @@ pub fn switch_agent(
                     .next()
                     .cloned()
                     .unwrap_or_else(|| "没有任何文件装上".into());
-                let back = rollback_to(app, &data, previous, &previous_files);
+                let back = rollback_to(app, &data, previous);
                 return Err(HostError::new(
                     INVALID_STATE,
                     format!("切到 {} 失败：{why}；{back}", adapter.display_name()),
@@ -592,24 +601,63 @@ pub fn switch_agent(
     }
 }
 
-/// 切换失败的回滚：把刚摘掉的旧 Agent 装回去，让「当前联动」仍然指向它。
-///
-/// 返回一句给人看的话（成功/失败都写清），调用方拼进错误里 —— 用户按完「切换」必须知道
-/// 现在到底是谁在联动，而不是只看到一个泛泛的失败（G2-10）。回滚本身也失败时把选择清成
-/// 「没选过」：状态页不能继续显示一个已经不在联动的 Agent，那比「没有 Agent」更难查。
-fn rollback_to(
-    app: &AppHandle,
+/// 只把**状态文件里确实记录过且已接线**的 Agent 当作回滚目标。
+/// 缺失/脏值不能走 `adapter_for` 的 Qoder 缺省：那个缺省只服务于旧配置清理，不是安装同意。
+fn rollback_previous(
     data: &Path,
-    previous: &dyn AgentAdapter,
-    previous_files: &[PathBuf],
-) -> String {
+    home: &Path,
+) -> Option<(&'static dyn AgentAdapter, Vec<PathBuf>)> {
+    let previous = agent_choice(data).and_then(|id| adapters::by_id(&id))?;
+    let files = previous.targets(home);
+    Some((previous, files))
+}
+
+/// 切换失败的回滚：把刚摘掉的旧 Agent 装回去，让「当前联动」仍然指向它。
+/// 纯决策部分不依赖 AppHandle，便于在临时 home 里证明 None/DSH 都不会写其他 Agent 的配置。
+fn rollback_action(previous: &Option<(&'static dyn AgentAdapter, Vec<PathBuf>)>) -> String {
+    let Some((previous, previous_files)) = previous.as_ref() else {
+        return "切换前没有已记录的 Agent，未替用户安装任何 Agent；当前没有 Agent 在联动".into();
+    };
+    if !previous.installs_files() {
+        return format!(
+            "仍联动 {}；未改写其他 Agent 的 hook",
+            previous.display_name()
+        );
+    }
     if previous_files.is_empty() {
         return format!(
             "旧 Agent（{}）没有候选文件，回滚不了；当前没有 Agent 在联动",
             previous.display_name()
         );
     }
-    match rollback_install(previous, previous_files, data) {
+    format!("需要回滚到 {}", previous.display_name())
+}
+
+/// 「这一步到底要不要动磁盘」的纯判断：只有**记录过、装文件、且真有候选文件**的旧 Agent
+/// 才回滚。`None`（没记录过）与 DSH（桥住在对方进程里，宿主没有文件可装）都返回 `None`——
+/// 尤其前者不能走 `adapter_for` 的 Qoder 缺省，否则切到未装 Agent 失败时会往用户真实的
+/// `~/.qoder/settings.json` 里写 hook，还把选择记成 qoder（N1）。
+///
+/// 与 `rollback_action`（怎么说）分开：这里只回答「装不装」，单测因此能在临时 home 里
+/// 证明「没有选择时一条配置都不写」，而不必造 `AppHandle`。
+fn rollback_plan(
+    previous: Option<(&'static dyn AgentAdapter, Vec<PathBuf>)>,
+) -> Option<(&'static dyn AgentAdapter, Vec<PathBuf>)> {
+    let (previous, files) = previous?;
+    (previous.installs_files() && !files.is_empty()).then_some((previous, files))
+}
+
+/// 执行纯决策给出的回滚；DSH 保留选择与桥，不能把「仍联动 DSH」说成「谁都不联动」。
+fn rollback_to(
+    app: &AppHandle,
+    data: &Path,
+    previous: Option<(&'static dyn AgentAdapter, Vec<PathBuf>)>,
+) -> String {
+    let message = rollback_action(&previous);
+    let Some((previous, previous_files)) = rollback_plan(previous) else {
+        return message;
+    };
+    match rollback_install(previous, &previous_files, data) {
         Ok(back) => {
             // 记账与 `switch_agent` 成功路径同口径：选择指回旧的、拨过的开关抄下来
             note_installed(app, previous.id(), &back);
@@ -780,24 +828,6 @@ fn adapter_for(agent: Option<&str>) -> &'static dyn AgentAdapter {
         .unwrap_or(&claude_style::QODER)
 }
 
-/// 联动安装的调用来源（G2-09 / t38-A）。区分它是因为「拨开用户的总开关」是需要同意的动作：
-/// **用户重新勾选启用插件就是对这个动作的同意**，而启动补写、启停清单迁移、插件目录扫描
-/// 都不是用户动作 —— 它们没有确认框可弹，也就没有资格替用户点头。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InstallMode {
-    /// 用户在设置页主动勾选启用插件（`plugin_enabled_set`）：需要确认的客户端也照装。
-    UserConfirmed,
-    /// 启动补写 / 清单迁移 / 插件目录扫描：走严格确认门，需要确认的客户端保持原样。
-    Strict,
-}
-
-impl InstallMode {
-    /// 往下透传给 `install_files` 的确认门（G2-09）。`true` 只该来自用户动作。
-    fn confirm(self) -> bool {
-        matches!(self, Self::UserConfirmed)
-    }
-}
-
 /// 装。`confirm` 往下透传给 `install_files` 的确认门（G2-09）：自动路径传 `false`，
 /// 遇见要确认的客户端只会拿到 `[need-confirm]` 报告而不会动文件。
 fn install(
@@ -849,7 +879,7 @@ fn report(app: &AppHandle, action: &str, files: &[FileReport]) {
 
 /// 算出该做的动作、执行并广播。`prev_on` 是差异基线：启停路径取旧清单算出的值，
 /// 磁盘重算路径取「宿主上一次认定的联动状态」。
-fn apply(app: &AppHandle, prev_on: Option<bool>, now_on: bool, ids: &[String], mode: InstallMode) {
+fn apply(app: &AppHandle, prev_on: Option<bool>, now_on: bool, ids: &[String]) {
     // 广播闸门先按现状拨过去：卸载失败也不该让 watcher 继续把事件推给宠物
     set_broadcast(now_on);
     let Some(data) = app_data(app) else { return };
@@ -869,11 +899,12 @@ fn apply(app: &AppHandle, prev_on: Option<bool>, now_on: bool, ids: &[String], m
     let switches = recorded_switches(&data);
     let reports = match action {
         Action::Install => {
-            // 确认门住在 `install_files` 里（G2-09），这里只透传调用来源：用户在设置页
-            // 主动启用（`InstallMode::UserConfirmed`）算对「恢复总开关」的同意；启动补写、
-            // 清单迁移、目录扫描都不是用户动作，需要确认的客户端只会拿到 `[need-confirm]`
-            // 报告，配置文件一个字都不动，也不记选择
-            let reports = install(adapter, &files, Some(data.as_path()), mode.confirm());
+            // 确认门住在 `install_files` 里（G2-09），而这条路径**永远是自动路径**
+            // （启停联动 / 清单迁移 / 目录扫描 / 启动补写），所以确认位恒为 false：
+            // 需要确认的客户端只拿到 `[need-confirm]` 报告，配置文件一个字都不动，也不记选择。
+            // 「重新勾选启用插件」不算用户对恢复总开关的同意 —— 那是 N8 复核掉的绕过：真正的
+            // 同意只有设置页那一下「安装/仍要打开」，它带 confirm=true 走 `agent_hooks_install`。
+            let reports = install(adapter, &files, Some(data.as_path()), false);
             // 拨过的总开关要立刻记下来：这条路径是自动装的，没有设置页帮忙记，
             // 漏记就等于卸载时把用户的开关留在开着的状态
             record_switches(&data, &reports);
@@ -905,22 +936,12 @@ fn apply(app: &AppHandle, prev_on: Option<bool>, now_on: bool, ids: &[String], m
 /// 调用方（`plugin_enabled_set` / `plugin_enabled_migrate`）都已把清单落盘才走到这里，
 /// 而且这个函数没有 Result —— **装卸失败绝不拦启停**是构造出来的，不是靠调用方记得忽略错误。
 ///
-/// `mode` 只说「这次是不是用户动作」：设置页主动勾选启用传 [`InstallMode::UserConfirmed`]，
-/// 迁移/启动/目录扫描传 [`InstallMode::Strict`]。确认门的语义仍在 `install_files` 里。
-pub fn reconcile(
-    app: &AppHandle,
-    previous: Option<&[String]>,
-    next: &[String],
-    mode: InstallMode,
-) {
+/// 没有「调用来源」参数：这条路径上的每一次安装都是自动的，确认门一律按严格处理（N8）。
+/// 用户重新勾选启用插件不等于对「拨开 ZCode 总开关」的同意 —— 需要确认的客户端保持原样，
+/// 用户要在设置页按「安装」并回应那句确认。
+pub fn reconcile(app: &AppHandle, previous: Option<&[String]>, next: &[String]) {
     let now_on = linkage_on(app, next);
-    apply(
-        app,
-        previous.map(|ids| linkage_on(app, ids)),
-        now_on,
-        next,
-        mode,
-    );
+    apply(app, previous.map(|ids| linkage_on(app, ids)), now_on, next);
 }
 
 /// 插件目录被改动（含整目录删除）后的重算。运行期没有「卸载插件」命令，
@@ -932,7 +953,7 @@ pub fn resync(app: &AppHandle) {
     };
     let now_on = linkage_on(app, &ids);
     // 插件目录扫描不是用户动作：严格确认门（t38-A）
-    apply(app, Some(broadcast_allowed()), now_on, &ids, InstallMode::Strict);
+    apply(app, Some(broadcast_allowed()), now_on, &ids);
 }
 
 /// 启动阶段广播闸门该拨到哪；返回 `None` 表示**不拨**，保持默认（开）。
@@ -1696,8 +1717,7 @@ mod tests {
                     .to_string(),
             )
             .unwrap();
-            let _scope =
-                EnvScope::new(&[("PET_AGENT_HOME", &home)], &["PET_AGENT_CONFIG_FILES"]);
+            let _scope = EnvScope::new(&[("PET_AGENT_HOME", &home)], &["PET_AGENT_CONFIG_FILES"]);
             let outcome = startup_sequence(&dir, &home, ids.as_deref(), on, &json!({}));
             assert!(outcome.cleaned.is_none(), "{why}：还是去摘了条目");
             assert_eq!(
@@ -1764,7 +1784,8 @@ mod tests {
         for adapter in &file_writers {
             let files = adapter.targets(&home);
             assert!(!files.is_empty(), "{} 的夹具没建对", adapter.id());
-            let reports = agent_hooks::install_files(*adapter, &files, exe, Some(dir.as_path()), true);
+            let reports =
+                agent_hooks::install_files(*adapter, &files, exe, Some(dir.as_path()), true);
             assert!(
                 agent_hooks::any_installed(&reports),
                 "{} 没装上，用例前提不成立",
@@ -1803,7 +1824,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-
     /// G7-10：env 作用域退场（包括断言 panic 展开）必须把变量全清掉 —— 手写
     /// set_var/remove_var 时漏一句就可能把假 home 泄漏给同进程的其它用例。
     #[test]
@@ -1815,7 +1835,10 @@ mod tests {
                 &[("PET_AGENT_HOME", fake)],
                 &["PET_AGENT_CONFIG_FILES", "PET_AGENT_CODEX_FILES"],
             );
-            assert_eq!(std::env::var("PET_AGENT_HOME").unwrap(), r"C:\pet-test\home");
+            assert_eq!(
+                std::env::var("PET_AGENT_HOME").unwrap(),
+                r"C:\pet-test\home"
+            );
             assert!(std::env::var("PET_AGENT_CONFIG_FILES").is_err());
         }
         assert!(
@@ -2027,10 +2050,7 @@ mod tests {
             zcode.events().len(),
             "回滚要把旧 Agent 的每一条都装回来"
         );
-        assert!(
-            text.contains("\"enabled\": true"),
-            "回滚不许把总开关拨乱"
-        );
+        assert!(text.contains("\"enabled\": true"), "回滚不许把总开关拨乱");
         // 回滚也失败时：可读原因，不是 panic 也不是空串
         let why = match rollback_install(codex, &broken, &dir) {
             Ok(back) => panic!("写不进去必须报错，却报成功（{} 条）", back.len()),
@@ -2231,36 +2251,167 @@ mod tests {
         assert_eq!(bridge.profiles, 1);
     }
 
-    /// G2-09 / t38-A：确认门只允许「用户在设置页主动启用」这一条路径代用户同意。
-    /// 启动补写、启停清单迁移、插件目录扫描都不是用户动作，需要确认的客户端必须保持原样。
+    /// N1 ①：状态文件里**没有**选择（或选择读不出来 / 指到未接线的 id）时，切换失败只许报错，
+    /// 绝不许拿 Qoder 当缺省回滚目标 —— 那会往用户真实的 `~/.qoder/settings.json` 里写 hook，
+    /// 还把选择记成 qoder。这里在临时 home 里真放一份 Qoder 配置，把三种「说不清」都跑一遍，
+    /// 逐字节证明整条回滚链一个字节都没碰。
     #[test]
-    fn only_the_user_action_clears_the_install_confirm_gate() {
-        assert!(
-            InstallMode::UserConfirmed.confirm(),
-            "主动启用就是对恢复总开关的同意"
-        );
-        assert!(
-            !InstallMode::Strict.confirm(),
-            "自动路径不许代用户同意拨开总开关"
-        );
+    fn no_recorded_choice_never_falls_back_to_qoder() {
+        let _env = adapters::lock_test_env();
+        let dir = tmp_dir("no-choice-rollback");
+        let home = dir.join("home");
+        let cfg = home.join(".qoder").join("settings.json");
+        fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        let raw = json!({ "theme": "dark" }).to_string();
+        fs::write(&cfg, &raw).unwrap();
+        let _scope = EnvScope::new(&[("PET_AGENT_HOME", &home)], &["PET_AGENT_CONFIG_FILES"]);
+        let data = dir.join("appdata");
+        fs::create_dir_all(&data).unwrap();
+        let state = state_path(&data);
 
+        // 三种「说不出上一家是谁」的形状：没写过 / 显式 null / 未接线的脏 id
+        for (label, body) in [
+            ("没写过", None),
+            (
+                "显式 null",
+                Some(json!({ "schema": 1, "agent": null }).to_string()),
+            ),
+            (
+                "未接线的 id",
+                Some(json!({ "schema": 1, "agent": "cursor" }).to_string()),
+            ),
+        ] {
+            match &body {
+                Some(text) => fs::write(&state, text).unwrap(),
+                None => {
+                    let _ = fs::remove_file(&state);
+                }
+            }
+            let previous = rollback_previous(&data, &home);
+            assert!(
+                previous.is_none(),
+                "{label}：没有可信的上一家，不许回滚到任何 Agent（尤其不许是 Qoder）"
+            );
+            assert!(
+                rollback_plan(previous).is_none(),
+                "{label}：回滚计划必须是空的，否则 rollback_install 会真的写盘"
+            );
+            let message = rollback_action(&None);
+            assert!(
+                message.contains("未替用户安装任何 Agent"),
+                "{label}：文案要说清没替用户装东西：{message}"
+            );
+            assert!(
+                !message.contains("Qoder"),
+                "{label}：文案不许把 Qoder 说成回滚目标：{message}"
+            );
+            assert_eq!(
+                fs::read_to_string(&cfg).unwrap(),
+                raw,
+                "{label}：用户的 Qoder 配置一个字节都不许动"
+            );
+        }
+
+        // 半截文件同理：读不出来按「没选过」处理，但**不许**顺手覆盖成空文件
+        fs::write(&state, "{ not json").unwrap();
+        assert!(rollback_previous(&data, &home).is_none());
+        assert_eq!(
+            fs::read_to_string(&state).unwrap(),
+            "{ not json",
+            "读不出的状态文件不许被回滚路径改写"
+        );
+        assert_eq!(fs::read_to_string(&cfg).unwrap(), raw);
+        // 全程没留下备份/账本痕迹：回滚一次也没真跑
+        assert!(!data.join("backups").exists(), "没有回滚就不该出现备份目录");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// N1 ②③：上一家是 DSH 时，切换失败**不回滚**（桥住在对方进程里，宿主没有文件可装），
+    /// 但话必须说对：仍联动 DSH，而不是「当前没有 Agent 在联动」—— 后者会让用户以为
+    /// 桌宠已经不接 DSH 了。同时也别去改写别家的 hook。
+    #[test]
+    fn dsh_as_the_previous_agent_is_kept_not_rolled_back() {
+        let _env = adapters::lock_test_env();
+        let dir = tmp_dir("dsh-previous-rollback");
+        let home = dir.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let _scope = EnvScope::new(&[("PET_AGENT_HOME", &home)], &["PET_AGENT_CONFIG_FILES"]);
+        let data = dir.join("appdata");
+        fs::create_dir_all(&data).unwrap();
+        record_choice(&data, Some("dsh")).unwrap();
+
+        let previous = rollback_previous(&data, &home).expect("记录过 dsh 就要认得出来");
+        assert_eq!(previous.0.id(), "dsh");
+        assert!(
+            previous.1.is_empty(),
+            "DSH 没有可装的配置文件，候选文件必须是空的"
+        );
+        let message = rollback_action(&Some(previous.clone()));
+        assert!(
+            rollback_plan(Some(previous)).is_none(),
+            "DSH 不许回滚：回滚会去装别家的 hook"
+        );
+        assert!(
+            message.contains("仍联动 DSH"),
+            "要说清 DSH 还在联动：{message}"
+        );
+        assert!(
+            !message.contains("当前没有 Agent 在联动"),
+            "别把「仍联动 DSH」说成谁都不联动：{message}"
+        );
+        assert_eq!(
+            agent_choice(&data).as_deref(),
+            Some("dsh"),
+            "回滚不改写选择：设置页仍该显示 DSH"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// N8 / G2-09：**没有任何自动路径能代用户同意**。启停清单写入后的联动（含用户重新
+    /// 勾选启用插件）、清单迁移、插件目录扫描、启动补写，四条路都只能按未确认装 ——
+    /// 需要确认的客户端保持原样。真正的同意只在设置页那一下「安装/仍要打开」里给出
+    /// （`agent_hooks_install` 带 `confirm: true`）。
+    /// 上一轮把「重新勾选启用」定义成同意的写法已删（`InstallMode` 枚举整个不存在了）。
+    #[test]
+    fn no_automatic_path_clears_the_install_confirm_gate() {
         let enabled = include_str!("../enabled.rs");
-        let set = function_body(enabled, "pub fn plugin_enabled_set(");
-        assert!(
-            set.contains("InstallMode::UserConfirmed"),
-            "设置页主动启用必须按已确认装（否则停用时还原的总开关装不回来）"
-        );
-        let migrate = function_body(enabled, "pub fn plugin_enabled_migrate(");
-        assert!(
-            migrate.contains("InstallMode::Strict"),
-            "清单迁移不是用户动作，必须走严格确认门"
-        );
+        for (name, body) in [
+            (
+                "pub fn plugin_enabled_set(",
+                function_body(enabled, "pub fn plugin_enabled_set("),
+            ),
+            (
+                "pub fn plugin_enabled_migrate(",
+                function_body(enabled, "pub fn plugin_enabled_migrate("),
+            ),
+        ] {
+            assert!(
+                body.contains("linkage::reconcile("),
+                "{name} 必须把联动交给 reconcile"
+            );
+            assert!(
+                !body.contains("UserConfirmed") && !body.contains("InstallMode"),
+                "{name} 不许自带「已确认」的安装模式：再启用插件不能代替系统确认（N8）"
+            );
+        }
 
         let myself = include_str!("linkage.rs");
+        // 自动路径的确认位是字面 false，不是从调用方传进来的参数
+        let apply = function_body(myself, "fn apply(");
+        assert!(
+            apply.contains("install(adapter, &files, Some(data.as_path()), false)"),
+            "自动路径的安装确认位必须恒为 false（N8）"
+        );
+        // 拼出来再查：不然 include_str! 把这条断言自己也算进去了
+        let ghost = concat!("enum Install", "Mode");
+        assert!(
+            !myself.contains(ghost) && !apply.contains(".confirm()"),
+            "「这次是不是用户动作」这条通道已删除，不许复活"
+        );
         let resync = function_body(myself, "pub fn resync(");
         assert!(
-            resync.contains("InstallMode::Strict"),
-            "插件目录扫描不是用户动作，必须走严格确认门"
+            resync.contains("apply(") && !resync.contains("UserConfirmed"),
+            "插件目录扫描不是用户动作"
         );
         // 启动路径压根没有安装能力（只清不装）：这条钉住「启动不越过确认门」的事实。
         // 用「没有安装调用点」判，避免把 `uninstall_*` 里的 install 子串当成安装。
@@ -2271,14 +2422,14 @@ mod tests {
         );
     }
 
-    /// G2-09 / t38-A：同一份用户配置，`Strict` 拿不到同意就一个字节都不写；
-    /// `UserConfirmed`（用户重新勾选启用插件）要真的装回去，并把停用时还原成 false 的
-    /// 总开关一并拨开。ZCode 的夹具正是 `switch_needs_consent` 的形状：总开关关着，
-    /// 但用户自己配过 hook。
+    /// N8 / G2-09：同一份用户配置，自动路径拿不到同意就一个字节都不写 —— 包括
+    /// 「用户重新勾选启用插件」这条（它现在与迁移/目录扫描同口径，不再自带同意）。
+    /// 真正的确认（设置页按钮 `confirm: true`）仍然能装回去并拨开总开关，门没被焊死。
+    /// ZCode 的夹具正是 `switch_needs_consent` 的形状：总开关关着，但用户自己配过 hook。
     #[test]
-    fn a_user_confirmed_install_restores_the_switch_a_strict_one_does_not() {
+    fn a_recheck_that_lacks_consent_never_writes_the_switch_back() {
         let _env = adapters::lock_test_env();
-        let dir = tmp_dir("user-confirmed");
+        let dir = tmp_dir("recheck-not-consent");
         let home = dir.join("home");
         let cfg = home.join(".zcode").join("cli").join("config.json");
         fs::create_dir_all(cfg.parent().unwrap()).unwrap();
@@ -2301,46 +2452,38 @@ mod tests {
         let ledger = dir.join("ledger");
         fs::create_dir_all(&ledger).unwrap();
 
-        // 自动路径（迁移/启动/目录扫描）：确认门先问，配置一个字都不许动
-        let strict = install(
-            zcode,
-            &files,
-            Some(ledger.as_path()),
-            InstallMode::Strict.confirm(),
-        );
-        assert!(
-            !agent_hooks::any_installed(&strict),
-            "严格路径不许动用户配置"
-        );
-        assert!(
-            strict.iter().all(|r| r
-                .error
-                .as_deref()
-                .is_some_and(|e| e.starts_with(agent_hooks::NEED_CONFIRM))),
-            "每个没写的文件都要带 [need-confirm] 标记"
-        );
-        assert_eq!(
-            fs::read_to_string(&cfg).unwrap(),
-            raw,
-            "没确认就一个字节都不写"
-        );
+        // 自动路径（迁移/启动/目录扫描/**以及重新勾选启用插件**）：配置一个字都不许动
+        for round in ["migrate", "recheck"] {
+            let auto = install(zcode, &files, Some(ledger.as_path()), false);
+            assert!(
+                !agent_hooks::any_installed(&auto),
+                "{round}：自动路径不许动用户配置"
+            );
+            assert!(
+                auto.iter().all(|r| r
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with(agent_hooks::NEED_CONFIRM))),
+                "{round}：每个没写的文件都要带 [need-confirm] 标记"
+            );
+            assert_eq!(
+                fs::read_to_string(&cfg).unwrap(),
+                raw,
+                "{round}：没确认就一个字节都不写（再启用插件不等于同意拨开总开关）"
+            );
+        }
 
-        // 用户主动再启用：同意随这次点击给出，装回去并恢复总开关
-        let confirmed = install(
-            zcode,
-            &files,
-            Some(ledger.as_path()),
-            InstallMode::UserConfirmed.confirm(),
-        );
+        // 用户在设置页按了「仍要打开」：同意随这次点击给出，装回去并恢复总开关
+        let confirmed = install(zcode, &files, Some(ledger.as_path()), true);
         assert!(
             agent_hooks::any_installed(&confirmed),
-            "主动再启用必须真的装上"
+            "设置页确认后必须真的装上（门没被焊死）"
         );
         let text = fs::read_to_string(&cfg).unwrap();
         assert_eq!(
             text.matches("--pet-hook").count(),
             zcode.events().len(),
-            "再启用要把 7 条事件装回来"
+            "确认后要把 7 条事件装回来"
         );
         assert!(
             text.contains("\"enabled\": true"),

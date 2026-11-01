@@ -192,6 +192,51 @@ body {
   margin-bottom: 10px;
 }
 
+/* 动作回执（G4：启停/撤销失败要看得见，而不是只进 console） */
+.notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  margin-bottom: 10px;
+  border: 1px solid transparent;
+}
+
+.notice-error {
+  background: #fdecea;
+  color: #b3261e;
+  border-color: #f5c6c1;
+}
+
+.notice-info {
+  background: #eef6ee;
+  color: #1e6b34;
+  border-color: #bfe3c8;
+}
+
+.notice-text {
+  flex: 1;
+  word-break: break-word;
+}
+
+.notice-close {
+  flex: none;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
+  opacity: 0.65;
+}
+
+.notice-close:hover {
+  opacity: 1;
+}
+
 .card {
   background: #fff;
   border: 1px solid #e4e7ec;
@@ -404,6 +449,14 @@ kbd {
 .btn-revoke:disabled {
   color: #98a2b3;
   cursor: default;
+}
+
+/* 声明 ≠ 已授权：chips 是 manifest 声明的能力，这一行说的是授权表的实况（N8） */
+.perm-hint {
+  flex-basis: 100%;
+  font-size: 11px;
+  color: #667085;
+  padding-top: 2px;
 }
 
 .plugin-settings {

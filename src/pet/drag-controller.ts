@@ -20,6 +20,17 @@ export const BLUR_GRACE_MS = 100;
  */
 export const DRAG_SILENCE_MS = 250;
 
+/**
+ * 停手→真收尾的额外等待（ms，仅 `pauseInsteadOfSilent` 模式）。
+ *
+ * 附录2 N1 说的是「静默兜底把停手当松手，且收不回来」：手在窗口上停一两秒（找位置、
+ * 换手、看提示）就会被判成松手，这趟拖动后面再动也再也拿不到方向帧。
+ * 打开这个模式后，静默先只是**暂停**（方向态回落到常态，拖动会话还活着），
+ * 再等这么久仍没有任何窗口位移才按静默收尾 —— 既不会把停手误判成松手，
+ * 也不会在真松手后把 running/穿透永远挂着（真机 e2e 依赖的收尾仍然发生）。
+ */
+export const DRAG_PAUSE_END_MS = 900;
+
 /** 拖动收尾原因（只用于诊断：e2e/真机排查时能看出是哪条路径收的尾） */
 export type DragEndReason = "mouseup" | "blur" | "silent" | "buttons-released" | "reset";
 
@@ -30,6 +41,13 @@ export interface DragControllerOptions {
   onBegin?: () => void;
   /** 收尾副作用：状态机 endDrag + 方向追踪器复位 */
   onEnd?: (reason: DragEndReason) => void;
+  /**
+   * 静默时只「暂停」不「收尾」（附录2 N1）：默认关闭以保持既有语义，
+   * main.ts 打开它，用 `onPause` 把方向态回落到常态，真收尾推迟到 DRAG_PAUSE_END_MS。
+   */
+  pauseInsteadOfSilent?: boolean;
+  /** 暂停副作用：方向态回落常态（拖动会话仍活着，窗口再动就恢复） */
+  onPause?: () => void;
 }
 
 export class DragController {
@@ -41,14 +59,22 @@ export class DragController {
   private pendingBlurAt: number | null = null;
   /** 最近一次窗口真实位移的时刻（静默兜底的计时起点） */
   private lastWindowMoveAt = 0;
+  /** 静默后是否已进入「停手」暂停态（只有 pauseInsteadOfSilent 模式会用到） */
+  private paused = false;
+  /** 进入暂停态的时刻（DRAG_PAUSE_END_MS 的计时起点） */
+  private pausedAt = 0;
   private readonly now: () => number;
   private readonly onBegin: () => void;
   private readonly onEnd: (reason: DragEndReason) => void;
+  private readonly pauseInsteadOfSilent: boolean;
+  private readonly onPause: () => void;
 
   constructor(opts: DragControllerOptions) {
     this.now = opts.now;
     this.onBegin = opts.onBegin ?? (() => {});
     this.onEnd = opts.onEnd ?? (() => {});
+    this.pauseInsteadOfSilent = opts.pauseInsteadOfSilent === true;
+    this.onPause = opts.onPause ?? (() => {});
   }
 
   /** 是否处于拖动期（点击穿透据此关/开） */
@@ -66,11 +92,25 @@ export class DragController {
     return this.pendingBlurAt !== null;
   }
 
+  /** 是否处于「停手」暂停态（方向态已回落，拖动会话还没收尾） */
+  get isPaused(): boolean {
+    return this.paused;
+  }
+
   /** 按下：上一趟拖拽的 mouseup 可能没收到，先按「松手」收尾，再记这一次的按下点 */
   pressDown(x: number, y: number): void {
     if (this.engaged) this.finish("reset");
     this.pendingBlurAt = null;
+    this.paused = false;
     this.pressPoint = { x, y };
+  }
+
+  /**
+   * 重设按下点（不起拖、不结束）：缩放倍率变化时由接线层重新算一次起点。
+   * 跨 DPI 时按下点如果还留在旧倍率的口径上，阈值判定会凭空多/少一截。
+   */
+  reanchor(x: number, y: number): void {
+    if (this.pressPoint) this.pressPoint = { x, y };
   }
 
   /** 移动：按键已松开（buttons === 0）就收尾；否则按起拖阈值判断是否交给系统拖拽 */
@@ -115,25 +155,42 @@ export class DragController {
     this.pressPoint = null;
   }
 
-  /** 窗口真实位移（onMoved）：喂静默兜底的计时 */
+  /** 窗口真实位移（onMoved）：喂静默兜底的计时；停手态下窗口再动就恢复拖动 */
   windowMoved(): void {
-    if (this.engaged) this.lastWindowMoveAt = this.now();
+    if (!this.engaged) return;
+    this.lastWindowMoveAt = this.now();
+    this.paused = false;
   }
 
-  /** 渲染帧驱动：宽限期到点按真失焦收尾；静默到点按「已松键」收尾 */
+  /** 渲染帧驱动：宽限期到点按真失焦收尾；静默到点按「已松键」收尾（或先暂停） */
   tick(): void {
     if (!this.engaged) return;
-    if (this.pendingBlurAt !== null && this.now() - this.pendingBlurAt >= BLUR_GRACE_MS) {
+    const now = this.now();
+    if (this.pendingBlurAt !== null && now - this.pendingBlurAt >= BLUR_GRACE_MS) {
       this.finish("blur");
       return;
     }
-    if (this.now() - this.lastWindowMoveAt >= DRAG_SILENCE_MS) this.finish("silent");
+    const quietFor = now - this.lastWindowMoveAt;
+    if (!this.pauseInsteadOfSilent) {
+      if (quietFor >= DRAG_SILENCE_MS) this.finish("silent");
+      return;
+    }
+    if (!this.paused) {
+      if (quietFor < DRAG_SILENCE_MS) return;
+      this.paused = true;
+      this.pausedAt = now;
+      this.onPause();
+      return;
+    }
+    // 停手超过 DRAG_PAUSE_END_MS 仍然没有任何窗口位移：才按静默收尾（真松手后不会永远挂着）
+    if (now - this.pausedAt >= DRAG_PAUSE_END_MS) this.finish("silent");
   }
 
   private engage(): void {
     this.engaged = true;
     this.pressPoint = null;
     this.pendingBlurAt = null;
+    this.paused = false;
     this.lastWindowMoveAt = this.now();
     this.onBegin();
   }
@@ -143,6 +200,7 @@ export class DragController {
     this.engaged = false;
     this.pressPoint = null;
     this.pendingBlurAt = null;
+    this.paused = false;
     if (wasEngaged) this.onEnd(reason);
   }
 }

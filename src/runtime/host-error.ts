@@ -111,3 +111,62 @@ export function deniedError(message: string): CodedError {
   err.code = DENIED;
   return err;
 }
+
+/* ---------- 严重度分类（G4：普通插件错误不该被当成致命错误） ---------- */
+
+/**
+ * 见到一个错误之后，界面该怎么对待它：
+ * - `fatal`：宿主自己起不来（启动阶段的未捕获错误）→ 整窗红条；
+ * - `warning`：某个插件自己踩的坑（坏 activate、调用被拒、设置页回显失败）→ 只记日志/横幅，
+ *   **不许**盖掉整个窗口；
+ * - `error`：宿主服务的真失败（io / network / internal / 框架侧的 legacy）→ 记日志，留给上层决定。
+ */
+export type ErrorSeverity = "fatal" | "warning" | "error";
+
+/**
+ * 这些码是「插件域可预期拒绝」：权限没给、参数不对、状态不对、设备不在……
+ * 它们只说明**某个插件这次没成**，不代表宿主坏了。分类表放在这里而不是调用点，
+ * 是为了让所有上报口径一致（G4-06 只 console、G4-11 listen 回调无 catch 都收口到这张表）。
+ */
+export const PLUGIN_SCOPED_CODES: readonly string[] = Object.freeze([
+  DENIED,
+  NOT_FOUND,
+  INVALID_ARG,
+  INVALID_STATE,
+  PARSE,
+  CONSENT_TIMEOUT,
+  UNSUPPORTED,
+  DEVICE_UNAVAILABLE,
+  SCAN_START,
+]);
+
+export interface SeverityContext {
+  /** 还在启动阶段（首帧/清单加载完成之前）：这时的未捕获错误是真起不来 */
+  bootPhase?: boolean;
+  /** 已知属于哪个插件：一律按插件域处理 */
+  pluginId?: string | null;
+}
+
+/** 取错误码；不是宿主错误形状的（DOM Error、字符串、null）给 `legacy`。 */
+export function errorCodeOf(rejection: unknown): string {
+  if (isHostErrorPayload(rejection)) return rejection.code;
+  const code = (rejection as { code?: unknown } | null)?.code;
+  return typeof code === "string" && code.length > 0 ? code : LEGACY_CODE;
+}
+
+export function isPluginScopedError(rejection: unknown): boolean {
+  return PLUGIN_SCOPED_CODES.includes(errorCodeOf(rejection));
+}
+
+/**
+ * 判严重度。顺序有意为之：启动阶段一律致命（页面渲染不出来，别藏）；
+ * 带 pluginId 的一律插件域（调用点比码表更清楚这是谁的事）；
+ * 其余按码表分类。
+ */
+export function classifyError(rejection: unknown, context: SeverityContext = {}): ErrorSeverity {
+  if (context.bootPhase) return "fatal";
+  if (context.pluginId) return "warning";
+  if (isPluginScopedError(rejection)) return "warning";
+  return "error";
+}
+

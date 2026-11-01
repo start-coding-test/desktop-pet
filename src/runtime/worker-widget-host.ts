@@ -102,7 +102,8 @@ async function handleCall(session: Session, msg: Extract<WidgetToHost, { t: "cal
     }
     const fn = hooks[msg.method.split(".")[1] as "status" | "install" | "uninstall" | "set"];
     // 参数一律透传：门禁已经过了，这里不该再决定「哪个方法值得带参数」。
-    // `set` 靠这两个参数才知道切给谁、用户确认了没有；另外三个不接受参数，多给不影响。
+    // `set` 靠这两个参数才知道切给谁、用户确认了没有；`install` 靠 confirm 才知道
+    // 这是不是用户按过「仍要打开」的第二趟；status/uninstall 不接受参数，多给不影响。
     reply(true, await fn.apply(hooks, msg.args));
   } catch (error) {
     const e = error as { code?: string; message?: string };
@@ -212,12 +213,20 @@ export const workerWidgetHost = {
     if (!session) return;
     sessions.delete(key);
     await new Promise<void>((resolve) => {
-      const done = setTimeout(resolve, 5_000);
+      let settled = false;
+      // 收尾一定要把两条挂出去的东西都摘掉（附录2 N7）：计时器与 message 监听。
+      // 原来只在收到 deactivated 时 clearTimeout，监听从来不摘 —— terminate 之后
+      // 这条 listener 还挂在（已失效的）worker 上，测试与 dev 热重载里会越攒越多。
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(done);
+        session.worker.removeEventListener("message", wait);
+        resolve();
+      };
+      const done = setTimeout(finish, 5_000);
       const wait = (e: MessageEvent) => {
-        if ((e.data as WidgetToHost)?.t === "deactivated") {
-          clearTimeout(done);
-          resolve();
-        }
+        if ((e.data as WidgetToHost)?.t === "deactivated") finish();
       };
       session.worker.addEventListener("message", wait);
       session.worker.postMessage({ t: "deactivate" } satisfies HostToWidget);

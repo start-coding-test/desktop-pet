@@ -1273,8 +1273,8 @@ try {
     .map((a) => ({ id: String(a.agent), claudeStyle: String(a.agent) !== "zcode", paths: a.files.map(String) }));
   const writesSafe = underTemp && hostProblems.length === 0 && isolationGap.length === 0;
   if (!writesSafe) {
-    r.info(
-      "跳过写盘断言",
+    r.skip(
+      "写盘断言",
       `隔离前置不成立（${[...hostProblems, ...isolationGap].join("；") || "Qoder 的候选文件不在 temp 下"}）；本组一个文件都不写`,
     );
   } else {
@@ -1683,9 +1683,9 @@ try {
     const isolationGap = unisolatedAgentAdapters(env, REAL_HOME);
     r.check("隔离变量齐备：四家都不会退到真实 home", [], isolationGap);
     if (isolationGap.length > 0) {
-      r.info("转发的隔离变量", "(跳过：隔离前置不成立，一个都不转发)");
-      r.info(
-        "跳过清理分支",
+      r.skip("转发的隔离变量", "隔离前置不成立，一个都不转发");
+      r.skip(
+        "清理分支",
         `这几家的候选文件仍落在真实 home：${isolationGap.join(", ")}；给 dev:debug 与本套件带上同一个 PET_AGENT_HOME（temp 下）再跑`,
       );
     } else {
@@ -1763,7 +1763,7 @@ try {
   const zhomeOk = ZHOME !== "" && resolve(ZHOME).startsWith(TEMP_ROOT + sep) && underTemp;
   r.check("前置齐备：PET_AGENT_HOME 在 temp 下 + 设置页已挂载", true, zhomeOk);
   if (!zhomeOk) {
-    r.info("跳过 ZCode 组", "PET_AGENT_HOME 未设/不在 temp 下，或设置页没打开；本组一个文件都不写");
+    r.skip("ZCode 组", "PET_AGENT_HOME 未设/不在 temp 下，或设置页没打开；本组一个文件都不写");
   } else {
     const zcli = join(ZHOME, ".zcode", "cli");
     rmSync(zcli, { recursive: true, force: true });
@@ -1863,13 +1863,48 @@ try {
     r.check("停用插件后 ZCode 的条目也摘净（不是只摘 Qoder）", 0, zOurs());
     r.check("停用 ZCode 时不动用户自己的条目", true, readFileSync(zcfg, "utf8").includes("user-hook.sh"));
     r.check("停用不清空 agent 字段（再启用全靠它恢复）", "zcode", linkageAgent());
+    // 停用把总开关恢复成「装之前的 false」。这条不只是回显：**再启用会不会静默装回条目，
+    // 全看这一刻开关是不是 false**（`switch_needs_consent` 只在显式关着时才返回 Some）。
+    r.check("停用 ZCode 时总开关恢复成装之前的 false", false, JSON.parse(readFileSync(zcfg, "utf8")).hooks.enabled);
     await writeEnabledIds(settings.invoke, [...new Set([...withoutAgent, AGENT_ID])]);
     await reconcilePetWindow(c);
-    r.check("再启用后 ZCode 的条目装回来（7 条，带 --agent zcode）", [7, true], [
+    // G2-09 / N8：**重新勾选启用 ≠ 对「拨开 ZCode 总开关」的同意**。启停联动走的是自动路径，
+    // 确认位恒为 false（linkage::apply 里 install(..., false)），撞上确认门就一个文件都不写、
+    // 一个字节都不动。上一版期望「再启用即装回 7 条」正是被复核掉的绕过 —— 期望必须反过来，
+    // 否则这套件是在给漏洞背书，跑绿反而更糟。
+    r.check("再启用不自动装回 ZCode 条目（自动路径撞确认门，7 条变 0）", 0, zOurs());
+    r.check("再启用不写任何 --pet-hook 条目", false, readFileSync(zcfg, "utf8").includes("--pet-hook"));
+    r.check(
+      "再启用不动总开关（仍是装之前的 false，不替用户拨开）",
+      false,
+      JSON.parse(readFileSync(zcfg, "utf8")).hooks.enabled,
+    );
+    r.check("再启用不动用户自己的条目", true, readFileSync(zcfg, "utf8").includes("user-hook.sh"));
+    // 「一个都没写」还要证明是**被确认门拦下**，不是别的失败静默跳过：同一条安装命令不带
+    // confirm 必须回 [need-confirm] 且仍不动盘（界面「安装」第一趟正是这个调用）。
+    const recheck = await settings.invoke("agent_hooks_install");
+    r.check("再启用后重新安装（不带 confirm）回 [need-confirm]", "[need-confirm]", String(recheck.e).slice(0, 14));
+    r.check("被确认门拦下时文件仍一个字节没动", 0, zOurs());
+    // 真确认才装得回来：走界面「安装」→「仍要打开」，原来那 7 条逐条核对全部保留
+    const clickedReinstallZ = await clickShadow(".hk-install", "确认门之后「安装」仍可点");
+    r.check(
+      "点「安装」第一趟停在确认门（界面 dataset.state=consent）",
+      true,
+      clickedReinstallZ && (await waitUntil(settings.client, stateExpr("consent"), 12_000)),
+    );
+    const clickedYesZ = await clickShadow(".hk-consent", "「仍要打开」点得到");
+    r.check(
+      "点「仍要打开」之后才装回来（界面 state=installed）",
+      true,
+      clickedYesZ && (await waitUntil(settings.client, stateExpr("installed"), 20_000)),
+    );
+    // 诊断：确认那一下之后面板到底说了什么（失败时把宿主的原话留下来，省得只看见 true/false）
+    r.info("确认后面板原文", `${await statusText()} ｜ 文件里 --pet-hook 条数=${zOurs()}`);
+    r.check("确认后 ZCode 的条目装回来（7 条，带 --agent zcode）", [7, true], [
       zOurs(),
       readFileSync(zcfg, "utf8").includes("--pet-hook pre --agent zcode"),
     ]);
-    r.check("再启用后总开关仍是打开（装回来的副作用一致）", true, JSON.parse(readFileSync(zcfg, "utf8")).hooks.enabled === true);
+    r.check("确认后总开关才被拨开（装回来的副作用一致）", true, JSON.parse(readFileSync(zcfg, "utf8")).hooks.enabled === true);
 
     // 来源过滤在真实切换之后仍只对当前那一家放行：注入 qoder 事件不该动桌宠，zcode 事件该动
     const evCount = async () =>
@@ -1915,7 +1950,7 @@ try {
   // 所以真实用户目录一个都不会被碰到。
   r.group("Codex 切换：目录在就建文件、10 个事件、timeout 按秒、不谎称查过自检");
   if (!zhomeOk) {
-    r.info("跳过 Codex 组", "前置不成立（PET_AGENT_HOME 不在 temp 下或设置页没挂载），本组一个文件都不写");
+    r.skip("Codex 组", "前置不成立（PET_AGENT_HOME 不在 temp 下或设置页没挂载），本组一个文件都不写");
   } else {
     const cdir = join(ZHOME, ".codex");
     const cf = join(cdir, "hooks.json");
@@ -2064,7 +2099,7 @@ try {
   // 而且我们不替用户改它 —— 所以确认门必须排在卸旧之前，否则会出现「旧的已摘、新的没装」那种两边都不动的状态。
   r.group("WorkBuddy 切换：卸旧之前的预检、7 个事件、matcher 只给工具类、不动用户的开关");
   if (!zhomeOk) {
-    r.info("跳过 WorkBuddy 组", "前置不成立，本组一个文件都不写");
+    r.skip("WorkBuddy 组", "前置不成立，本组一个文件都不写");
   } else {
     const wdir = join(ZHOME, ".workbuddy");
     const wf = join(wdir, "settings.json");

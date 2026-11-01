@@ -47,19 +47,21 @@ export function mountBadge(root, ctx, cleanups) {
 
   function show() {
     const d = lastView;
-    if (!d || d.state === "onboarding" || !d.account || !d.windows) {
-      if (mounted) badge.remove();
-      mounted = false;
-      return;
-    }
-
-    if (d.state === "auth_error") {
+    // 鉴权失败要先判（G5-09）：Key 失效时 account 往往是 null，先走下面那条
+    // 「没账号就整块不挂」会把「Key 失效」吞掉，用户只看到徽标消失。
+    if (d && d.state === "auth_error") {
       setTextIfChanged(label, "Key 失效", cache, "label");
       setClassIfChanged(badge, "g-badge bad", cache);
       if (!mounted) {
         root.append(badge);
         mounted = true;
       }
+      return;
+    }
+
+    if (!d || d.state === "onboarding" || !d.account || !d.windows) {
+      if (mounted) badge.remove();
+      mounted = false;
       return;
     }
 

@@ -444,6 +444,30 @@ export function isAgentPathInside(candidate, root) {
   return c === r || c.startsWith(`${r}/`);
 }
 
+/** 真实用户配置目录的目录名（与 tools/check-nsis-cleanup.ps1 的 Test-RealAgentPath 同源，另加 .dsh）。 */
+const REAL_AGENT_DIR_NAMES = [".qoder", ".qoder-cn", ".zcode", ".codex", ".workbuddy", ".codebuddy", ".dsh"];
+
+/**
+ * `candidate` 是否就是真实 home，或落在真实 home 下的已知 agent 目录里（G2-N6 / 复核报告 N6）。
+ *
+ * 旧判据是「在 realHome 下一律判红」，但 Windows 默认 TEMP 就在
+ * `%USERPROFILE%\\AppData\\Local\\Temp` 下，于是合法夹具全被判成「落在真实 home」——
+ * 报告里 POSIX 模拟（tmp 与仓库 temp 都在 home 下）四家全红就是这个假阳。
+ * 现在按报告给的修法与 ps1 的 Test-RealAgentPath 对齐：等于 home 本身，或位于 home 下的
+ * `.qoder` / `.qoder-cn` / `.zcode` / `.codex` / `.workbuddy` / `.codebuddy` / `.dsh`
+ * 才算真实配置；home 下其它位置（含 TEMP）不再误伤。`realHome` 为空时不做这项判断 ——
+ * 调用方没给参照物时硬判会误伤一切。
+ */
+export function isRealAgentPath(candidate, realHome = "") {
+  if (isBlankEnv(candidate) || isBlankEnv(realHome)) return false;
+  const c = normalizeAgentPath(candidate);
+  const r = normalizeAgentPath(realHome);
+  if (c === r) return true;
+  if (!c.startsWith(`${r}/`)) return false;
+  const first = c.slice(r.length + 1).split("/")[0];
+  return REAL_AGENT_DIR_NAMES.includes(first);
+}
+
 /** 一个路径是否落在白名单临时根内。**只信落点**，不看它来自哪个变量：
  * `PET_AGENT_CONFIG_FILES=C:\Users\me\.qoder\settings.json` 与没设同样危险。 */
 export function isIsolatedAgentPath(candidate, roots = agentIsolationRoots()) {
@@ -473,7 +497,7 @@ export function agentIsolationEnvProblems(source = {}, { roots = agentIsolationR
     }
     for (const value of values) {
       if (!isIsolatedAgentPath(value, roots)) problems.push(`${name}=${value} 不在 temp 下`);
-      else if (isAgentPathInside(value, realHome)) problems.push(`${name}=${value} 落在真实 home`);
+      else if (isRealAgentPath(value, realHome)) problems.push(`${name}=${value} 落在真实 home`);
     }
   }
   return problems;
@@ -542,13 +566,13 @@ export function unisolatedAgentAdapters(source = {}, realHome = "", options = {}
         const paths = agentEnvPaths(raw);
         const ok =
           paths.length > 0 &&
-          paths.every((p) => isIsolatedAgentPath(p, roots) && !isAgentPathInside(p, realHome));
+          paths.every((p) => isIsolatedAgentPath(p, roots) && !isRealAgentPath(p, realHome));
         if (!ok) out.push(adapter.id);
         continue;
       }
     }
     const home = source.PET_AGENT_HOME;
-    if (isBlankEnv(home) || !isIsolatedAgentPath(home, roots) || isAgentPathInside(home, realHome)) {
+    if (isBlankEnv(home) || !isIsolatedAgentPath(home, roots) || isRealAgentPath(home, realHome)) {
       out.push(adapter.id);
     }
   }
@@ -581,7 +605,7 @@ export function hostIsolationProblems(everywhere, { roots = agentIsolationRoots(
   const adapters = Array.isArray(record?.adapters) ? record.adapters : null;
   if (!adapters) return ["宿主没有回报 everywhere.adapters（判不出就判红）"];
   const problems = [];
-  if (!isIsolatedAgentPath(record.home, roots) || isAgentPathInside(record.home, realHome)) {
+  if (!isIsolatedAgentPath(record.home, roots) || isRealAgentPath(record.home, realHome)) {
     problems.push(`宿主实际生效 home=${String(record.home)} 不在 temp 下`);
   }
   const specs = new Map(AGENT_ISOLATION_ADAPTERS.map((spec) => [spec.id, spec]));
@@ -600,7 +624,7 @@ export function hostIsolationProblems(everywhere, { roots = agentIsolationRoots(
       continue;
     }
     for (const file of files) {
-      if (!isIsolatedAgentPath(file, roots) || isAgentPathInside(file, realHome)) {
+      if (!isIsolatedAgentPath(file, roots) || isRealAgentPath(file, realHome)) {
         problems.push(`${id}: ${String(file)} 不在 temp 下`);
       }
     }

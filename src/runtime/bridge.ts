@@ -137,7 +137,12 @@ function gated<A extends unknown[], R>(
 export function createAgentHooksApi(manifest: ManifestLike) {
   return {
     status: gated(manifest, AGENT_HOOKS, () => hostCall<unknown>("agent_hooks_status", { pluginId: manifest.id })),
-    install: gated(manifest, AGENT_HOOKS, () => hostCall<unknown>("agent_hooks_install", { pluginId: manifest.id })),
+    // N3：ZCode 的总开关显式关着、且用户自己配过 hook 时，宿主第一趟只回 `[need-confirm]`。
+    // 设置页把用户那句「仍要打开」翻成 confirm:true 再打一次 —— 不传这一位，界面上就只剩
+    // 机器前缀，用户永远装不上。默认 false：不给确认就不动手。
+    install: gated(manifest, AGENT_HOOKS, (confirm?: boolean) =>
+      hostCall<unknown>("agent_hooks_install", { pluginId: manifest.id, confirm: confirm ?? false }),
+    ),
     uninstall: gated(manifest, AGENT_HOOKS, () => hostCall<unknown>("agent_hooks_uninstall", { pluginId: manifest.id })),
     // 切换联动的 Agent（设置页四选一）。单独一条命令的理由见 ADR-0002 与 A02 卡片 §5：
     // 「卸旧失败、停在原状态」必须同步回给设置页，复用 install 或「写配置再让宿主响应」都做不到

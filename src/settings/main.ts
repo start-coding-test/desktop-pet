@@ -1,6 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { bus } from "../runtime/event-bus";
-import { hostCall } from "../runtime/host-error";
+import { hostCall, hostErrorMessage } from "../runtime/host-error";
 import { applyHotReload, reloadIdsFrom } from "../runtime/hot-reload";
 import {
   loadEnabled,
@@ -13,6 +13,7 @@ import { $, el } from "./dom";
 import { applyFilter, renderNav } from "./nav";
 import { detachWidget, renderPluginPage } from "./plugin-page";
 import { toggleListener } from "./plugin-toggle";
+import { showNotice } from "./notice";
 import { renderAutostart, wireStartup } from "./sections/autostart";
 import { renderGameMode, wireGameMode } from "./sections/game-mode";
 import { renderHotkey, wireHotkey } from "./sections/hotkey";
@@ -140,4 +141,9 @@ async function main(): Promise<void> {
 
 // 侧栏点击 → select 的回调经 state 注入（本文件是入口装配层，不对外导出任何名字）
 setNavigate(select);
-void main();
+// 末尾不吞初始化失败：以前这里是 `void main()`，任何一次 IPC 失败都变成一条
+// unhandledrejection —— 没有提示、窗口停在半装配状态，用户只看到空白侧栏（G4）
+void main().catch((error) => {
+  console.error("[settings] 初始化失败", error);
+  showNotice(`设置窗初始化失败：${hostErrorMessage(error)}`);
+});

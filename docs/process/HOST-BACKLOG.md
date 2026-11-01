@@ -33,7 +33,15 @@ MVP 范围：<这一轮只做什么>
 |---|---|---|---|---|---|---|
 | S1 | 发布 0.2.0 便携包 | 工程发布 | **已完成**（2026-10-16 用户直接要求出包；B3/B4/A9b 未落地，包按当期 main 切，证据见卡面） | — | `93a6eef` | — |
 | S3 | 发布 0.2.2（安装包 + 便携包） | 工程发布 | **已完成**（2026-10-27；tag `v0.2.2` → `bf585fe`；GitHub Release 双资产；真机 A27/A28/A29/A30/A32/C09/E03 通过，`verify:release` 36/0，main 组合 E2E 五套件全 0；已知项与校验值见发版说明） | — | `bf585fe` | — |
-| S4 | 发布 0.2.3 / 0.2.4 修复轮（tag `v0.2.4` → `b6d98cd`；0.2.3 安装器作废） | 工程发布 | **已出包、GitHub Release 未建、CI/E2E 门未跑**（2026-10-28；`v0.2.4` annotated tag 已打，0.2.3 安装器内嵌桥为修复前版本、已作废；E2E 本地读数：`verify` 485/0、`verify:agent` 307/0、`verify:drag` 41/0、`verify:dsh` 43/0（t37 实测，336s、0 rebuild）；发版清单 [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md)、notes [RELEASE-NOTES-0.2.x.md](RELEASE-NOTES-0.2.x.md)；分支保护未开，需管理员） | — | `b6d98cd`（release）+ `02e5102`（0.2.3）+ `4df82f9`（修复轮） | — |
+| S4 | 发布 0.2.3 / 0.2.4 修复轮（tag `v0.2.4` → `b6d98cd`；0.2.3 安装器作废） | 工程发布 | **已出包、GitHub Release 未建；b6d98cd CI 绿（run 40643854516），E2E 门未触发**（2026-10-28；`v0.2.4` annotated tag 已打，0.2.3 安装器内嵌桥为修复前版本、已作废；E2E 本地读数跑在 a18ec21 工作区、不是 tag `b6d98cd` 的字节（`verify:dsh` 套件 a18ec21 才加入，不能当作 0.2.4 包的证据）：`verify` 485/0、`verify:agent` 307/0、`verify:drag` 41/0、`verify:dsh` 43/0（t37 实测，336s、0 rebuild）；注（2026-11-01）：本行 `verify:agent` 307/0 是 2026-10-28 的历史读数，已按 N4 作废，现行基线只认 `.github/workflows/e2e-gate.json` 的 `floorBasis`（303/4，floor 250）；发版清单 [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md)、notes [RELEASE-NOTES-0.2.x.md](RELEASE-NOTES-0.2.x.md)；分支保护未开，需管理员） | — | `b6d98cd`（release）+ `02e5102`（0.2.3）+ `4df82f9`（修复轮） | — |
+| R1 | main CI 红：Rust fmt 门（a18ec21，23 处差异 / 7 文件） | 工程/门禁 | **本地已收口（2026-11-01）/ CI 复验待推送**（本地最终字节 `cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check` 退出 0、0 处 `Diff in`；写模式 fmt 前后 `git diff -- src-tauri/src` 的 sha256 一致＝零字节改动，详见 [ACCEPTANCE-a18ec21-2026-10-29.md](ACCEPTANCE-a18ec21-2026-10-29.md) 的「fmt 收口」节。原判：run 40725727745 / 40725728961，step 12「Rust fmt」失败、13～15 skipped；修复由 t1/t2 在覆盖 `src-tauri/**` 的卡里落地。**CI 侧仍未复验：本地没有推送，没有新 run**） | — | `a18ec21` | — |
+| R2 | 2026-10-29 验收复核：报告式门禁修复（结构化 skip 计数、gate v2、e2e-extended、NSIS 已知缺口、文档口径） | 工程/门禁 + 文档 | **已放行**（2026-10-29；`.github/workflows/e2e.yml` / `e2e-gate.json` / 新增 `e2e-extended.yml`、`tests/e2e/harness/{cdp,fixtures}.mjs`、`tools/{check-e2e-gate,check-docs,check-nsis-cleanup}.*`、`tests/unit/{harness,unit-nsis-hook}.mjs`、docs；逐项判定与证据见 [ACCEPTANCE-a18ec21-2026-10-29.md](ACCEPTANCE-a18ec21-2026-10-29.md)；离线 `unit` 2241/0、`check:docs` 全绿；fmt 红项见 R1） | — | 本轮工作区（未推送） | — |
+| R3 | 巨型 E2E 文件与超长行排版（G9-08 / G8-02 残余） | 回归/文档 | **待排**（`verify-isolation.mjs` 4064 行、`verify-agent-bridge.mjs` 2372 行；`CONVENTIONS.md` 仍有 8452 字单行与 38 行 >400 字；拆文件与排版不改判据，但改动面大，单开卡） | — | 未提交 | — |
+| R4 | NSIS Case C 真机重跑 + 0.2.4 SHA256 补录（G1-07 / G1-08 真机部分） | 工程发布 | **待排（需真机与打包产物）**（`tools/check-nsis-cleanup.ps1` 现在默认把「被动覆盖摘 hook」判红，真机接受时须显式 `-AcceptKnownGapC`；0.2.4 的 SHA256 仍是「待补录」，需在打好的安装包上实测后写回发版清单） | — | 未提交 | — |
+| R5 | docs/plugin-dev 防冲写/编辑锁口径 + 共享 helper（G8-05 / G9-09） | 文档 | **待排**（`PLUGIN_SDK.md` / `PLUGIN_HANDBOOK.md` / `PLUGIN_REVIEW.md` 未写「回显守卫/防冲写」；插件侧共享 helper 未抽，需与 `plugins/**` 一起改，t1 范围外） | — | 未提交 | — |
+| R6 | 真机项汇总（B6 真实 OS 拖动与 DPI、DSH 桥真机联动、四家 Agent 真机写盘、hr-ble 真机蓝牙、astock/goat 在线行情） | 真机验收 | **待排（需真机与桌面会话；离线门不覆盖）**（2026-11-01 集成卡登记：本轮所有相关证据都在临时 home 夹具与单测里，没有一处写真实 Agent 配置、没有真实蓝牙/行情读数；B6 的 OS 拖拽循环在 `startDragging()` 之后收不到 webview 事件，断言只能到数学模型。逐项见 [ACCEPTANCE-a18ec21-2026-10-29.md](ACCEPTANCE-a18ec21-2026-10-29.md) 的「剩余项」节） | — | 未提交 | — |
+| R7 | `verify:agent` 等 E2E 套件本轮未实跑（含 t9 改过的 N8 新期望） | 工程/门禁 | **已收口（2026-11-01 本机 E2E 四套全绿）**（用户授权后由 `tools/e2e-run.mjs` 现构建 debug exe 串行跑：verify 485/0、verify:agent 318/0、verify:drag 41/0、verify:dsh 43/0，总 341s。首跑 478/7 + 315/3 抓出 `boot-error` 语义、E2E 行号判据、**`widget-worker` 零参工厂吞 confirm** 三处回归，修复后复跑全绿；`floorBasis` 的 verify:agent 已更新为 318/0。CI 侧 `e2e.yml` 的 `workflow_dispatch` 仍未触发） | — | 未提交 | [ACCEPTANCE §8](ACCEPTANCE-a18ec21-2026-10-29.md) |
+| R8 | Worker 化以来 `agentHooks.install` 的 confirm 位被零参工厂吞掉（ADR-0008 遗留） | 前端/运行时 | **已修（2026-11-01 本机 E2E 实测）**（`src/runtime/widget-worker.ts` 的 settings 区 `const agent = (method) => () => call(method, [])` 把 `api.install(confirm)` 的参数丢掉 → 宿主永远收 false、第二趟停在确认门；修为 `install: (confirm) => call("agentHooks.install", [confirm ?? false])`，`tests/unit/unit-widget-worker.mjs` 补 +2 条，`verify:agent` 315/3 → 318/0） | — | 未提交 | [ACCEPTANCE §8](ACCEPTANCE-a18ec21-2026-10-29.md) |
 | S2 | P1/P2 加固：同意框身份、订阅侧 ACL、点击穿透门禁、widget boot 超时、store 锁表回收、裸 IPC 判据换真执行 | 安全边界 + 工程 | **已放行**（2026-10-17 落地、2026-10-28 清账；提交 `4b002b2`（merge `e097b24`），离线门禁全绿、e2e 未跑，残余见 [adr/0011](../adr/0011-consent-identity-and-subscribe-acl.md)） | — | `4b002b2` | — |
 | B7 | settings 区强制进 Worker（门禁粒度从"窗口"收到"身份"） | 安全边界 | **已放行**（2026-10-28 清账；落地提交 `41670b2`（#7），settings 区 widget 一律 Worker 已并入 main；原「进行中」是 2026-10-17 旧口径） | — | `41670b2` | — |
 | B2 | `agent:hooks` 受控能力：钩子配置从设置窗移交到插件页 | 本体功能 + 安全边界 | **已放行**（第二轮返工后 PM 全量重跑：cargo 72、`verify` **189/0**、`verify:agent` 53、`verify:release` 12、build 0；三条打回问题都修在脚本侧，根因见卡 §10 与提交说明；历史行：指向已被 squash/rebase 覆盖的旧提交） | — | `7b9b558` | — |
@@ -51,13 +59,12 @@ MVP 范围：<这一轮只做什么>
 | U06 | 补 T14 施工图**真剩下**的 2 条运行时断言（原口径「7 条命令补 12–14 条」已由 `91fd80b`/T15 做完 15 条） | 回归 | **已放行**（`.dispatch/ui-surfaces/cards/U06-leftover-t14-assertions.md`，派单工作区、不入库，R4 口径；派卡前逐条对账 21 候选：14 条已在套件里、真剩 2 条、4 条砍掉并写明理由，其中「设置页『测试』按钮」那条**物理前提不成立**（`src/settings/sections/hotkey.ts` 只有 input/save/reset/status 四个元素）；PM 实测 `verify` 271→**273/0** 且两条新标题以 OK 出现（不是 `r.info` 跳过），变异按执行者预先写出的红条件下靶 —— 掐掉 `hotkeys.rs` 成功分支的 `unregister` 后 **272/1，红的恰好只有那一条**） | ~~U01~~ 已满足 | `74077bf` | — |
 | U07 | 盯盘悬浮卡改插件自定坐标（与 U04 同构的 astock 片） | 插件 + 回归 | **已放行**（`.dispatch/ui-surfaces/cards/U07-astock-card-position.md`，派单工作区、不入库，R4 口径；PM 冷启动实测 `verify:astock` **159/0** 且四条新落点标题全在场 —— 该套件出网、条数随盘面形态漂，判覆盖比标题集合；变异：x/y 对调 → **6 failed**（三条点名 + 三条同套件连带，记下来：这套件断言彼此不独立），离线加白名单外属性 → `unit:migrate` 红；执行者留下了真实的红→绿原文（按卡面 attr 写法时 18/0→17/1）） | ~~U01, U03~~ 已满足 | `e02a68e` | — |
 | U08 | 收尾两笔欠账：本体压 overlay 的第二重放点了结 + 同意框应答泵的偶发红（**PM 自留，无执行卡**） | 本体窗口 + 回归脚本 | **已完成**（#69 三态实验：V0 两处都在／V1 只掐 `apply_visibility` 逐扇重放／V2 只掐 `pet.rs` 整体重放，各 **278 passed / 0 failed**、`win-zorder.ps1` 每态三次采样一致 pet-top → 第二重放点无法被证明独立必要，连同唯一调用它的 `raise_above_pet_all` 一起删掉，结论记在 [adr/0010](../adr/0010-badge-visibility-overlay-position-and-window-layering.md)「修订」；新增真窗断言一组 5 条（`r.check` 唯一标题 252→257、消失 0 条），并把 `win-zorder.ps1` 的结论补成纯 ASCII 机器行 `ZORDER samples=… verdict=…`。#70 根因：pump 把「窗口出现在 CDP 列表」当成「已渲出内容」，抢在 `consent_details` 回来之前读+点，于是「探针首次调用弹出的同意框列出了 agent:hooks」三轮红一次；改为轮询到 `#cap-list li` 出现再读点（最多 4 秒，超时仍应答）+ 新增硬失败「pump 应答过的每一扇同意框都渲出过内容」（75→76、消失 0 条），两轮冷启动各 **80/0**。变异 `mutate-check` 2 点 **killed=2 survived=0**（M-A1 让 pump 不等渲出 → 新那条与探针那条一起红；M-B1 让 `raise_above_pet` 首行早退 → **全套件唯一红的就是新加的那条**，实得 `verdict=overlay-covers-pet`）。复跑门禁：cargo 189/0、clippy `-D warnings` 与 fmt 退出码 0、`unit` 1236/0、`check:shape` 48 全 0、`check:docs` rules=8 failing=0、tsc／biome 全 0） | — | `bfa3112`（窗口层）+ `40cc843`（应答泵）+ `aca1563`（文档） | — |
-
 | E02 | debug 默认热键覆盖（`PET_HOTKEY_DEFAULT`）：E2E 机器占键时仍验证默认值路径 | 工程/回归 | **已放行**（2026-10-27；debug-only 覆盖，release 不读；`hotkey_status.default` 驱动判据，产品默认仍 `CommandOrControl+Alt+P`；详见 [adr/0015](../adr/0015-debug-only-default-hotkey-override.md)） | — | `78f6cd7` | — |
 | E03 | 「测试占用」对未注册的当前键必须真试（0.2.2 真机验收发现） | 工程/回归 | **已放行**（2026-10-27；当前键只有 `is_registered` 为真才直接判 true；启动时被占的默认键现在会如实报「注册失败」，与状态行一致；Rust 源码层判据 + 真机复演） | — | `bf585fe` | — |
 | E04 | v3 CSP 回归、atlas 缓存失效与 0.2.2 打包版内存实测 | 工程/回归 + 文档 | **已放行**（2026-10-27；`verify-release` 补 `connect-src` 断言并真实 fetch `pet.json`；v3 清单无效时清 `atlasCache`；`pet.json` 请求加 `no-store` 并写明覆盖后重启；SKIN-FORMAT 记录 4608×6240 v3 皮肤实测总工作集 887 MiB） | — | `85e9165` | — |
 | E05 | goat badge 空态判据在 astock 共存时误红（改判自身高度/内容） | 回归 | **已放行**（2026-10-27；`#widget-badge` 宽度会被共存插件撑开，块级插槽继承宽度；空态改判 goat 插槽自身 `height===0` 且无文本，仍为严格断言，并保留失败现场诊断） | — | `2ab013f` | — |
-| B5 | DSH Agent 桥（第五家）：DSH 侧 cordis 桥插件 + 宿主 bridge 接入形态（[adr/0016](../adr/0016-dsh-agent-bridge-is-a-plugin-not-hook-files.md)） | 本体功能 + 插件 | **已出包、CI 未验、分支保护未开（待真机验收）**（2026-10-28；新增 `integrations/dsh-bridge/`：`session/created|event|disposed` → 收件行（`agent:"dsh"`）、纯函数映射 `mapping.js`、`cordis.patch.yml`、两个 locale 与图标、README；宿主新增 `adapters/dsh.rs`（`installs_files()==false`，无文件可装）与 `services/agent/dsh_bridge.rs`（检测 `~/.dsh/profiles/*/package.json` 的 `dsh.profile.bundles`，`PET_DSH_HOME` 可换根），`linkage::switch_agent` 与 `attach_bridge` 走「摘旧 hook + 检测 + 记录选择」分支，`snapshot()` 多 `mode`/`bridge` 字段，设置页按形态显示「接入/断开」；`AGENT_IDS` 加 `dsh`（来源过滤靠它）；打包资源加 `../integrations`（单测按「目标=源目录名」+ 根白名单判定）。离线门禁：`cargo test` **416/0**、`npm run unit` **2238/0**（新 `tests/unit/unit-dsh-bridge.mjs` 110 条断言，已并入 `unit` 与新增的 `unit:dsh-bridge` 脚本）、`check:docs` rules=10 failing=0、`check:shape` commands=52 failing=0、`lint` / `build` rc 0。**e2e 只在本地跑过，CI 门未跑**（本轮用五项变量冷重启实例跑：`PET_E2E_PRESEED=1` / `PET_AGENT_CONFIG_FILES` / `PET_AGENT_HOME` / `PET_AGENT_INBOX` / `PET_HOTKEY_DEFAULT=CommandOrControl+Alt+Q`；`PET_E2E_PRESEED` 的预置夹具是一次性的，每轮都要冷重启实例）：`verify` **485/0**、`verify:agent` **307/0**、`verify:drag` **41/0**、`verify:dsh` **43/0**（t37 实测，336s、0 rebuild）；套件里「四选一清单」两条旧判据跟着改成五家并新增「dsh 指路 install_bundle」一条（只加严，未放宽）。**未真机验证**「DSH 里 `install_bundle` 一次后桌宠联动」（需要用户在 DSH 侧装一次桥，属产品既定步骤）；0.2.4 修复轮已出包（`release-package/DesktopPet_0.2.4_x64-setup.exe`，2026-10-28 打出；修复轮提交 `4df82f9` 覆盖 P0 收件目录回退、CRLF 判据 + `.gitattributes`、四家卸载断言、13 条恒真断言转真、发版口径纠偏）；0.2.3 的安装器内嵌的是收件目录修复前的桥，**已作废**；目录形态便携包 `release-package/DesktopPet-0.2.4/`（`desktop-pet.exe` + `plugins/` + `integrations/` + `更新说明.txt`）已在本工作区组装，未入库（`.gitignore` 覆盖）、属本地产物，不作为入库证据。三笔提交（`7448b3f` / `02e5102` / `4df82f9`）直接推了 main、出包早于 CI 门、分支保护至今未开——发版口径与开启命令见 [CONVENTIONS](CONVENTIONS.md)「发版前置」，需仓库管理员执行（本机没有 gh、也没有仓库 token）。 | — | `7448b3f` + `4df82f9` | — |
-| B6 | 拖动态（拖动桌宠按窗口真实位移切 running-right/running-left，松手复原） | 本体功能 | **已落地待验收**（2026-10-28；`src/main.ts` 拖拽接线 + `DRAG_START_PX` 常量化 + onMoved 监听单飞/幂等注销/pagehide；`src/pet/state-machine.ts` 新增 `DragDirectionTracker` 与 beginDrag/dragDirection/endDrag，`DRAG_DIRECTION_MIN_PX=24`、`DRAG_DIRECTION_COOLDOWN_MS=80` 导出供 e2e 复用；方向只来自 `getCurrentWindow().onMoved`（系统拖拽吞掉 mousemove），无新增 Rust 命令或依赖；松手复原拖动前状态（waiting 复原 waiting、插件插播不抢回）；新增 `tests/e2e/verify-pet-drag.mjs` + `tests/e2e/harness/pet-window.mjs` 与 `pet-window.ps1` + `package.json` 的 `verify:drag`，`tests/unit/unit-runtime.mjs` +62 条；ARCHITECTURE/CONVENTIONS/README/CONTEXT 已由 t4 补齐。读数：`cargo test` 416/0、`npm run unit` 2238/0、`check:docs` rules=10 failing=0、`check:shape` commands=52 failing=0、`lint` 200 files、`build` ✓ 108ms、`verify:drag` 41/0（t27 起一套件一实例）、`verify` 485/0、`verify:agent` 307/0、`verify:dsh` 43/0（t37 实测，336s、0 rebuild）。**e2e 本地绿，真实 OS 拖拽属人工项**：① 真实鼠标按住拖动的 OS 拖拽循环不可自动覆盖（`startDragging()` 之后 webview 收不到事件、合成按下没有物理按键），套件头已写人工 5 步；② DPI≠100% 与多屏/负坐标未测；③ 拖动期插件 `pet:react` 插播可能被后续方向切换覆盖、dwell 暂停后不补播（t3 的 P2，触发窄、损失瞬时）；④ `verify:drag` 不能与其它搬窗口/动光标套件并发（t5 已写进套件头与 CONVENTIONS）） | — | `993e1f2` | — |
+| B5 | DSH Agent 桥（第五家）：DSH 侧 cordis 桥插件 + 宿主 bridge 接入形态（[adr/0016](../adr/0016-dsh-agent-bridge-is-a-plugin-not-hook-files.md)） | 本体功能 + 插件 | **已出包、CI 未验、分支保护未开（待真机验收）**（2026-10-28；新增 `integrations/dsh-bridge/`：`session/created\|event\|disposed` → 收件行（`agent:"dsh"`）、纯函数映射 `mapping.js`、`cordis.patch.yml`、两个 locale 与图标、README；宿主新增 `adapters/dsh.rs`（`installs_files()==false`，无文件可装）与 `services/agent/dsh_bridge.rs`（检测 `~/.dsh/profiles/*/package.json` 的 `dsh.profile.bundles`，`PET_DSH_HOME` 可换根），`linkage::switch_agent` 与 `attach_bridge` 走「摘旧 hook + 检测 + 记录选择」分支，`snapshot()` 多 `mode`/`bridge` 字段，设置页按形态显示「接入/断开」；`AGENT_IDS` 加 `dsh`（来源过滤靠它）；打包资源加 `../integrations`（单测按「目标=源目录名」+ 根白名单判定）。离线门禁：`cargo test` **416/0**、`npm run unit` **2238/0**（新 `tests/unit/unit-dsh-bridge.mjs` 110 条断言，已并入 `unit` 与新增的 `unit:dsh-bridge` 脚本）、`check:docs` rules=10 failing=0、`check:shape` commands=52 failing=0、`lint` / `build` rc 0。**e2e 只在本地跑过，CI 门未跑**（本轮用五项变量冷重启实例跑：`PET_E2E_PRESEED=1` / `PET_AGENT_CONFIG_FILES` / `PET_AGENT_HOME` / `PET_AGENT_INBOX` / `PET_HOTKEY_DEFAULT=CommandOrControl+Alt+Q`；`PET_E2E_PRESEED` 的预置夹具是一次性的，每轮都要冷重启实例）：`verify` **485/0**、`verify:agent` **307/0**、`verify:drag` **41/0**、`verify:dsh` **43/0**（t37 实测，336s、0 rebuild）；套件里「四选一清单」两条旧判据跟着改成五家并新增「dsh 指路 install_bundle」一条（只加严，未放宽）。**未真机验证**「DSH 里 `install_bundle` 一次后桌宠联动」（需要用户在 DSH 侧装一次桥，属产品既定步骤）；0.2.4 修复轮已出包（`release-package/DesktopPet_0.2.4_x64-setup.exe`，2026-10-28 打出；修复轮提交 `4df82f9` 覆盖 P0 收件目录回退、CRLF 判据 + `.gitattributes`、四家卸载断言、13 条恒真断言转真、发版口径纠偏）；0.2.3 的安装器内嵌的是收件目录修复前的桥，**已作废**；目录形态便携包 `release-package/DesktopPet-0.2.4/`（`desktop-pet.exe` + `plugins/` + `integrations/` + `更新说明.txt`）已在本工作区组装，未入库（`.gitignore` 覆盖）、属本地产物，不作为入库证据。三笔提交（`7448b3f` / `02e5102` / `4df82f9`）直接推了 main、出包早于 CI 门、分支保护至今未开——发版口径与开启命令见 [CONVENTIONS](CONVENTIONS.md)「发版前置」，需仓库管理员执行（本机没有 gh、也没有仓库 token）。 | — | `7448b3f` + `4df82f9` | — |
+| B6 | 拖动态（拖动桌宠按窗口真实位移切 running-right/running-left，松手复原） | 本体功能 | **已落地待验收**（2026-10-28；`src/main.ts` 拖拽接线 + `DRAG_START_PX` 常量化 + onMoved 监听单飞/幂等注销/pagehide；`src/pet/state-machine.ts` 新增 `DragDirectionTracker` 与 beginDrag/dragDirection/endDrag，`DRAG_DIRECTION_MIN_PX=24`、`DRAG_DIRECTION_COOLDOWN_MS=80` 导出供 e2e 复用；方向只来自 `getCurrentWindow().onMoved`（系统拖拽吞掉 mousemove），无新增 Rust 命令或依赖；松手复原拖动前状态（waiting 复原 waiting、插件插播不抢回）；新增 `tests/e2e/verify-pet-drag.mjs` + `tests/e2e/harness/pet-window.mjs` 与 `pet-window.ps1` + `package.json` 的 `verify:drag`，`tests/unit/unit-runtime.mjs` +62 条；ARCHITECTURE/CONVENTIONS/README/CONTEXT 已由 t4 补齐。读数：`cargo test` 416/0、`npm run unit` 2238/0、`check:docs` rules=10 failing=0、`check:shape` commands=52 failing=0、`lint` 200 files、`build` ✓ 108ms、`verify:drag` 41/0（t27 起一套件一实例）、`verify` 485/0、`verify:agent` 307/0、`verify:dsh` 43/0（t37 实测，336s、0 rebuild）。**e2e 本地绿，真实 OS 拖拽属人工项**：① 真实鼠标按住拖动的 OS 拖拽循环不可自动覆盖（`startDragging()` 之后 webview 收不到事件、合成按下没有物理按键），套件头已写人工 5 步；② DPI≠100% 与多屏/负坐标未测；③ 拖动期插件 `pet:react` 插播可能被后续方向切换覆盖、dwell 暂停后不补播（t3 的 P2，触发窄、损失瞬时）；④ `verify:drag` 不能与其它搬窗口/动光标套件并发（t5 已写进套件头与 CONVENTIONS）；实现已拆到 `src/pet/drag-controller.ts`（a18ec21），`src/main.ts` 只做接线） | — | `993e1f2` | — |
 | B8 | 代理路径的 DNS rebinding 与代理端点信任（G3-04 残余） | 安全边界 | **待排**（2026-10-28 入账；直连已由 `GuardedResolver` 收口，代理模式的目标由代理侧解析、本机无法在解析后判私网；代理端点本身不做公网校验。来源：F02 卡回传） | — | 未提交 | — |
 | B9 | L2 收口：插件执行边界换 Web Worker 独立 realm | 安全边界 | **待排**（2026-10-28 入账；按 ADR-0011 第 5 条 L2-1/2/3：index.js 与 widget 全进 Worker、每插件一 realm，宿主只信启动时绑定的 plugin_id，命令面去掉自报 id。来源：F02 卡回传） | — | 未提交 | — |
 | B10 | 「零 op 反向断言可能假绿」：反向断言补「本帧确有其它 op」前置 | 回归 | **待排**（2026-10-28 入账；`tests/unit/unit-settings-echo.mjs:161`（stalePush）与 `:99` 靠「当帧没有 op」表达、整帧恰为空时假绿。来源：B5 卡后续项，t5/t7 判属既有） | — | 未提交 | — |
@@ -347,25 +354,110 @@ MVP 范围：<这一轮只做什么>
   `verify-isolation` / `verify-release` 全绿，且探针按新契约重写后仍覆盖
   「settings 区拿得到 `ctx.host.agentHooks`、badge/overlay 区拿不到」这条不变量。
 
+### R1 main CI Rust fmt 红 · 状态：**本地已收口（2026-11-01）/ CI 待复验**
+
+- 目标：把 a18ec21 上 23 处 rustfmt 差异修掉（7 个文件，全部在 `src-tauri/**`），让 `ci.yml` 的
+  「Rust fmt」步重新绿。这一步不过，后面的 clippy / `cargo test` / `tauri build` 三步都是 skipped，
+  「CI 绿」无从谈起。
+- 证据：run `40725727745`、`40725728961` 均在 step 12「Rust fmt」失败（复核报告 N1）。
+- 2026-11-01 本地收口证据（集成卡 t8）：`cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check`
+  退出 0 且 `Diff in` 计数为 0；同一轮 `cargo clippy --all-targets -- -D warnings` 退出 0、`cargo test` 428/0。
+  写模式 fmt 之前/之后 `git diff -- src-tauri/src | sha256sum` 都是
+  `7c62eab7ff04398d9d13fa3a38b396ba9b504d50b1b5574715b1bf044ee1dfed`（`git status --porcelain` 指纹同样不变），
+  即收尾时 fmt 对最终字节是零改动 —— 差异是 t1/t2 各自对自己改的 `.rs` 跑 `rustfmt --edition 2021` 时消化掉的。
+  `src-tauri/src/commands/agent.rs`、`src-tauri/src/services/agent_hooks.rs` 两个本轮无逻辑改动的文件，
+  去空白去尾逗号归一化后与 `8b2bc0e` 版逐字节相同，证明那两处只是 rustfmt 排版。
+- 边界：只动格式不改语义；`cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check` 退出 0。
+  **t1 的 inScope 排除 `src-tauri/**`**，所以本卡只复核与记账，实现由覆盖 src-tauri 的卡接手
+  （builder-2 / builder-3 的文件级认领见团队邮箱）。
+- 验收：新 run 在 main 上 fmt + clippy + `cargo test` 三步全绿，run 号回填状态板 S4/R1 与
+  [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md)。**这一步没做**：本地没有推送（用户未授权），所以 R1 只是
+  「本地已收口」，不是「CI 绿」。
+
+### R2 2026-10-29 验收复核修复轮 · 状态：**已放行**
+
+- 目标：按 `desktop-pet-验收-a18ec21-2026-10-29.docx` 复核门禁、测试工具与文档，修可复现项、
+  给不成立项证据，并写验收矩阵。
+- 交付：`.github/workflows/e2e.yml`（结构化 `E2E-SUMMARY` / SKIP 登记判据）、`e2e-gate.json` v2、
+  新增 `e2e-extended.yml`、`tests/e2e/harness/{cdp,fixtures}.mjs`、`tools/{check-e2e-gate,check-docs,check-nsis-cleanup}.*`、
+  `tests/unit/{harness,unit-nsis-hook}.mjs`、发版/状态板/README/AGENTS 口径、本文件 R1～R5。
+- 验收证据：逐项判定见 [ACCEPTANCE-a18ec21-2026-10-29.md](ACCEPTANCE-a18ec21-2026-10-29.md)；
+  离线 `npm run unit` 2241/0、`check:docs` / `check:shape` / `lint` / `build` 退出 0；Rust fmt 红项转 R1。
+- 明确不做的：不 push、不建 GitHub Release、不改分支保护、不豁免 fmt 红。
+
+### R3 巨型 E2E 文件与超长行排版（G9-08 / G8-02 残余） · 状态：**待排**
+
+- 目标：把 `tests/e2e/verify-isolation.mjs`（4064 行）、`verify-agent-bridge.mjs`（2372 行）按组拆成
+  harness + 分片脚本；`docs/process/CONVENTIONS.md` 里 8452 字的单行与 38 行 >400 字按段落折行。
+- 约束：只搬不改判据；拆完 `npm run verify` / `verify:agent` 的断言数与标题集合必须不变
+  （用 `audit-assertions` 对标题集合，不比数字）。
+- 为什么不在 t1：改动面覆盖测试主流程，低风险才做；本轮只记录，不硬拆。
+
+### R4 NSIS Case C 真机重跑 + 0.2.4 SHA256 补录 · 状态：**待排（需真机与打包产物）**
+
+- 目标：在 0.2.4 安装包上重跑 `tools/check-nsis-cleanup.ps1` 的 A/B/C；`/P` 被动覆盖若摘 hook，
+  必须显式 `-AcceptKnownGapC` 记录（默认已判红）；把实测 SHA256 写回
+  [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md) 的 0.2.4 节。
+- 为什么不在 t1：需要真机安装/卸载与已打好但未入库的安装包（`release-package/` 被 `.gitignore` 覆盖）。
+
+### R5 docs/plugin-dev 防冲写/编辑锁口径 + 共享 helper（G8-05 / G9-09） · 状态：**待排**
+
+- 目标：在 `PLUGIN_SDK.md` / `PLUGIN_HANDBOOK.md` / `PLUGIN_REVIEW.md` 写清「回显守卫 / 防冲写」
+  的插件侧义务；把重复的实现抽成 `plugins/` 共享 helper 或在文档里写明「暂不抽、复制要带理由」。
+- 为什么不在 t1：`plugins/**` 与 ADR 不在本卡范围，且抽 helper 要动插件运行时代码。
+
+### R6 真机项汇总 · 状态：**待排（需真机与桌面会话）**
+
+- 目标：把本轮只有离线证据的条目集中登记，逐项取得真机读数：① B6 真实 OS 拖动（鼠标按住拖窗口，
+  `startDragging()` 之后的拖拽循环 webview 收不到事件、合成按下没有物理按键，故只验证到方向判定数学模型）
+  与 DPI≠100% / 多屏负坐标；② DSH 桥真机「`install_bundle` 一次后桌宠联动」；③ Qoder / ZCode / Codex /
+  WorkBuddy 四家真实配置目录的写盘与回滚（本轮全部用临时 home 夹具，**没有一处写真实 Agent 配置**）；
+  ④ hr-ble 真机蓝牙广播；⑤ astock/goat 在线行情读数（本轮 0 在线读数）。
+- 证据：语境见 [ACCEPTANCE-a18ec21-2026-10-29.md](ACCEPTANCE-a18ec21-2026-10-29.md) 的「剩余项」节
+  （真机 / 桌面会话一类）与本文件 B5/B6 卡面的未验收项。
+- 边界：真机项不得用离线门读数代认；拿到读数后回填对应卡面与验收文档，不改断言口径。
+- 为什么不在 t8：集成卡无桌面会话与打包产物，且契约明确禁止把本地离线验证当发布完成。
+
+### R7 E2E 套件本轮未实跑 · 状态：**已收口（2026-11-01 本机如实跑完，四套全绿）**
+
+- 目标：先重建 `src-tauri/target/debug/desktop-pet.exe`（当前是 2026-10-28 的旧构建，`src-tauri/src` 下有多个
+  `.rs` 比它新），再串行跑 `npm run verify` / `verify:agent` / `verify:dsh` / `verify:drag` 等，重点验 t9 在
+  `tests/e2e/verify-agent-bridge.mjs` 里写下的 N8 新期望（停用后 0 条、总开关仍 false、`.hk-install`→`.hk-consent`
+  的真确认链装回 7 条）。
+- 为什么不在 t8：① 旧二进制跑新源码等于没跑；② 多套 E2E 并发会互抢窗口/光标（t5 已写进套件头与 CONVENTIONS），
+  必须串行且需要一个可控桌面会话；③ 本卡契约要求「不把未跑 E2E 写成通过」，故只登记 `check:e2e-gate` 的配置读数
+  （`suites=12 floors=8 pending=4 skips=3 failing=0`），并在验收文档明写 0 条 E2E 读数。
+- **收口结果（2026-11-01 夜，用户授权在本机跑）**：`node tools/e2e-run.mjs` 由 `dev:debug` 现构建实例，串行四套 →
+  `verify` 485/0（263s）、`verify:agent` 318/0（62s）、`verify:drag` 41/0（13s）、`verify:dsh` 43/0（3s）。首跑抓出的
+  `boot-error` 语义、E2E 行号判据、`widget-worker` 零参工厂吞 confirm 三处回归已修（详见
+  [ACCEPTANCE-a18ec21-2026-10-29.md](ACCEPTANCE-a18ec21-2026-10-29.md) §8），`floorBasis` 的 verify:agent 更新为 318/0。
+  未覆盖：真实 OS 拖动 / DPI≠100%、四家 Agent 真机写盘、CI 侧 `e2e.yml` 的 `workflow_dispatch`（仍未触发）。
+
 ## 3. 验收证据矩阵（本体改动必须跑哪个套件）
+
+> **本表里的数字是各卡落地当时的读数，只作「不许倒退」的历史参考，不是当前基线。**
+> 当前基线的唯一来源是 [.github/workflows/e2e-gate.json](../../.github/workflows/e2e-gate.json) 的
+> `minAssertions` + `floorBasis`（离线用 `npm run check:e2e-gate` 核对）与最近一次 CI/E2E 绿 run；
+> `CONVENTIONS.md` 的套件索引只写口径、不再抄第二份数字。发现本表与 gate 冲突时以 gate 为准，
+> 并且**别在这里新增第二份读数**（复核报告 N4 就是这么来的）。
 
 | 改动落点 | 必须跑 | 上一轮实测断言数（**下限，不许倒退**） |
 |---|---|---|
-| `src/pet/`（状态机、图集切片、点击穿透、气泡） | `npm run verify` + `npm run verify:skin`（动了形象/协议）+ `verify:game`（动了显隐） | verify **189** / skin 26 / game 15 |
-| `src/runtime/`（插件运行时、bridge、widget 宿主、订阅回收） | `npm run verify` | **189** |
+| `src/pet/`（状态机、图集切片、点击穿透、气泡） | `npm run verify` + `npm run verify:skin`（动了形象/协议）+ `verify:game`（动了显隐） | verify **485** / skin 26 / game 15 |
+| `src/runtime/`（插件运行时、bridge、widget 宿主、订阅回收） | `npm run verify` | **485** |
 | L1 Worker 插件宿主（`src/runtime/plugin-worker.ts`、`plugin-worker-protocol.ts`、`worker-plugin-host.ts`，开关是宠物窗 localStorage 的 `host:worker-plugin-host`） | `npm run verify:worker` + `npm run unit:worker-host` + `npm run verify:release` | worker **25**（2026-10-14 原型首日：装载 1 + realm 事实 7 + 相对子模块 2 + 协议层伪造 5 + `?v=`/`no-store` 4 + todo 跑通 3 + 回收 2 + 零噪音 1）/ unit:worker-host **118**（22 方法表、派发表完备、Worker 侧禁带裸 IPC）/ **release 24**（其中「L1 Worker 宿主在打包版 CSP 下成立」一组 14 条，在全新构建上复跑过 —— ADR-0006 打包版那条前提已闭合）。L2 的输入是 `reference/T16-*`：入口闭包零 DOM，338 行 DOM 全在 widget 图 |
 | `src-tauri/`（Rust 能力服务、gate、fsutil、hotkeys） | `cargo test --lib` + `npm run verify` + 对应 `verify:<域>` | cargo **144** / verify **234**（S/Q/C1 之后。verify 的条数随同意框是否真弹在 215~234 间浮动，**下限按 215**；2026-10-13 实测 219 即落在该区间内，A1 那波起实例实测 230/0。cargo 由 121 → 131（H2）→ **144**（A1 的 13 条新规则单测）） |
 | `http` 能力 / charset 解码 / 重定向 | `npm run verify:http` | 21 |
-| Agent hook 链路 | `npm run verify:agent` | **72**（A9a 加了插件页端到端组；当批实测 `cargo` 72 / `verify` 189。本波只改了 overlay/bus 门禁那条采样路径，verify:agent 72/72 复跑过） |
-| 待办链路 | `npm run verify:todo` | 30（C1 后复跑 30/30） |
+| Agent hook 链路 | `npm run verify:agent` | **303 passed / 4 failed**（t38 记录的现行读数，floor 250；旧的 307/0 没有对应 run，按 N4 作废） |
+| 待办链路 | `npm run verify:todo` | 31（C1 后复跑 30/30；2026-10-28 起 31/0） |
 | A股插件 | `npm run verify:astock` | **154**（盘中形态实测：盘口两侧都有档 + 分时有数据 + 北交所有源供历史 + `session.trading` 为真 + 无异常留证分支；同形态两轮 154/0）。**这个数随数据形态浮动，不能当恒定下限** —— 五处分支各自产不同条数：① `verify-astock.mjs:473` 的 `session.trading` 守卫（盘中 1 条 / 非盘中 0 条，只出一行 info，**这是 153 与 154 最常见的差**：2026-10-13 12:44 午休跑出的就是 153）；② 分时那一段失败时 1 条（有数据时 2 条）；③ 北交所判「不供历史」3 条（成功出图 1 条）；④ 三源全不通的现场支与离线注入支条数不同；⑤ `!gotSug` / `!hasQuote` / `cardTarget` / `!cardGone` 四个异常留证支各多 1 条，`catch` 里那条「脚本未抛异常」只在崩溃时出现。验收时用 `audit-assertions.cjs` 把报告里的标题集合与源码里的 check 点做差，**比标题不比数字** |
 | `plugins/com.pet.astock` 的纯函数（三源解析 / 节流 / 提醒判定 / 五档数据 / 源判定层） | `npm run unit:astock`（常驻单测，零 GUI、零联网、秒级） | market **247** / aux **186**（含 A11 的 `sourceBranch` 组 36 条；Q2 起跑在 `node --test`，读 `ℹ tests 433 / fail 0` 与 `ASSERTIONS` 分组计数） |
 | `src/` 运行时纯逻辑（状态机、topic ACL、总线、插件 URL、manifest 校验、资源回收） | `npm run unit:runtime`（离线，靠 `tests/unit/ts-loader.mjs` 转译 .ts） | runtime **107**（Q3 + C1 的启停清单迁移；`npm run unit` 合计 **811**） |
 | 插件纯函数（`plugins/com.pet.todo/todo-txt.js`；hr-ble 的 BPM 解析在 Rust，归 cargo test） | `npm run unit:plugins` | plugins **53**（Q4；`npm run unit` 合计 **811**） |
-| 任何新增脚本 / 协议源 / CSP / 打包相关 | `npm run verify:release` | 12 |
+| 任何新增脚本 / 协议源 / CSP / 打包相关 | `npm run verify:release` | 36（0.2.2 发版轮实测 36/0） |
 | Cargo 依赖变动 | `cargo tree -p tauri` 必须仍是 **2.12.0**，且 `npm run verify:release` | — |
-| 文档与磁盘一致性（改 `ARCHITECTURE.md` §4 目录树、README 目录速览、搬文件/建删模块、改 ADR 链接、动 `AGENTS.md`、往文档里写路径坐标） | `npm run check:docs`（CI 里 `npm run unit` 之后一步，见 `.github/workflows/ci.yml`） | **rules=10 failing=0**、退出码 0。十条：R-A md 相对链接可达 / R-B §4 树对 `src-tauri/src/services/` 双向（`disk=12 doc=12`）/ R-C 速览点名的插件 id 齐 / R-D 反引号路径 token 存在 / R-E 链接文字与目标名一致 / R-F `AGENTS.md` ≤6000 字节 / R-G **§4 全树双向**（正向逐条 existsSync、反向按顶层目录；`tree=99`）/ R-H **坐标对读者可达**（清单 R4）/ R-I 正式文档不得留旧口径占位（提交列只写真实哈希或「未提交」） / R-J 状态板卡号不得重复：反引号里的盘符绝对路径直接判红，指向派单工作区 `.dispatch/…` 的引用必须同行写「不入库」，现场读数 `checked=19 exempted=2 broken=0`（豁免常量只有一条＝仓库外那份历史重写备份目录，`exempted=2` 是它在两处出现；豁免带出处、进 `EXEMPT_TOKENS`）。R7（`e2e63c7`）交付前六条、R8 补出 R-G、R4 补出 R-H：清单 32 项那句「删一个模块而文档未改时 CI 变红」从那一刻起才对**整棵树**成立，此前只对 services 成立。**加规则不许削既有读数**，且新增例外一律进 `EXEMPT_*` 常量表带出处理由 |
-| 命令层形状（新增或改动任何 `#[tauri::command]`） | `npm run check:shape`（CI 里跟在 `check:docs` 之后） | **commands=48 s1=0 s2=0 string_err=0 failing=0**。三条机械判据：S1 命令体禁 IO 原语、S2 命令体非空行 ≤20（A1 / [ADR-0005](../adr/0005-command-layering-thin-command-bodies.md)）、S3 命令 Err 侧必须是 `HostError` 的 `{code, message}`（A2 收口后升成拦截项，2026-10-14）。首跑 8 处违例已全部修掉，读数中位数 9 行、最大 20 行；「业务规则要住在可单测的函数里」这一维靠 `cargo test --lib` 的点名新测试与评审，不靠这条 CI（机械判据不判断径） |
+| 文档与磁盘一致性（改 `ARCHITECTURE.md` §4 目录树、README 目录速览、搬文件/建删模块、改 ADR 链接、动 `AGENTS.md`、往文档里写路径坐标） | `npm run check:docs`（CI 里 `npm run unit` 之后一步，见 `.github/workflows/ci.yml`） | **rules=10 failing=0**、退出码 0。十条：R-A md 相对链接可达 / R-B §4 树对 `src-tauri/src/services/` 双向（`disk=12 doc=12`）/ R-C 速览点名的插件 id 齐 / R-D 反引号路径 token 存在 / R-E 链接文字与目标名一致 / R-F `AGENTS.md` ≤6000 字节 / R-G **§4 全树双向**（正向逐条 existsSync、反向按顶层目录；`tree=107`）/ R-H **坐标对读者可达**（清单 R4）/ R-I 正式文档不得留旧口径占位（提交列只写真实哈希或「未提交」） / R-J 状态板结构（卡号不重复、表内无空行、每行列数 == 表头）（豁免常量只有一条＝仓库外那份历史重写备份目录，`exempted=2` 是它在两处出现；豁免带出处、进 `EXEMPT_TOKENS`）。R7（`e2e63c7`）交付前六条、R8 补出 R-G、R4 补出 R-H：清单 32 项那句「删一个模块而文档未改时 CI 变红」从那一刻起才对**整棵树**成立，此前只对 services 成立。**加规则不许削既有读数**，且新增例外一律进 `EXEMPT_*` 常量表带出处理由 |
+| 命令层形状（新增或改动任何 `#[tauri::command]`） | `npm run check:shape`（CI 里跟在 `check:docs` 之后） | **commands=52 s1=0 s2=0 string_err=0 failing=0**。三条机械判据：S1 命令体禁 IO 原语、S2 命令体非空行 ≤20（A1 / [ADR-0005](../adr/0005-command-layering-thin-command-bodies.md)）、S3 命令 Err 侧必须是 `HostError` 的 `{code, message}`（A2 收口后升成拦截项，2026-10-14）。首跑 8 处违例已全部修掉，读数中位数 9 行、最大 20 行；「业务规则要住在可单测的函数里」这一维靠 `cargo test --lib` 的点名新测试与评审，不靠这条 CI（机械判据不判断径） |
 | IPC 错误形状（A2 / [ADR-0007](../adr/0007-unified-command-error-codes.md)：命令 Err 侧、`packages/sdk/error-codes.json`、`src/runtime/host-error.ts`） | `npm run check:shape`（S3 拦截项）+ `npm run unit:errors` + `cargo test --lib`（`host_error.rs` 单测） | 码表 12 个，两侧对撞 cargo 4 条 + unit:errors 13 条；**2026-10-14（A07）收口**：`string_err=0`、`From<HostError> for String` 混迁桥已删且 `cargo check --all-targets` 全绿（无残余转换的机器证明） |
 
 **验收纪律**（沿用 PLUGIN-REVIEW §0，此处不复制全文）：跑起来看而不是只读代码；每条问题给 文件:行号 + 触发步骤 +
@@ -421,7 +513,7 @@ MVP 范围：<这一轮只做什么>
 | G4 | 系统代理 / `HTTP(S)_PROXY`：宿主 `ureq::AgentBuilder` 未配置 proxy，代码没有读取系统/Clash 代理的路径（`src-tauri/src/services/http.rs:40-50`）。 | 需要代理才出网的环境（Clash `127.0.0.1:7897`）可能失败；插件没有绕过方式。 | 评估 `ctx.http.request` 读取系统代理或增加显式 proxy 配置；另拆宿主卡，本行仅登记 C05 预检发现。 |
 | G5 | C06 的 `/internal/usage` 与 `/internal/usage/charts` 出口同样受 G4 的宿主无代理限制（`src-tauri/src/services/http.rs:40-50`）；插件侧没有 proxy 参数。 | 需要代理的环境里 internal 明细不可达；Key 路径也一并失败，UI 只能显示冷却/错误。 | 与 G4 同一宿主缺口，C06 不修改宿主；真站/代理可达性由 PM 本机验收，runner 的 internal 用例使用假响应。 |
 
-> **B10（2026-10-21）已实现 G4 说的「读系统代理」**：默认走 Windows 系统代理（HKCU 的 Internet Settings，回落 `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`），回环/私网目标仍直连；判定与实现在 `src-tauri/src/services/http_proxy.rs`，边界与新增信任面见 ADR-0011 的「出站走系统代理」追加节。G5 受的是同一条限制，一并解除（C06 走的还是同一个 `ctx.http.request`）。
+> **历史缺口 B10（2026-10-21；旧宿主缺口表编号，与状态板 B10「零 op 反向断言」不是同一张卡）已实现 G4 说的「读系统代理」**：默认走 Windows 系统代理（HKCU 的 Internet Settings，回落 `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY`），回环/私网目标仍直连；判定与实现在 `src-tauri/src/services/http_proxy.rs`，边界与新增信任面见 ADR-0011 的「出站走系统代理」追加节。G5 受的是同一条限制，一并解除（C06 走的还是同一个 `ctx.http.request`）。
 
 ## 6. 宿主凭据存储（B07，2026-10-21）
 

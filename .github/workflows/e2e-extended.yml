@@ -1,0 +1,37 @@
+# extended 模式的 E2E 入口（G1-09）：把出网 / 需打包产物的四套件（verify:skin、
+# verify:astock、verify:http、verify:release）挂到「手动点名 + 每周一次」的入口上。
+#
+# 判据与步骤**不在这里复制**：本工作流只是调用 e2e.yml（workflow_call），断言下限、允许的
+# skip、环境债、floorPending 全部仍来自 .github/workflows/e2e-gate.json（`npm run check:e2e-gate`
+# 离线核对）。复制一份判据正是复核报告 N4 点出的老毛病，别再犯。
+#
+# 为什么单独一条：这四套要真实外网（行情、GBK 源、petdex.dev）或 3~4 分钟的 tauri build，
+# 放进 core 的默认清单会让每次手动门都变慢、变脆；core 仍然只跑 8 个离线套件。
+name: E2E extended（手动 / 每周）
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      suites:
+        description: "要跑的套件，逗号分隔（默认四套 extended；名字照 package.json 的 npm script）"
+        required: false
+        default: "verify:skin,verify:astock,verify:http,verify:release"
+  schedule:
+    # 每周一 03:00 UTC（北京 11:00）。自托管 runner 没开机时这次调度会排队/跳过，
+    # 以 workflow_dispatch 的手动跑为准；不要把「本周没跑」当成通过。
+    - cron: "0 3 * * 1"
+
+concurrency:
+  group: e2e-extended-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  extended:
+    # 复用同一套 checkout / 构建 / 起实例 / 判据，避免第二份 e2e 脚本
+    uses: ./.github/workflows/e2e.yml
+    with:
+      mode: extended
+      suites: ${{ inputs.suites || 'verify:skin,verify:astock,verify:http,verify:release' }}

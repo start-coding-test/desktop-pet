@@ -9,6 +9,7 @@ import hostConfig from "../../src-tauri/tauri.conf.json" with { type: "json" };
 import { bus } from "./event-bus";
 import { buildContext, invalidatePermissions } from "./bridge";
 import { applyHotReload, reloadIdsFrom } from "./hot-reload";
+import { runIsolated } from "./lifecycle";
 import { CAPABILITIES } from "./plugin-capabilities";
 import { hostCall } from "./host-error";
 import { pluginFileUrl, pluginFileVersion } from "./plugin-url";
@@ -212,6 +213,26 @@ function reportError(plugin: string, error: unknown): void {
   void emit("host:plugin-error", { plugin, error: message });
 }
 
+/**
+ * 事件回调统一兜住异常（G4-11 / 附录2 N5）。
+ *
+ * `listen` 的 handler 是 fire-and-forget：抛出去只会变成一条 unhandledrejection，
+ * 由 boot-error 当成整窗「致命错误」盖住；而它实际上多半只是某个插件的一次操作失败。
+ * 这里就地收敛成一条 host:plugin-error（设置页的横幅能看见），宿主其余部分照常运行。
+ */
+async function listenSafe<T>(event: string, label: string, handler: (payload: T) => unknown): Promise<void> {
+  await listen<T>(event, (e) => {
+    try {
+      const out = handler(e.payload);
+      if (out !== null && typeof out === "object" && "then" in out) {
+        void Promise.resolve(out).catch((err) => reportError(label, err));
+      }
+    } catch (err) {
+      reportError(label, err);
+    }
+  });
+}
+
 /** 拒绝/停用的文案分开：停用不是用户拒绝，不能提示“去设置页重新授权”。 */
 export function consentFailureMessage(stillEnabled: boolean): string {
   return stillEnabled
@@ -250,6 +271,34 @@ function realmHostOptOut(): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * 激活半途失败的回滚（附录2 N5）：把已经建起来的东西拆干净，别留一个
+ * 「表里有、实际跑不起来」的半实例 —— 那种实例会让后续 activate 直接 return（永不重试），
+ * 插件页留一块白，用户只能重启宿主。
+ */
+async function rollbackActivation(pluginId: string): Promise<void> {
+  const fromWorker = workerHosted.delete(pluginId);
+  active.delete(pluginId);
+  await runIsolated(
+    [
+      {
+        name: "rollback:worker",
+        run: async () => {
+          if (fromWorker) await (await workerHost()).deactivate(pluginId);
+        },
+      },
+      { name: "rollback:subscriptions", run: () => disposeAll(pluginId) },
+      { name: "rollback:widget", run: () => widgetHost.unmount(pluginId) },
+      { name: "rollback:resources", run: () => releaseAll(pluginId) },
+    ],
+    (step, err) => reportError(pluginId, `[${step}] ${messageOf(err)}`),
+  );
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 async function doActivate(manifest: PluginManifest): Promise<void> {
@@ -305,39 +354,51 @@ async function doActivate(manifest: PluginManifest): Promise<void> {
     await widgetHost.mount(manifest, "badge");
   } catch (err) {
     reportError(manifest.id, err);
+    // 坏插件的 activate/boot 失败只影响它自己：回滚到「没激活」的干净状态（N5）
+    await rollbackActivation(manifest.id);
   }
 }
 
 async function doDeactivate(pluginId: string): Promise<void> {
   const instance = active.get(pluginId);
   if (!instance) return;
+  // 先摘表：后面任何一步抛错都不能让「还在跑」的假象留在表里
   active.delete(pluginId);
-  if (workerHosted.delete(pluginId)) {
-    // Worker 会话的 deactivate 在插件自己那个 realm 里跑，跑完由宿主 terminate 整个 Worker
-    await (await workerHost()).deactivate(pluginId);
-  } else {
-    try {
-      await instance.module.deactivate?.();
-    } catch (err) {
-      reportError(pluginId, err);
-    }
-  }
-  // 插件自己漏掉的订阅由宿主兜底回收：留着闭包收事件，它捕获的界面也 GC 不掉
-  disposeAll(pluginId);
-  await widgetHost.unmount(pluginId);
-  // 只回收该插件确实持有、且已无其他持有者的共享资源。
-  // 早先这里是无条件 ble_disconnect + stop_scan，会掐断别的插件正在用的会话。
-  const freed = releaseAll(pluginId);
-  try {
-    if (freed.ble) await hostCall("ble_disconnect", { pluginId });
-    if (freed["ble-scan"]) await hostCall("ble_stop_scan", { pluginId });
-    // 悬浮窗是这个插件为自己开的，它停了就整扇收掉，不涉及别的插件。
-    // 走宿主的回收通道而不是插件面的 overlay_destroy：撤销授权之后能力已经没了，
-    // 那条命令会被门禁挡住，窗就永远留在桌面上。
-    await hostCall("overlay_reclaim", { pluginId });
-  } catch (err) {
-    reportError(pluginId, err);
-  }
+  const fromWorker = workerHosted.delete(pluginId);
+  // 逐条兜住：插件自己的 deactivate 抛错，不拖累订阅回收 / widget 卸载 / 资源释放（N5）
+  await runIsolated(
+    [
+      {
+        name: "deactivate",
+        run: async () => {
+          if (fromWorker) {
+            // Worker 会话的 deactivate 在插件自己那个 realm 里跑，跑完由宿主 terminate 整个 Worker
+            await (await workerHost()).deactivate(pluginId);
+            return;
+          }
+          await instance.module.deactivate?.();
+        },
+      },
+      // 插件自己漏掉的订阅由宿主兜底回收：留着闭包收事件，它捕获的界面也 GC 不掉
+      { name: "subscriptions", run: () => disposeAll(pluginId) },
+      { name: "widget", run: () => widgetHost.unmount(pluginId) },
+      {
+        name: "resources",
+        run: async () => {
+          // 只回收该插件确实持有、且已无其他持有者的共享资源。
+          // 早先这里是无条件 ble_disconnect + stop_scan，会掐断别的插件正在用的会话。
+          const freed = releaseAll(pluginId);
+          if (freed.ble) await hostCall("ble_disconnect", { pluginId });
+          if (freed["ble-scan"]) await hostCall("ble_stop_scan", { pluginId });
+          // 悬浮窗是这个插件为自己开的，它停了就整扇收掉，不涉及别的插件。
+          // 走宿主的回收通道而不是插件面的 overlay_destroy：撤销授权之后能力已经没了，
+          // 那条命令会被门禁挡住，窗就永远留在桌面上。
+          await hostCall("overlay_reclaim", { pluginId });
+        },
+      },
+    ],
+    (step, err) => reportError(pluginId, `[${step}] ${messageOf(err)}`),
+  );
 }
 
 /** 按持久化的启用清单同步实际运行状态 */
@@ -366,16 +427,16 @@ export async function initRuntime(): Promise<void> {
   await loadEnabled();
   await bus.init();
   // 宿主 Rust 原生事件注入总线，插件经标准 topic 订阅
-  await listen("ble:device-found", (e) => bus.inject("ble:device-found", e.payload));
-  await listen("ble:heart-rate", (e) => bus.inject("ble:heart-rate", e.payload));
-  await listen("ble:disconnected", (e) => bus.inject("ble:disconnected", e.payload));
-  await listen("ble:error", (e) => bus.inject("ble:error", e.payload));
+  await listenSafe<unknown>("ble:device-found", "ble:device-found", (p) => bus.inject("ble:device-found", p));
+  await listenSafe<unknown>("ble:heart-rate", "ble:heart-rate", (p) => bus.inject("ble:heart-rate", p));
+  await listenSafe<unknown>("ble:disconnected", "ble:disconnected", (p) => bus.inject("ble:disconnected", p));
+  await listenSafe<unknown>("ble:error", "ble:error", (p) => bus.inject("ble:error", p));
   // Agent hook 事件（Rust 侧 watcher 归一化后广播）
-  await listen("agent:state", (e) => bus.inject("agent:state", e.payload));
-  await listen("agent:event", (e) => bus.inject("agent:event", e.payload));
+  await listenSafe<unknown>("agent:state", "agent:state", (p) => bus.inject("agent:state", p));
+  await listenSafe<unknown>("agent:event", "agent:event", (p) => bus.inject("agent:event", p));
   // 设置窗切换插件开关 → 本窗运行时执行启停
-  await listen<{ id: string; enabled: boolean }>("host:plugin-toggled", async (e) => {
-    const { id, enabled } = e.payload;
+  await listenSafe<{ id: string; enabled: boolean }>("host:plugin-toggled", "host:plugin-toggled", async (inner) => {
+    const { id, enabled } = inner;
     // 清单的事实来源在宿主：本窗那份缓存要跟着刷新，否则下一次 reconcile
     // 会拿旧名单把刚被停用的插件又激活回来
     await loadEnabled();
@@ -389,18 +450,35 @@ export async function initRuntime(): Promise<void> {
     }
   });
   // 撤销授权后必须丢掉桥的能力缓存，否则已经加载的插件还能继续用它刚被收回的权限
-  await listen<string>("host:permission-revoked", (e) => {
-    invalidatePermissions(e.payload);
+  await listenSafe<string>("host:permission-revoked", "host:permission-revoked", (id) => {
+    invalidatePermissions(id);
   });
   // 插件目录变动（放入/移除插件）即时生效，不必重启宿主。
   // 其中「覆盖了正在跑的插件的文件」光靠 reconcile 不成立：入口的 ?v= 管不到子模块，
   // 同一 realm 的模块映射表会把旧实例还回来 —— dev 下先按载荷判定本窗要不要整页重载，
   // reconcile 逻辑保留（新装/删除插件仍靠它，重载只是它之上的一层判断）。
-  await listen<{ ids?: string[]; reloadIds?: string[] }>("host:plugins-changed", async (e) => {
-    // Worker 宿主的那部分不必整页换茬：它的模块映射表在 Worker 里，重载文档也换不掉它，
-    // 真正取新内容的动作是「停用 → 换一个 Worker 重新 boot」（见 worker-plugin-host.ts）
-    applyHotReload(reloadIdsFrom(e.payload), (id) => active.has(id) && !workerHosted.has(id));
-    await reconcile(await hostCall<PluginManifest[]>("plugins_list"));
-  });
+  await listenSafe<{ ids?: string[]; reloadIds?: string[] }>(
+    "host:plugins-changed",
+    "host:plugins-changed",
+    async (payload) => {
+      // Worker 宿主的那部分不必整页换茬：它的模块映射表在 Worker 里，重载文档也换不掉它，
+      // 真正取新内容的动作是「停用 → 换一个 Worker 重新 boot」。同一份载荷里的 id 已去重。
+      const reloadIds = reloadIdsFrom(payload);
+      const manifests = await hostCall<PluginManifest[]>("plugins_list");
+      const enabled = new Set(await loadEnabled());
+      for (const id of reloadIds) {
+        if (!workerHosted.has(id)) continue;
+        // 同 id 重启一次：deactivate 会从 workerHosted / active 里摘干净，不会留空表项（N6）
+        await deactivatePlugin(id);
+        const manifest = manifests.find((m) => m.id === id);
+        if (manifest && enabled.has(id)) await activatePlugin(manifest);
+      }
+      applyHotReload(
+        reloadIds,
+        (id) => active.has(id) && !workerHosted.has(id),
+      );
+      await reconcile(manifests);
+    },
+  );
   await reconcile(await hostCall<PluginManifest[]>("plugins_list"));
 }

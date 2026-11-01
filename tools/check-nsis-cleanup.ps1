@@ -44,6 +44,15 @@
   when set, and from src-tauri/target otherwise; either way a bundle older than the
   HEAD commit is refused.
 
+.PARAMETER AcceptKnownGapC
+  Case C (passive overwrite, /P) measures whether the old uninstaller strips the
+  pre-uninstall hooks. Stripping is a KNOWN gap: the hook cannot tell "invoked by
+  another installer" from a genuine uninstall without reading the _?= parameter.
+  By default that outcome FAILS the run, so a broken package cannot masquerade as
+  verified. Pass this switch to accept the gap explicitly: the run then records it
+  as an accepted known gap instead of a pass, and the release checklist must carry
+  the same wording. The gap is a limitation of the hook, not an environment issue.
+
 .EXAMPLE
   $env:PET_AGENT_CONFIG_FILES = "F:\tmp\nsis\cfg-a.json;F:\tmp\nsis\cfg-b.json"
   powershell -NoProfile -ExecutionPolicy Bypass -File tools\check-nsis-cleanup.ps1
@@ -52,6 +61,10 @@
 param(
   [string] $InstallRoot = "",
   [switch] $SkipBuild,
+  # Case C: passive overwrite may strip the hooks (KNOWN gap). Without this switch
+  # that outcome fails; with it the run records "KNOWN GAP ACCEPTED" and still exits
+  # non-zero-free only if every other check passes. See .PARAMETER AcceptKnownGapC.
+  [switch] $AcceptKnownGapC,
   # Guard self-test only: run the counterexamples and exit. This file must stay ASCII --
   # tools/unit-nsis-hook.mjs greps it and pwsh 5.1 decodes no-BOM scripts as ANSI.
   [switch] $GuardSelfTest
@@ -610,6 +623,14 @@ if (-not (Test-Path $exeC)) {
     Note "Known gap: inside the hook we cannot tell 'invoked by another installer'"
     Note "from a genuine uninstall without reading the _?= parameter, which needs a"
     Note "Var of its own in the hook file. See the PR description for the follow-up."
+    if (-not $AcceptKnownGapC) {
+      # G1-08: a stripped hook must not disappear into a Note. The default verdict is
+      # FAIL taken together with the missing explicit switch, and the message names the
+      # switch so the operator records the gap on purpose (release checklist wording).
+      Fail ("case C: passive overwrite stripped the pre-uninstall hooks (" + $beforeC + " -> " + $afterC + "); re-run with -AcceptKnownGapC to record this known gap explicitly (see docs/process/RELEASE-CHECKLIST.md)")
+    } else {
+      Note "KNOWN GAP ACCEPTED (-AcceptKnownGapC): recorded explicitly, NOT a pass"
+    }
     # install again so the exit assertion about leftovers still means something
     $rcCr = Invoke-Installer @("/S", "/D=$rootC")
     Check ($null -ne $rcCr) "case C: reinstall ExitCode captured" "case C: exit code unavailable from the reinstall"

@@ -33,7 +33,12 @@ fn app_data_dir_standalone() -> Result<PathBuf, String> {
 /// 也没有窗口，报错无处可显示，更不能反过来挡住 Agent。
 ///
 /// `agent` 是来源标识，取自命令行校验过的结果（见 `phases::hook_phase_from_args`）——
-/// **不能**从 hook 的 payload 里取，那是外部输入，来源过滤拿它当依据就等于让事件自己声明来源。
+/// **不能**从 hook 的 payload 里取：来源过滤拿 payload 当依据，就等于让事件自己声明来源。
+///
+/// 这句只约束「宿主自己被 Agent 当作 hook 调用」这条写侧路径。收件目录整体仍是外部输入：
+/// 读取侧（`watcher.rs::line_agent`）按行里的 `agent` 原样取值、缺字段按 `qoder` 兜底
+/// （兼容 A01 及更早的旧行），所以同用户的任意进程都能伪造任意来源的行 —— 这是 ADR-0016
+/// 信任边界第 1 条明确接受的残余风险，别把本函数的前提读成「收件目录里的 agent 可信」。
 pub fn hook_ingest(phase: &'static str, agent: &'static str) {
     let dir = match app_data_dir_standalone().map(|p| inbox_dir(&p)) {
         Ok(dir) => dir,
@@ -125,7 +130,11 @@ mod tests {
 
         enforce_inbox_cap(&dir);
 
-        assert_eq!(fs::metadata(&big).unwrap().len(), 0, "超限的 jsonl 必须被清空");
+        assert_eq!(
+            fs::metadata(&big).unwrap().len(),
+            0,
+            "超限的 jsonl 必须被清空"
+        );
         assert_eq!(fs::read(&small).unwrap(), b"keep me\n", "没超限的不许动");
         assert_eq!(
             fs::metadata(&other).unwrap().len(),

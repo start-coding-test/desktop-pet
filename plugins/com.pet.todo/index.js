@@ -22,14 +22,23 @@ function status(text, level = "info") {
   ctx?.bus.publish(TOPIC_STATUS, { text, level });
 }
 
+/**
+ * 宽松落盘：配置/提醒这类「尽力而为」的写入，失败只记日志（定时检查里不该因为一次存储抖动炸掉）。
+ * 注意别拿它当 `commitDone` 的 save —— 它把异常吞掉后，order.js 的回滚分支永远进不去（N8）。
+ */
 async function persist() {
   try {
-    await ctx.storage.set("tasks", tasks);
-    await ctx.storage.set("config", config);
-    await ctx.storage.set("notified", notified);
+    await persistStrict();
   } catch (err) {
     ctx?.log?.("保存待办失败", err);
   }
+}
+
+/** 严格落盘：出错必须抛，调用方（commitDone）靠它决定要不要回滚内存状态 */
+async function persistStrict() {
+  await ctx.storage.set("tasks", tasks);
+  await ctx.storage.set("config", config);
+  await ctx.storage.set("notified", notified);
 }
 
 /** 推给各界面的视图：只给未完成的、最多 20 条，附一条 todo.txt 原文方便核对 */
@@ -120,18 +129,27 @@ async function handleCmd(cmd) {
       const wasNotified = notified[task.id];
       if (done) delete notified[task.id];
       // 先落盘、再 await 宠物调用（G5-09）：宠物 reject 时状态已经存下了，不会被丢
-      await commitDone(task, done, {
-        completed: today(),
-        save: persist,
-        rollback: (err) => {
-          if (wasNotified !== undefined) notified[task.id] = wasNotified;
-          ctx?.log?.("完成状态落盘失败，已回滚", err);
-        },
-        react: (level) => ctx.pet.react(level),
-        say: (text) => ctx.pet.say(text),
-        note: (err) => ctx?.log?.("宠物反应失败（状态已落盘）", err),
-      });
-      await afterChange(done ? `已完成：${task.text}` : `重新打开：${task.text}`);
+      // save 用严格版：失败要抛给 order.js 回滚，宽松版会吞异常让回滚变死代码（N8）。
+      // save 已经写过一遍，成功后用 save:false 跳过 afterChange 里的第二次落盘（同一次 toggle 只写一遍）
+      try {
+        await commitDone(task, done, {
+          completed: today(),
+          save: persistStrict,
+          rollback: (err) => {
+            if (wasNotified !== undefined) notified[task.id] = wasNotified;
+            ctx?.log?.("完成状态落盘失败，已回滚", err);
+          },
+          react: (level) => ctx.pet.react(level),
+          say: (text) => ctx.pet.say(text),
+          note: (err) => ctx?.log?.("宠物反应失败（状态已落盘）", err),
+        });
+      } catch (err) {
+        // 回滚后必须把界面拉回内存里的真实状态：否则用户眼前的勾还停着，
+        // 下次重开面板才发现没存上（N8 的可观测面）
+        pushState();
+        throw err;
+      }
+      await afterChange(done ? `已完成：${task.text}` : `重新打开：${task.text}`, { save: false });
       break;
     }
     case "remove": {
@@ -166,8 +184,9 @@ async function handleCmd(cmd) {
   }
 }
 
-async function afterChange(note) {
-  await persist();
+async function afterChange(note, { save = true } = {}) {
+  // save:false 用于「调用方已经严格落过盘」的路径（toggle），避免同一次操作连写两遍存储
+  if (save) await persist();
   pushState();
   emitChanged();
   await syncCard();

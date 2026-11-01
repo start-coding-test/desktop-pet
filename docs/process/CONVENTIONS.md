@@ -32,24 +32,17 @@
 0.2.3 就是反面教材（2026-10-28）：B5 与发版两笔提交（`7448b3f` / `02e5102`）**直接推了 `main`**，安装包在 CI 之前就打好了，E2E（`verify:agent` 285/0、`verify` 482/0）**只在本地跑过**；`.github/workflows/e2e.yml` 是 `workflow_dispatch`，那一轮没触发，CI 侧没有绿，`main` 的分支保护也一直没开。本地读数算证据，但**不能替代 CI 绿**。下面四步按序做，前一步不绿不进下一步：
 
 1. **CI 必绿**：合并前 `main` 上的 CI（`.github/workflows/ci.yml`，job `windows`）必须跑完且结论绿；E2E 门不随 push 自动跑，要手动触发 `E2E（手动触发）` 工作流并**亲眼看到那一次 run 绿**，把 run id 记下来。本地跑出来的 285/0 只是旁证，不能写成「已过 E2E 门」。
-2. **分支保护先开**：按下节命令开 `main` 保护——要求 PR、要求 CI checks、禁 force push、禁直推。没开之前，任何「已过门禁」的说法都不成立。
+2. **分支保护先开**：按 [BRANCHES.md](BRANCHES.md)「七」的 `--input` JSON 开 `main` 保护（要求 PR、要求 CI checks、禁 force push、禁直推、**审批数 0**、`restrictions: null`）——要求 CI checks、禁 force push、禁直推。没开之前，任何「已过门禁」的说法都不成立。
 3. **再打包**：CI 绿 **且** 分支保护开着之后，才出安装包 / 便携包；产物对应的提交必须就是那次绿 run 的提交（`git rev-parse HEAD` 对得上，别拿本地未推的改动出包）。
 4. **记录写全**：Release 说明、[本体任务卡](HOST-BACKLOG.md) 状态、`release-package/` 里的更新说明都要写清当时的 CI 状态（绿 run id，或「未跑」）、E2E 是 CI 跑的还只是本地跑的、分支保护开没开。**没跑就写「未跑」，不许写「全绿」**。
 
-`main` 分支保护的开启命令（**需要仓库管理员**；本机没有 `gh`、也没有仓库 token，**以下命令本轮没有执行，保护仍是关闭状态**，`<owner>/<repo>` 即 `start-coding-test/desktop-pet`）：
+`main` 分支保护**只认** [BRANCHES.md](BRANCHES.md)「七、`main` 分支保护命令」那一节：`gh api --input <json>`，
+审批数 **0**、`restrictions: null`，先在临时分支上试。**需要仓库管理员**；本机没有 `gh`、也没有仓库 token，
+**本轮没有执行，保护仍是关闭状态**。
 
-```bash
-gh api -X PUT repos/<owner>/<repo>/branches/main/protection \
-  -F 'required_status_checks[strict]=true' \
-  -F 'required_status_checks[contexts][]=windows' \
-  -F 'enforce_admins=true' \
-  -F 'required_pull_request_reviews[required_approving_review_count]=1' \
-  -F 'restrictions=' \
-  -F 'allow_force_pushes=false' \
-  -F 'allow_deletions=false'
-# 回读确认：应看到 contexts=["windows"]、required_approving_review_count=1、allow_force_pushes=false
-gh api repos/<owner>/<repo>/branches/main/protection
-```
+早先这里贴过一版 `gh api -F 'required_pull_request_reviews[required_approving_review_count]=1'` 与
+`-F 'restrictions='` 的旧命令，**已作废**（复核报告 G1-04）：那一版会把仓库锁成「必须 1 个审批 + 空 restrictions」，
+单人维护时 PR 直接合不进去，回读确认里还把字段名写错。命令与回读 JSON 全在 BRANCHES.md，别在本文件抄第二份。
 
 `windows` 是 `.github/workflows/ci.yml` 的 job 名（CI 的 required status check 上下文），job 改名就得同步改这里。没有 `gh` 就在 GitHub 网页 Settings → Branches → Add branch protection rule 里勾：Require a pull request before merging（≥1 approval）、Require status checks to pass（选 `windows`）、Do not allow force pushes、Do not allow deletions；勾了 Require a pull request 也就禁了直推。开完把回读结果贴进 [本体任务卡](HOST-BACKLOG.md) 的 B5 行，别只在口头说「开了」。
 
@@ -85,22 +78,17 @@ gh api repos/<owner>/<repo>/branches/main/protection
 - 设置窗输入 Petdex 名字（如 `deepseek`）即从公开画廊下载并换装，默认形象 `deepseek`，切换不必重启 ✅（`npm run verify:skin` 28 条：真网络安装 boba、目录穿越被拒、安装类命令只认设置窗、换装后宠物窗不重启就解码新图集、删掉当前形象回落默认）。**它钉的是「当前形象必须是已安装列表里的某一个」，不是钉死 `deepseek`** —— 后者把用户状态当宿主不变量，用户换过一次装就整片红（2026-10-15 实测：换成 qwen 后红 3 条）；随包默认形象仍在列表里单独钉一条。收尾也从此不再替用户做选择：跑完把形象还回用户原来挑的那个（旧写法走宠物窗发 `pet_skin_use`，而那条命令自己被第 2 组断言钉着「宠物窗必被拒」，所以它一直是个静默空操作）。画廊安装要下图集 + zip 各 2.4 MB，实测 2026-10-15 上午整条链路 > 20s，套件的 CDP 求值默认上限会把红写成「调试端点失去响应」，故这两次调用单独给 90s。已用真实截图确认宠物窗里播的就是画廊下载的默认形象
 - 上述大部分由 `npm run verify` 的运行时断言把守（见「约定」），不是靠人工回归
 
-### 当前离线门与 e2e 基线（2026-10-28，t37 实测）
+### 基线的唯一来源（别在本文件抄第二份数字）
 
-| 门 | 读数 |
-|---|---|
-| `cargo test` | 416 passed / 0 failed |
-| `npm run unit` | 2238 passed / 0 failed |
-| `check:shape` | commands=52，failing=0 |
-| `check:docs` | rules=10，failing=0 |
-| `npm run lint` | 200 files，无修 |
-| `verify` | 485 passed / 0 failed（262s） |
-| `verify:agent` | 307 passed / 0 failed（61s） |
-| `verify:drag` | 41 passed / 0 failed（11s） |
-| `verify:dsh` | 43 passed / 0 failed（2s） |
-| `npm run e2e` | 四套件串行，总 336s，0 rebuild |
-
-历史读数保留在下方段落与各卡卡面；换数字时按同一张表整行替换。
+- **套件读数基线只认** [.github/workflows/e2e-gate.json](../../.github/workflows/e2e-gate.json) 的
+  `minAssertions` + `floorBasis`；离线核对用 `npm run check:e2e-gate`。改基线就是改那个文件，并在 PR/卡里写清理由。
+- **最近一次 CI / E2E 的结论与 run id** 记在 [HOST-BACKLOG](HOST-BACKLOG.md) 状态板（发版行）与
+  [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md)，必须带日期与提交号；「未跑」就写「未跑」。
+- **离线门的当轮读数**只写进 [ACCEPTANCE-a18ec21-2026-10-29.md](ACCEPTANCE-a18ec21-2026-10-29.md)
+  这类一次性复核文档或 CI run 日志，不在这里建常驻表。下方段落里的 N/0 都是**历史读数**（各卡落地当时），
+  只用于「不许倒退」比较；与 gate 冲突时以 gate 为准（N4 的教训）。
+- 2026-10-29 复核轮确认的事实：`cargo fmt --all --manifest-path src-tauri/Cargo.toml -- --check`
+  在 `a18ec21` 上**红**（23 处差异全在 `src-tauri/**`，修复卡 R1），别再写「fmt 退出码 0」。
 
 ## 数据源口径
 
@@ -125,8 +113,8 @@ gh api repos/<owner>/<repo>/branches/main/protection
 - **http 的重定向由宿主逐跳跟**：ureq 设 `redirects(0)`，`http.rs::send_following_redirects` 自己走，每一跳的新 host 都要重新过 `http:<host>` 授权（否则授权一个域名就能被 302 弹到内网 / `169.254.169.254`）；跨主机时不带 `authorization`/`cookie`
 - **插件身份仍是自报的**：`store_*`、`overlay_*`、`http_request`、`bus_publish` 的 `pluginId` 由调用方给出，能力授权现在都在 Rust 侧查了（见上一条），但同 realm 里插件 A **冒名 B** 仍然拦不住（要等 Web Worker 宿主）。已收紧的两条边角：`overlay_show` 只给确实装着的插件开窗；id 词表在 Rust 侧与前端 `validateManifest` 的字符集对齐
 - **插件 id 只有一份校验实现**：`src-tauri/src/ids.rs::is_safe_id`（S4）。原先 `commands::plugins`、`services::permission::valid_id`、`services::store` 各写一套，后两套只挡 `..` `/` `\`，`C:` 这类盘符 id 能过 —— id 同时是存储目录名、overlay 标签来源与授权表键，口径必须唯一。**新增带 `pluginId` 的命令一律走 `gate::plugin_capability`**，漏了会被 `src-tauri/src/gate_coverage.rs` 拦下：它从 `lib.rs` 的 `generate_handler!` 反查全部已注册命令，逐条核对是否过了门禁（只走窗口门禁的例外要写进它的 `WINDOW_GATED` 名单并说明理由）
-- **命令体必须是薄层（A1，[ADR-0005](../adr/0005-command-layering-thin-command-bodies.md)）**：一条 `#[tauri::command]` 只许做「参数与 id 校验 → 门禁判定 → **一次**委托 → 映射返回值」。机器拦三条：命令体里出现 IO 原语（`fs::` / `File::` / `read_to_string` / `read_dir` / `remove_file` / `reqwest` / `send()`）即红；命令体非空行 > 20 即红；命令 Err 侧出现裸 `String`（不是 `{code, message}`）即红（S3，2026-10-14 A07 收口后升成拦截项）—— `npm run check:shape`，CI 里紧跟在 `check:docs` 之后。业务规则一律抽成能力域内的函数好离线单测；`Peripheral`/`AppHandle` 在测试里构造不出来的那些判定，拆成只吃布尔或纯数据的函数（`device_lacks_heart_rate`、`consent_outcome`、`plan_active_after_removal` 是样板）。**新增命令与它的能力同模块**，不要往 `src-tauri/src/commands/` 搬目录——48 条里 41 条本来就在能力域，搬家不改一个函数体，只把账付在 `§4` 树、`gate_coverage` 反查和 CI 上
-- **命令错误统一成 `{code, message}`（A2，[ADR-0007](../adr/0007-unified-command-error-codes.md)）**：48 条注册命令的 Err 侧全是 `HostError`；码表唯一来源是 `packages/sdk/error-codes.json`（Rust 用 `include_str!`、TS 直接 import **同一份磁盘文件** —— 改一边两侧测试都红），12 个码不许改名、要拆细只能加新码。`message` 逐字保持原样，所以 `verify` 里按文本判的断言不受影响。命令 Err 侧用没用规范形状由 `npm run check:shape` 的 S3 拦截（读数 42 → 0 之后升成门禁，2026-10-14）。前端 `legacy` 码保留、不改名（ADR-0007 规则 2）：它只兜 **Tauri 框架自己发出的裸字符串错误**（命令名写错、参数序列化失败这类），不再是「未迁移命令」的迁移标记。
+- **命令体必须是薄层（A1，[ADR-0005](../adr/0005-command-layering-thin-command-bodies.md)）**：一条 `#[tauri::command]` 只许做「参数与 id 校验 → 门禁判定 → **一次**委托 → 映射返回值」。机器拦三条：命令体里出现 IO 原语（`fs::` / `File::` / `read_to_string` / `read_dir` / `remove_file` / `reqwest` / `send()`）即红；命令体非空行 > 20 即红；命令 Err 侧出现裸 `String`（不是 `{code, message}`）即红（S3，2026-10-14 A07 收口后升成拦截项）—— `npm run check:shape`，CI 里紧跟在 `check:docs` 之后。业务规则一律抽成能力域内的函数好离线单测；`Peripheral`/`AppHandle` 在测试里构造不出来的那些判定，拆成只吃布尔或纯数据的函数（`device_lacks_heart_rate`、`consent_outcome`、`plan_active_after_removal` 是样板）。**新增命令与它的能力同模块**，不要往 `src-tauri/src/commands/` 搬目录——注册命令绝大多数本来就在能力域（现行条数看 `npm run check:shape` 的 commands 读数），搬家不改一个函数体，只把账付在 `§4` 树、`gate_coverage` 反查和 CI 上
+- **命令错误统一成 `{code, message}`（A2，[ADR-0007](../adr/0007-unified-command-error-codes.md)）**：所有注册命令的 Err 侧全是 `HostError`（条数随卡增长，看 `npm run check:shape`）；码表唯一来源是 `packages/sdk/error-codes.json`（Rust 用 `include_str!`、TS 直接 import **同一份磁盘文件** —— 改一边两侧测试都红），12 个码不许改名、要拆细只能加新码。`message` 逐字保持原样，所以 `verify` 里按文本判的断言不受影响。命令 Err 侧用没用规范形状由 `npm run check:shape` 的 S3 拦截（读数 42 → 0 之后升成门禁，2026-10-14）。前端 `legacy` 码保留、不改名（ADR-0007 规则 2）：它只兜 **Tauri 框架自己发出的裸字符串错误**（命令名写错、参数序列化失败这类），不再是「未迁移命令」的迁移标记。
 - Agent watcher 的偏移只在**真的消费掉整行**之后才前进（`complete_line_prefix` 有单测）：以前先写偏移再读，hook 写一半时那批事件永久丢
 
 - **插件样式注入契约暂不收紧**：打包版 CSP 的 `style-src` 保留 `'unsafe-inline'` —— 三个示例插件都用「运行时往自己的 Shadow Root 注入样式表」的写法，且 `tests/e2e/verify-release.mjs` 里有一条断言在替第三方插件作者钉这个契约；真要收紧必须先做 Web Worker 宿主并逐条实测 U-1…U-7。另一类（markup 里的内联 `style=` 属性）已由 M2a 清零，所以这条豁免只覆盖「style 元素」。取舍全文见 [ADR-0004](docs/adr/0004-style-src-unsafe-inline-kept.md)
@@ -162,7 +150,7 @@ gh api repos/<owner>/<repo>/branches/main/protection
 - 首批插件目录：`plugins/com.pet.hr-ble`（已做）、`plugins/com.pet.agent-bridge`（已做：订阅宿主 `agent:state` 把编码 Agent 的会话状态转成宠物反应）、`plugins/com.pet.todo`（已做：目录名与 id 一致，标准 topic `com.pet.todo:changed` 落在它自己的命名空间里）、`plugins/com.pet.astock`（已做：A股盯盘，出网走宿主 http 代理按域名授权，数据源东方财富公开接口；自选+提醒+badge/overlay，插件页另有分时/K线/五档面板。**2026-10-09 K线与分时已加腾讯后端**：`market.js` 的 `MARKET_SOURCES` 源注册表，每个源一套自己的列序映射（腾讯是「开收高低」，与东财同序不同实现），先试上一次成功的源、一个源内部再主入口→两个后备入口；快照与五档仍只有东财一条，等阶段二。**2026-10-10 阶段二落地**：四个 kind 都有多源，快照/五档为「东财 → 腾讯 `qt.gtimg.cn` → 新浪 `hq.sinajs.cn`」，新浪只兜价格、不供五档与涨跌停）、`plugins/llm-token-usage`（暂缓）
 - 面板（分时/K线/五档）只在设置页活着时刷：`PANEL_TTL_MS` 90 秒，由设置页 widget 每 60 秒发一次 `sync` 续期（`watchView(ctx, render, { beatMs })`），badge/overlay 不续期 —— 人走了额外出网要自己停。
 - `ctx.bus.subscribe` 这个 API **本身**就要在 manifest 声明 `bus:subscribe`，不声明会在激活时被拒（`com.pet.todo 未在 manifest 声明这些能力: bus:subscribe`）；ACL 放宽的只是「自己前缀不需要额外授权」，别把两者混为一谈
-- **验证**：离线常驻单测有十五份文件，合计 `npm run unit` = **1249 个用例**（2026-10-17 实测；本轮 P1/P2 加固前的基线是 1236）：`unit:astock`（`tests/unit/unit-market.mjs` 247 + `tests/unit/unit-aux.mjs` 186）、`unit:runtime`（`src/` 运行时纯逻辑 107 条，含 C1 的启停清单迁移，靠 `tests/unit/ts-loader.mjs` 把 .ts 现场转译进 `node --test`，并把 `@tauri-apps/api/*` 换成 `tests/unit/tauri-stub.mjs`）、`unit:worker-host`（L1 的 Worker 通道契约：22 个方法表、派发表完备、Worker 侧入口的**传递 import 闭包**不许触及 IPC 入口 —— P2-5 起判据是 `tests/unit/import-graph.mjs` 真的把 import 图走一遍（AST 取说明符，与引号风格无关），并带一条「单引号 + 隔层」的负向对照防它空转；旧的手写正则只认双引号、只看直接 import，已删）、`unit:widget-protocol` + `unit:widget-worker`（L2 阶段二的渲染契约、Worker 侧虚拟节点与 Worker 运行时共 92 条（`2163de4` 给 apiVersion 拦截加了 8 条）：12 个 op kind 是闭集、五张名字白名单、**没有 html op 也没有 class kind**、批次在微任务里合并并按 512 切分、宿主回推事件不回声）、`unit-widget-migrations.mjs` 18 条（`npm run unit:migrate`：把插件的 widget 真跑一遍 Worker 侧运行时，离线抓残留 `document.*` 与表外名字，跑的就是生产默认那条路（widget 一律进 Worker），另有一条合成 widget 的负向对照防它空转（一个还用 `document.createElement` 的模块必须当场挂）；它还会把 mount 期间登记的每个监听都真触发一次，因为设置页大量渲染只发生在事件回调里，并有两条合成 widget 自证这条抓得到；**列表 / 盘面那类数据驱动的渲染必须按 topic 喂假 payload（`BUS_POKE`）才会被执行**，断言要求每个订阅都匹配到 payload、喂进去要多发 op —— A10 有一条「回调里用表外事件名」的变异在只跑 mount() 时存活过，就是这个缺口；迁移卡的离线取证用这个，抢不到 CDP 端口也能自验，作者临时点名用 `PET_WIDGET_SMOKE=<id>`；**判定按标题不按总数** —— 还没照契约写的 widget（那种还用 `document.createElement`）在这套冒烟里**必须**当场红，它是反向对照而不是缺陷；`PET_WIDGET_SMOKE` 点名里每多一个 id，总数就多一格）
+- **验证**：离线常驻单测的分工见下（`npm run unit` 合计条数以输出里的 `ℹ tests` 行为准，2026-10-29 复核轮是 2241/0；数字随卡增长，别抄旧值）：`unit:astock`（`tests/unit/unit-market.mjs` 247 + `tests/unit/unit-aux.mjs` 186）、`unit:runtime`（`src/` 运行时纯逻辑 107 条，含 C1 的启停清单迁移，靠 `tests/unit/ts-loader.mjs` 把 .ts 现场转译进 `node --test`，并把 `@tauri-apps/api/*` 换成 `tests/unit/tauri-stub.mjs`）、`unit:worker-host`（L1 的 Worker 通道契约：22 个方法表、派发表完备、Worker 侧入口的**传递 import 闭包**不许触及 IPC 入口 —— P2-5 起判据是 `tests/unit/import-graph.mjs` 真的把 import 图走一遍（AST 取说明符，与引号风格无关），并带一条「单引号 + 隔层」的负向对照防它空转；旧的手写正则只认双引号、只看直接 import，已删）、`unit:widget-protocol` + `unit:widget-worker`（L2 阶段二的渲染契约、Worker 侧虚拟节点与 Worker 运行时共 92 条（`2163de4` 给 apiVersion 拦截加了 8 条）：12 个 op kind 是闭集、五张名字白名单、**没有 html op 也没有 class kind**、批次在微任务里合并并按 512 切分、宿主回推事件不回声）、`unit-widget-migrations.mjs` 18 条（`npm run unit:migrate`：把插件的 widget 真跑一遍 Worker 侧运行时，离线抓残留 `document.*` 与表外名字，跑的就是生产默认那条路（widget 一律进 Worker），另有一条合成 widget 的负向对照防它空转（一个还用 `document.createElement` 的模块必须当场挂）；它还会把 mount 期间登记的每个监听都真触发一次，因为设置页大量渲染只发生在事件回调里，并有两条合成 widget 自证这条抓得到；**列表 / 盘面那类数据驱动的渲染必须按 topic 喂假 payload（`BUS_POKE`）才会被执行**，断言要求每个订阅都匹配到 payload、喂进去要多发 op —— A10 有一条「回调里用表外事件名」的变异在只跑 mount() 时存活过，就是这个缺口；迁移卡的离线取证用这个，抢不到 CDP 端口也能自验，作者临时点名用 `PET_WIDGET_SMOKE=<id>`；**判定按标题不按总数** —— 还没照契约写的 widget（那种还用 `document.createElement`）在这套冒烟里**必须**当场红，它是反向对照而不是缺陷；`PET_WIDGET_SMOKE` 点名里每多一个 id，总数就多一格）
 - **改过 `src/` 之后必须先冷重启 dev 实例，再跑任何 CDP 套件（2026-10-15 实测，代价是一次误判）**：Vite dev 会给「刚被改过」的模块 URL 加 `?t=时间戳`，页面加载的是那一份；
   而套件里 `await import('/src/runtime/plugin-runtime.ts')` 用的是**不带查询串**的 URL → 那是**第二份模块实例**，
   它的 `active` / `workerHosted` 等模块级状态是空的。症状非常有迷惑性：`deactivatePlugin` 看似调用成功却什么都没关

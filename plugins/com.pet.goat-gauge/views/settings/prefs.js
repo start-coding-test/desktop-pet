@@ -23,12 +23,24 @@ export function mountPrefs(ctx, state) {
   const dom = ctx.dom;
   const box = tag(dom, "div", "g-prefs");
   const editing = new Set();
+  /**
+   * 已发出、还在等推送追上的汇率串（G5-02 的补）。
+   * 以前「应用」通过后立刻放锁：下一帧拿到的还是旧配置，于是合法值先闪回一帧旧值。
+   * 现在记下发出去的值，等推送里的 usdToCny 追上它再放开回显。
+   */
+  let sentRate = null;
   const send = (patch) => ctx.bus.publish(TOPIC_CMD, { action: "saveConfig", config: patch });
 
-  const field = (type, cls = "g-input g-num") => {
+  /**
+   * 文本/数字输入框。`releaseOnChange` 默认 true（失焦即放锁），
+   * 但汇率格必须是 false（N1/G5-02）：真实点击顺序是 blur → change → click，
+   * change 先把锁放了，等「应用」做校验时旧帧已经把非法汇率冲回去了。
+   * 汇率的锁只由「应用」校验通过后放（见下面 currencyBtn）。
+   */
+  const field = (type, cls = "g-input g-num", { releaseOnChange = true } = {}) => {
     const node = input(dom, type, cls);
     node.on("input", () => editing.add(node));
-    node.on("change", () => editing.delete(node));
+    if (releaseOnChange) node.on("change", () => editing.delete(node));
     return node;
   };
 
@@ -69,7 +81,7 @@ export function mountPrefs(ctx, state) {
     option.textContent = label;
     currencySel.append(option);
   }
-  const rateInput = field("number");
+  const rateInput = field("number", undefined, { releaseOnChange: false });
   rateInput.dataset.field = "usdToCny";
   rateInput.placeholder = "7.2";
   const currencyBtn = button(dom, "应用", "g-btn");
@@ -83,7 +95,11 @@ export function mountPrefs(ctx, state) {
       state.status.set("汇率要在 1–20 之间", "error");
       return;
     }
-    if (releaseRate) editing.delete(rateInput);
+    if (releaseRate) {
+      editing.delete(rateInput);
+      // 记下发出去的值：推送追上之前不要回显（否则合法值先闪回一帧旧值，G5-02 的 N2）
+      sentRate = String(patch.usdToCny);
+    }
     send(patch);
   });
   currencyCard.append(
@@ -213,7 +229,15 @@ export function mountPrefs(ctx, state) {
     const d = view ?? {};
     const c = d.config ?? {};
     if (!editing.has(refreshInput)) refreshInput.value = String(c.refreshSec ?? 60);
-    if (!editing.has(rateInput)) rateInput.value = String(c.usdToCny ?? 7.2);
+    // 汇率：编辑中不回显（用户草稿优先）；刚发出、还没追上也不回显（避免闪回一帧）；
+    // 追上（推送里的值与发出去的一致）才复位放行，之后外部改动照样进得来。
+    if (editing.has(rateInput)) {
+      // 用户还在改：一个 op 都不发
+    } else if (sentRate !== null) {
+      if (String(c.usdToCny ?? 7.2) === sentRate) sentRate = null;
+    } else {
+      rateInput.value = String(c.usdToCny ?? 7.2);
+    }
     const thresholds = c.thresholds ?? {};
     if (!editing.has(fiveInput)) fiveInput.value = (thresholds.fiveHourPct ?? [20, 5]).join(",");
     if (!editing.has(weeklyInput)) weeklyInput.value = (thresholds.weeklyPct ?? [20]).join(",");

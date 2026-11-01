@@ -233,6 +233,16 @@ class WorkerPluginHost {
           this.post(session, { t: "event", sub, payload });
         }
       });
+      // 等订阅落地的这段时间插件可能已经被停用（destroy 清过 subs）：这时登记进去
+      // 就是一条永远不会被回收的订阅，监听者还活着、Worker 已经 terminate 了（G4-04）
+      if (this.sessions.get(session.pluginId) !== session) {
+        try {
+          off();
+        } catch (error) {
+          console.error(`[worker-host] ${session.pluginId} 迟到订阅退订失败`, error);
+        }
+        return undefined;
+      }
       session.subs.set(sub, off);
       return undefined;
     }

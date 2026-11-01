@@ -15,7 +15,7 @@ use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::fsutil::write_atomic;
-use crate::host_error::{HostError, INTERNAL, IO};
+use crate::host_error::{HostError, INTERNAL, INVALID_ARG, IO};
 
 const FILE_NAME: &str = "plugins-enabled.json";
 
@@ -41,6 +41,22 @@ fn sanitize(ids: &[String]) -> Vec<String> {
         }
     }
     out
+}
+
+/// 写路径（设置窗）用的严格档：**形状不合法的 id 直接报错**，不静默丢。
+///
+/// 静默丢是「自封成功」（验收 N7）：设置页停用 `../evil` 时宿主会回 Ok，前端把这一项
+/// 渲染成「已停用」，可磁盘上什么都没写，下一次 reconcile 它又回来了。这条路径的输入
+/// 只来自设置窗对已扫描插件的勾选，出现非法 id 就该当契约错误暴露出来。
+/// 迁移 / 读旧文件那条路径继续用宽容的 `sanitize`：老文件里的脏 id 该被清掉，不该让宿主起不来。
+fn review_ids(ids: &[String]) -> Result<Vec<String>, HostError> {
+    if let Some(bad) = ids.iter().find(|id| !crate::ids::is_safe_id(id)) {
+        return Err(HostError::new(
+            INVALID_ARG,
+            format!("插件 id 形状不合法: {bad}"),
+        ));
+    }
+    Ok(sanitize(ids))
 }
 
 /// 读清单。返回 `None` = 还没写过（新安装，或老用户尚未迁移）。
@@ -108,19 +124,15 @@ pub fn plugin_enabled_set(
     ids: Vec<String>,
 ) -> Result<Vec<String>, HostError> {
     crate::gate::settings(&window, "改动插件启停清单")?;
-    let cleaned = sanitize(&ids);
+    let cleaned = review_ids(&ids)?;
     let previous = read_ids_before_write(&app);
     write_ids(&app, &cleaned)?;
     cancel_pending_for_removed(&app, previous.as_deref(), &cleaned);
     let _ = app.emit("host:enabled-changed", &cleaned);
-    // 用户主动勾选启用就是对「恢复停用时还原的总开关」的同意（G2-09 / t38-A）：
-    // 这条路径按已确认装；启动补写、清单迁移、目录扫描都不是用户动作，仍走严格确认门。
-    crate::services::agent::linkage::reconcile(
-        &app,
-        previous.as_deref(),
-        &cleaned,
-        crate::services::agent::linkage::InstallMode::UserConfirmed,
-    );
+    // 用户重新勾选启用插件**不是**对「拨开 ZCode 总开关」的同意（N8 复核结论）：
+    // 再启用只把插件挂回来，联动安装仍走严格确认门 —— 需要确认的客户端保持原样，
+    // 用户要在设置页按「安装」并回应那句确认，才真正动它的配置文件。
+    crate::services::agent::linkage::reconcile(&app, previous.as_deref(), &cleaned);
     Ok(cleaned)
 }
 
@@ -197,12 +209,7 @@ pub fn plugin_enabled_migrate(
     write_ids(&app, &cleaned)?;
     let _ = app.emit("host:enabled-changed", &cleaned);
     // 迁移不是用户动作：严格确认门，需要确认的客户端保持原样（t38-A）
-    crate::services::agent::linkage::reconcile(
-        &app,
-        None,
-        &cleaned,
-        crate::services::agent::linkage::InstallMode::Strict,
-    );
+    crate::services::agent::linkage::reconcile(&app, None, &cleaned);
     log::info!("已从 WebView 迁移插件启停清单到宿主");
     Ok(cleaned)
 }
@@ -319,6 +326,21 @@ mod tests {
             vec!["todo".to_string(), "com.pet.hr-ble".to_string()],
             "非法 id 与重复项都该被挡在文件外"
         );
+    }
+
+    #[test]
+    fn set_path_rejects_malformed_ids_instead_of_dropping_them() {
+        // N7：写路径不许「静默丢 + 回 Ok」。设成 true 才算修好 —— 报错必须带上是哪个 id。
+        let bad = vec!["todo".to_string(), "../evil".to_string()];
+        let err = review_ids(&bad).expect_err("非法 id 必须报错");
+        assert_eq!(err.code, INVALID_ARG);
+        assert!(err.message.contains("../evil"), "错误要指出是哪个 id");
+        // 合法输入仍按去重规则落盘，不是把它整体拒掉
+        assert_eq!(
+            review_ids(&["todo".to_string(), "todo".to_string()]).unwrap(),
+            vec!["todo".to_string()]
+        );
+        assert_eq!(review_ids(&[]).unwrap(), Vec::<String>::new());
     }
 
     #[test]
