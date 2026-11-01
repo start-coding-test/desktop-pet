@@ -33,7 +33,11 @@
   `b6d98cd`（release）。**不在 0.2.4 包内的 tag 后提交**：`993e1f2`（B6 拖动态；不是 `b6d98cd` 的祖先）、
   `f2e9fd0`（文档）、`a18ec21`（F01′–F06 修复轮）。
 - tag：`v0.2.4`（annotated → `b6d98cd`）**已打**；GitHub Release **已建**（2026-11-02，release id `430739968`，
-  安装包资产已上传，sha256 与本地一致）。
+  安装包资产已上传，sha256 与本地一致）。资产校验：从 Release 下载回 `DesktopPet_0.2.4_x64-setup.exe`
+  （2,760,222 B）实算 sha256 = `3122867e606944ab16bc97b27431186fbd60c6432ab2206ac6274b57ed9bb28b`，与
+  `release-package/` 本地包一致。记录这次发布的文档提交 `9321433` 的 main CI 同样全绿（run `41332340797`）。
+  自托管 runner（`CHEN` / `chen_work`）2026-11-02 均 **Offline**，`.github/workflows/e2e.yml` 的
+  `workflow_dispatch` 因此未触发。
 - CI / E2E 门：`b6d98cd` 的 CI 绿（run `40643854516`，success）；E2E 门（`e2e.yml`）**未触发**。
   本地读数（工作区、不是 tag 字节）：`verify` 485/0、`verify:agent` 303/4（t38 修复前记录；2026-11-01 复跑为 318/0）、
   `verify:drag` 41/0、`verify:dsh` 43/0；现行基线见 `.github/workflows/e2e-gate.json` 的 `floorBasis`。
