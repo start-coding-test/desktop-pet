@@ -221,7 +221,9 @@ N8 = G8-01（R-J 加「状态板内不许空行、每行列数 == 表头」）�
 
 **外部权限 / 需要推送或 token**
 - 推送后重跑 main CI（R1 的 CI 复验 + clippy/test 一步）、触发 `.github/workflows/e2e.yml` 的 E2E 门。
-- `main` 分支保护开启（`gh` / token 都没有）；GitHub Release 未建。
+- `main` 分支保护开启（`gh` / token 都没有）；GitHub Release **已于 2026-11-02 建**（release id `430739968`，
+  安装包资产 2,760,222 B）；分支保护在网页侧提交时被 GitHub 的 sudo 二次认证拦下，仍需管理员在已 sudo 的会话里按
+  [BRANCHES.md](BRANCHES.md)「七」重做。
 
 **架构债务**
 - 同 realm 插件可 `import { invoke }` 绕过 JS 桥、插件身份由调用方自报（ADR-0011 / CODE-REVIEW R2 已记为未解决，本轮未假装解决）。
@@ -232,6 +234,8 @@ N8 = G8-01（R-J 加「状态板内不许空行、每行列数 == 表头」）�
 ## 7. 本轮没有做的事（不得读成通过）
 
 - 没有 `git add` / `commit` / `push`，没有建 GitHub Release，没有改分支保护，没有改写历史提交。
+  （**2026-11-01～02 补记**：经用户授权已推 main `33c78d8` / `eec3abe` 并复验 CI 绿；GitHub Release `v0.2.4` 已建；
+  分支保护仍未开，见上节。）
 - **E2E 已补跑**（2026-11-01，用户授权，§8）：`tools/e2e-run.mjs` 由 `dev:debug` 现构建 debug exe 并串行拉起实例，
   四套全绿；首跑出的 7+3 条红全部归因并修复，不是靠放宽断言转绿（`verify:agent` 反而因 t9 新断言从 307 增到 318）。
   CI 侧的 `e2e.yml`（`workflow_dispatch` + 自托管 runner）仍未触发，不能写成 CI 通过。

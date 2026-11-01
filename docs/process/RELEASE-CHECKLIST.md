@@ -22,7 +22,9 @@
    0.2.3 / 0.2.4 都违反过：出包早于 CI 门（历史事实，照记不洗）。
 8. **Release notes**：按 [RELEASE-NOTES-0.2.x.md](RELEASE-NOTES-0.2.x.md) 的格式写；
    「安装器内嵌桥为修复前版本」这类已知事实必须写明。
-9. **GitHub Release（管理员）**：上传安装包 + 便携包 + notes。本机无 gh/token，**本轮未建**。
+9. **GitHub Release（管理员）**：上传安装包 + notes。**2026-11-02 已建**：`v0.2.4`（release id `430739968`，
+   资产 `DesktopPet_0.2.4_x64-setup.exe` 2,760,222 B，与本地 sha256 一致）；便携包未上传（与 notes 的
+   「仓库外产物」口径一致）。
 10. **收尾**：`git status` 复核无凭据入库；更新本文件对应版本节、HOST-BACKLOG 的发版行（S 前缀）与读数。
 
 ## 0.2.4（2026-10-28，修复轮）
@@ -30,7 +32,8 @@
 - 提交：`7448b3f`（DSH 桥，第五家）、`02e5102`（0.2.3）、`4df82f9`（收件目录回退修复轮）、
   `b6d98cd`（release）。**不在 0.2.4 包内的 tag 后提交**：`993e1f2`（B6 拖动态；不是 `b6d98cd` 的祖先）、
   `f2e9fd0`（文档）、`a18ec21`（F01′–F06 修复轮）。
-- tag：`v0.2.4`（annotated → `b6d98cd`）**已打**；GitHub Release **未建**（管理员）。
+- tag：`v0.2.4`（annotated → `b6d98cd`）**已打**；GitHub Release **已建**（2026-11-02，release id `430739968`，
+  安装包资产已上传，sha256 与本地一致）。
 - CI / E2E 门：`b6d98cd` 的 CI 绿（run `40643854516`，success）；E2E 门（`e2e.yml`）**未触发**。
   本地读数（工作区、不是 tag 字节）：`verify` 485/0、`verify:agent` 303/4（t38 修复前记录；2026-11-01 复跑为 318/0）、
   `verify:drag` 41/0、`verify:dsh` 43/0；现行基线见 `.github/workflows/e2e-gate.json` 的 `floorBasis`。

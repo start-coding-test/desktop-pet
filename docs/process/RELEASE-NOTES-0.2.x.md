@@ -28,7 +28,9 @@
   后续 clippy / cargo test / 打包 skipped），不在 0.2.4 包内；修复卡见 [HOST-BACKLOG](HOST-BACKLOG.md) R1。
 - **真机安装/覆盖升级未验**：安装器只构建过，未做静默安装 + 真装机布局断言 + 卸载复跑。
 - **DSH 真机联动未验**：需要在 DSH 侧用 `plugin_manager` 的 `install_bundle` 装一次桥插件，属产品既定步骤。
-- **GitHub Release 未建**：本机无 `gh` / 仓库 token，安装包与 notes 由管理员在网页侧上传。
+- **GitHub Release 已建**（2026-11-02，release id `430739968`，资产 `DesktopPet_0.2.4_x64-setup.exe` 2,760,222 B）；
+  便携包未上传（按上文口径属仓库外产物）。**分支保护仍未开**：网页侧创建被 GitHub 二次认证（sudo）拦下，
+  需管理员在已通过 sudo 的会话里按 [BRANCHES.md](BRANCHES.md)「七」重做。
 
 ## 0.2.3 — 2026-10-28（**作废**）
 
