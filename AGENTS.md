@@ -4,8 +4,8 @@
 
 ## 当前状态
 
-- **阶段**：**0.2.2 已发布（2026-10-27）**；0.2.4 修复轮已出包、tag `v0.2.4` → `b6d98cd`（2026-10-28），**GitHub Release v0.2.4 已发布**（2026-11-02，安装包资产 2,760,222 B）、notes 见 [0.2.x 发版说明](docs/process/RELEASE-NOTES-0.2.x.md)、发版清单见 [RELEASE-CHECKLIST.md](docs/process/RELEASE-CHECKLIST.md)；0.2.3 安装器作废（内嵌收件目录修复前的桥）；2026-11-01 验收修复轮 `33c78d8` 已推 main，**main CI 全绿**（run `41323567293`）；离线门 `npm run unit` 2638/0、`cargo test` 428/0；**E2E 本机四套全绿**（`verify` 485/0、`verify:agent` 318/0、`verify:drag` 41/0、`verify:dsh` 43/0），E2E 门（`workflow_dispatch`）未触发，main 分支保护未开（命令见 [BRANCHES.md](docs/process/BRANCHES.md)，需管理员）。
-- **已完成**：宠物窗（Petdex 九状态 + 状态机 + 渲染层 + 点击穿透）、Petdex 资源安装、插件运行时、Rust 能力服务（ble / store / http / notify / 权限同意框 / Agent hook 收件）、设置窗、按插件分开的 overlay 悬浮窗、五个示例插件（心率 / Agent 桥 / 待办 / A股 / GOAT）、v0.2.2 与 v0.2.4 的安装包/便携包（tag `v0.2.4` 已打）。
+- **阶段**：**0.2.2 已发布（2026-10-27）**；0.2.3 安装器作废（内嵌收件目录修复前的桥）；0.2.4 修复轮 tag `v0.2.4` → `b6d98cd`、GitHub Release 已建（2026-11-02，资产 2,760,222 B）；**0.2.5 已出包并发布（2026-11-03，tag `v0.2.5`）**——验收修复轮 `33c78d8` + R3/R5 `564f2a8`，notes 见 [0.2.x 发版说明](docs/process/RELEASE-NOTES-0.2.x.md)、清单见 [RELEASE-CHECKLIST.md](docs/process/RELEASE-CHECKLIST.md)；main CI 全绿（run `41578407995`）；离线门 unit 2642/0、cargo test 428/0、打包版 `verify:release` 40/0；**E2E 本机四套全绿**（485/318/41/43），E2E 门未触发、main 分支保护未开（见 [BRANCHES.md](docs/process/BRANCHES.md)，需管理员）。
+- **已完成**：宠物窗（Petdex 九状态 + 状态机 + 渲染层 + 点击穿透）、Petdex 资源安装、插件运行时、Rust 能力服务（ble / store / http / notify / 权限同意框 / Agent hook 收件）、设置窗、按插件分开的 overlay 悬浮窗、五个示例插件（心率 / Agent 桥 / 待办 / A股 / GOAT）、v0.2.2 / v0.2.4 / v0.2.5 的安装包与便携包（tag 已打）。
 - **进行中**：DSH Agent 桥（第五家）：`integrations/dsh-bridge/` 桥插件 + 宿主 `mode=bridge` 接入形态，见 [ADR-0016](docs/adr/0016-dsh-agent-bridge-is-a-plugin-not-hook-files.md)，待真机验证「DSH 里 `install_bundle` 一次后桌宠联动」；拖动态（B6）已落地待验收，真实 OS 拖拽与 DPI≠100% 待人工验证；llm-token-usage 按用户决定暂缓。
 - 完整设计见 [docs/architecture/ARCHITECTURE.md](docs/architecture/ARCHITECTURE.md)；插件 API 见 [docs/plugin-dev/PLUGIN_SDK.md](docs/plugin-dev/PLUGIN_SDK.md)。
 

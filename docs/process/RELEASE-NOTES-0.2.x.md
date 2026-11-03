@@ -1,7 +1,43 @@
 # 0.2.x 发版说明草稿（Release Notes）
 
-本文件是 0.2.3 / 0.2.4 的 release notes 草稿；正式发布时把对应一节贴到 GitHub Release。
+本文件是 0.2.3 / 0.2.4 / 0.2.5 的 release notes 草稿；正式发布时把对应一节贴到 GitHub Release。
 发版步骤与每版勾选项见 [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md)。
+
+## 0.2.5 — 2026-11-03（验收修复轮；tag `v0.2.5`）
+
+### 主要变化
+
+- **验收报告 P1/P2 收口**（`33c78d8`）：Rust fmt 23 处差异清零 → main CI 第 12 步「Rust 格式检查」转绿；
+  TUN/fake-ip 的 `198.18.0.0/15` 与 `fc00::/7` 不再被「非公网」判据误拒；代理跨源按起始源永久摘掉
+  `Authorization` / `Cookie` / `Proxy-Authorization`；HTTP 代理并发拆成 idle 10s 与绝对 deadline 30s。
+- **E2E 判定**：两个套件不再用「日志里出现跳过」判红，改结构化 `SKIP` + `E2E-SUMMARY`；
+  `e2e-gate` 升 v2（floors 与 pending 分开），新增 `e2e-extended.yml`；NSIS Case C 默认判红、需显式接受。
+- **Agent / DSH 桥**：修掉设置页「确认安装」的确认位被 worker 零参工厂吞掉的实现缺陷（Qoder/ZCode 真机链路的断点）；
+  hook 回滚只回滚真正装过的文件，空选择不再回退 Qoder；事件写盘超过 8MiB 轮换成 `.1` 后继续写。
+- **拖动与运行时**：拖动起点/结束改用「物理窗口坐标 + dpr × 窗口内偏移」的 anchor，跨 DPI 重锚丢弃假位移；
+  overlay 找不到归属 3s 自关；插件单步错误隔离；设置页授权状态与撤销改为真调用；错误分级（boot 才亮整窗红条）。
+- **业务插件**：A股盯盘阈值自检与编辑锁、GOAT 用量快照门与汇率锁、待办严格持久化、心率广播后缀剥离。
+- **R3**（`564f2a8`）：`verify-isolation.mjs`（4074→59 行）与 `verify-agent-bridge.mjs`（2407→44 行）拆成
+  `tests/e2e/isolation/` + `tests/e2e/agent/` 的分片；断言标题集合与拆分前**顺序敏感**逐条一致；`CONVENTIONS.md` 超长行折行。
+- **R5**：`PLUGIN_SDK.md` 新增 6.1「设置页回显与防冲写（编辑锁）」，A股与 GOAT 各留一份同式 `lock.js`。
+
+### 门禁读数（开发机；不是本包字节）
+
+- `npm run unit` 2642/0；`lint` 238 文件 0 fix；`build` 退出 0；`check:docs` rules=10 failing=0；
+  `check:shape` commands=52 failing=0；`check:e2e-gate` suites=12 failing=0。
+- `cargo test` 428/0；`cargo fmt --all -- --check` 干净；`clippy -D warnings` 退出 0。
+- E2E：`verify` 485/0、`verify:agent` 318/0、`verify:drag` 41/0、`verify:dsh` 43/0。
+- 打包版：`npm run verify:release` **40/0**。安装包 `DesktopPet_0.2.5_x64-setup.exe`
+  （2,809,161 B，sha256 `c8bd2bae3218a602d884aa35a1ff8718e5751bd35767ebd603f220cb9c3f76aa`，未签名）。
+
+### 已知问题与未验项
+
+- 0.2.3 安装器作废；**0.2.4 安装器不含 2026-11-01 之后的修复**（Rust fmt、E2E 回归、R3/R5），本包才含。
+- E2E 门（`.github/workflows/e2e.yml`）仍是 `workflow_dispatch` + 自托管 runner；2026-11-03 runner 仍 Offline，未触发。
+- **main 分支保护仍未开启**：网页创建被 GitHub 二次认证（sudo）拦下，需管理员按 [BRANCHES.md](BRANCHES.md)「七」重做。
+- 真机未验：安装/覆盖升级、DSH 真机 `install_bundle` 联动、四家 Agent 写盘、DPI≠100% 拖动、蓝牙、在线行情。
+- G5-03（A股阈值整表 replace → 差分）未做；报告中 8 个 UI 点在源码中不存在。
+
 
 ## 0.2.4 — 2026-10-28（修复轮；tag `v0.2.4` → `b6d98cd`）
 

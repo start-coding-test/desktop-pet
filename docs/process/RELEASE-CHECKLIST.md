@@ -27,6 +27,32 @@
    「仓库外产物」口径一致）。
 10. **收尾**：`git status` 复核无凭据入库；更新本文件对应版本节、HOST-BACKLOG 的发版行（S 前缀）与读数。
 
+## 0.2.5（2026-11-03，验收修复轮）
+
+- 提交：`33c78d8`（a18ec21 验收 P1/P2 收口、Rust fmt 转绿）、`eec3abe`（AGENTS 状态行）、
+  `9321433` / `63e1917`（0.2.4 Release 记录）、`564f2a8`（R3 拆分巨型 E2E + R5 编辑锁契约）、
+  本节的文档提交（版本号 0.2.5 + 发版记录）。tag `v0.2.5` 落在其中的 CI 绿提交上。
+- CI：`33c78d8` run `41323567293`、`eec3abe` run `41324267186`、`564f2a8` run `41578407995` 均 15 步全绿。
+- 版本号：`package.json` 0.2.5、`package-lock.json` 两处 0.2.5、`src-tauri/tauri.conf.json` 0.2.5、
+  `src-tauri/Cargo.toml` 0.2.5、`src-tauri/Cargo.lock` 的 `desktop-pet` 0.2.5（`npm version 0.2.5` + 手工改 Rust 侧三处）。
+- 构建（2026-11-03 本机）：`npm run tauri build` 退出 0，产物
+  `src-tauri/target/release/bundle/nsis/DesktopPet_0.2.5_x64-setup.exe`（**2,809,161 字节**，
+  sha256 `c8bd2bae3218a602d884aa35a1ff8718e5751bd35767ebd603f220cb9c3f76aa`）；
+  便携包按口径组装在 `release-package/DesktopPet-0.2.5/`（`desktop-pet.exe` + `plugins/` + `integrations/` +
+  `更新说明.txt`，8.1M；`release-package/` 被 `.gitignore` 覆盖，属仓库外产物）。
+- 打包版校验：`npm run verify:release` **40 passed / 0 failed**。
+  期间修掉一条与发版无关的误红：该套件原把「当前皮肤图集必须是 1536x1872」钉死，而本机 active 皮肤是社区高清版
+  `deepseek-v64x`（4608x6240），换皮肤即误红 —— 改为断言「解码成功且是合法位图尺寸」并 `info` 打出实际尺寸，
+  判据回到它本来的目标（CSP/`petskin://` 映射）。
+- E2E：门（`e2e.yml`）仍是 `workflow_dispatch` + 自托管 runner，2026-11-03 runner 仍 Offline，**未触发**；
+  本机开发树实测 `verify` 485/0、`verify:agent` 318/0、`verify:drag` 41/0、`verify:dsh` 43/0
+  （注意：跑的是工作树，不是本包字节）。
+- 离线门：`npm run unit` 2642/0、`npm run lint` 238 文件 0 fix、`npm run build` 退出 0、
+  `check:docs` rules=10 failing=0、`check:shape` commands=52 failing=0、`check:e2e-gate` suites=12 failing=0；
+  `cargo test` 428/0、`cargo fmt --all -- --check` 干净、`clippy --all-targets -- -D warnings` 退出 0。
+- tag / Release：待本节最终回填（见下条）。分支保护：**仍未开启**（网页创建被 GitHub sudo 二次认证拦下）。
+- 未验：真机安装/覆盖升级、DSH 真机联动、四家 Agent 真机写盘、DPI≠100% 拖动、蓝牙与在线行情。
+
 ## 0.2.4（2026-10-28，修复轮）
 
 - 提交：`7448b3f`（DSH 桥，第五家）、`02e5102`（0.2.3）、`4df82f9`（收件目录回退修复轮）、

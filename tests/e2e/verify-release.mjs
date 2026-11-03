@@ -286,7 +286,16 @@ try {
         img.src = url;
       });
     })()`);
-    r.check("图集解码成功且尺寸是 petdex v1 布局", "1536x1872", decoded);
+    // 这条钉的是「打包版能经 petskin:// 解码位图」——img-src/CSP 与协议映射的真实判据。
+    // 具体尺寸属于用户可换的皮肤内容：本机装的社区高清版 deepseek-v64x 是 4608x6240，
+    // 把尺寸钉成 1536x1872（v1 默认皮肤）会在换皮肤后误红，与发版无关。
+    const decodedSize = /^(\d+)x(\d+)$/.exec(decoded);
+    r.check(
+      "图集解码成功且尺寸是合法位图尺寸（换皮肤不误红）",
+      true,
+      Boolean(decodedSize) && Number(decodedSize[1]) > 0 && Number(decodedSize[2]) > 0,
+    );
+    r.info("当前皮肤图集尺寸", decoded);
 
     r.group("宿主自身在 CSP 下加载插件（真实启动路径，非 CDP 发起）");
     // 启停清单归宿主（C1）：写只认设置窗，打包版也一样（这一组同时在验打包版的门禁与协议）
