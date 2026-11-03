@@ -41,14 +41,19 @@ function scheduleRetry(): void {
  * 用户只能去任务管理器杀进程（附录2 N4）。close 本身也可能因为窗口已销毁而失败，
  * 那正好说明目标达成，一并吞掉。
  */
-async function closeSelf(reason: string): Promise<void> {
+async function closeSelf(reason: string, level: "warn" | "debug" = "debug"): Promise<void> {
   if (closing) return;
   closing = true;
   if (retryTimer !== null) {
     window.clearTimeout(retryTimer);
     retryTimer = null;
   }
-  console.warn(`[overlay] 关闭悬浮窗 ${getCurrentWindow().label}：${reason}`);
+  // 正常收窗（插件停用 / 卸载 / 没有 overlay widget）是用户操作的直接结果，用 debug 留痕即可；
+  // 走 warn 会被「零 console 噪音」的门禁判成红（verify:goat-gauge 实测）。
+  // 只有「宿主一直说不出这扇窗是谁的」才是真异常（附录2 N4），那条调用点显式传 warn。
+  const line = `[overlay] 关闭悬浮窗 ${getCurrentWindow().label}：${reason}`;
+  if (level === "warn") console.warn(line);
+  else console.debug(line);
   if (pluginId) {
     await widgetHost.unmount(pluginId).catch(() => undefined);
   }
@@ -78,7 +83,8 @@ async function sync(): Promise<void> {
         ownerMissingMs: ownerMissingMs(),
       };
       if (decideOverlayAction(probe) === "close") {
-        await closeSelf(closeReason(probe));
+        // 等满宽限还认不出主人：真异常，留 warn（正常收窗走 debug）
+        await closeSelf(closeReason(probe), "warn");
       } else {
         scheduleRetry();
       }

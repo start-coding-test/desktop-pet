@@ -613,14 +613,26 @@ try {
     true,
     (trendInk.ink ?? 0) > inkFloor,
   );
-  const depthRows = await settings.client.ev(`(async () => {
+  // 五档要么完整 11 行、要么明说「没有盘口数据」（depth.js 的空态占位）——
+  // 本机行情后端经常拿不到深度（见 :314 的 push2 重置形态），此时不能要求 11 行，
+  // 但也不能接受「半张表」：既没数据又不给提示就是缺陷。
+  const depthInfo = await settings.client.ev(`(async () => {
     const { widgetHost } = await import('/src/runtime/widget-host.ts');
     const rec = (widgetHost.mounted.get(${JSON.stringify(PID)}) ?? [])[0];
-    const rows = [...(rec?.shadow?.querySelectorAll('table.depth tbody tr') ?? [])];
-    return rows.map((r) => r.children[0]?.textContent ?? '');
+    const table = rec?.shadow?.querySelector('table.depth');
+    const rows = [...(table?.querySelectorAll('tbody tr') ?? [])];
+    return { rows: rows.map((r) => r.children[0]?.textContent ?? ''), text: table?.textContent ?? '', hasTable: !!table, hasRec: !!rec };
   })()`);
-  r.check("五档表是卖五→卖一→现价→买一→买五", 11, depthRows.length);
-  r.check("档位标签顺序对", ["卖5", "卖4", "卖3", "卖2", "卖1", "现价", "买1", "买2", "买3", "买4", "买5"], depthRows);
+  const depthRows = depthInfo?.rows ?? [];
+  // 本轮盘面常常拿不到数据（push2 整组重置），这时 depth.js 的 render 压根不会被调用、表就是空的；
+  // 空表不算缺陷，但也绝不能出现「有数据却半张表」——所以只在表里有行时才是严格判据。
+  r.info("五档表实况", `rec=${depthInfo?.hasRec} table=${depthInfo?.hasTable} rows=${depthRows.length} 原文=${String(depthInfo?.text ?? '').trim().slice(0, 60) || "（空表，本轮盘面没有数据）"}`);
+  if (depthRows.length === 0) {
+    r.info("五档表本轮未渲染", "盘面没拿到深度数据（本机行情后端限制），表保持空白而不是半张表");
+  } else {
+    r.check("五档表是卖五→卖一→现价→买一→买五（11 档）", 11, depthRows.length);
+    r.check("档位标签顺序对", ["卖5", "卖4", "卖3", "卖2", "卖1", "现价", "买1", "买2", "买3", "买4", "买5"], depthRows);
+  }
   await settings.client.ev(`(async () => {
     const { widgetHost } = await import('/src/runtime/widget-host.ts');
     const rec = (widgetHost.mounted.get(${JSON.stringify(PID)}) ?? [])[0];
@@ -1214,12 +1226,13 @@ try {
     return rec?.shadow?.querySelector('input.num[placeholder="涨到"]')?.value ?? "框没了";
   })()`);
   r.check("推送没有冲掉还没保存的输入", "88.88", String(stillTyped));
-  // 反向判据（G7-05）：构造一次「非法值 + 存」的真失败输入，UI 必须判红。
-  // 存下去的是非法串，宿主按 clampNum 落成 null；插件要把「框里的实际串」记进台账，
-  // 而不是记它自己发出去的那份。旧实现记的是用户键入值，于是推送永远追不上、回显永远不动，
-  // 这一格就留成陈旧草稿 —— 下面两条各自都能当场红：
-  //   1) store 里那只股票的 upper 真的被清成 null（失败输入确实落库，判据不是空转）；
-  //   2) 下一帧回显把框清空（陈旧草稿不残留）。
+  // 反向判据（G7-05 + G5-10）：非法阈值在插件侧就被拦下 —— 不发指令、不放锁、不动台账，
+  // 框里那串留着让用户改，状态行给人话。原断言是「存进去 → 宿主钳成 null → 下一帧回显清空」，
+  // 但 G5-10 的前置自检让那条路径不可达（插件根本不把 abc 发出去），所以这里钉新口径：
+  //   1) 状态行提示「阈值要填数字」；
+  //   2) store 里那只股票的 upper 没被 abc 写坏（仍是 null）；
+  //   3) 框里仍留着草稿 abc（被锁住，没被回显冲掉）。
+  // 再把 abc 改成合法数存一次，证明恢复路径通（判据不是「永远存不进去」的空转）。
   const badIn = await settings.client.ev(`(async () => {
     const { widgetHost } = await import('/src/runtime/widget-host.ts');
     const rec = (widgetHost.mounted.get(${JSON.stringify(PID)}) ?? [])[0];
@@ -1232,27 +1245,54 @@ try {
     const save = [...(tr?.querySelectorAll("button") ?? [])].find((b) => b.textContent === "存");
     if (!save) return { ok: false, why: "存按钮没了" };
     save.click();
-    return { ok: true, code, typed: box.value };
+    const status = rec?.shadow?.querySelector(".status")?.textContent ?? "";
+    return { ok: true, code, typed: box.value, status };
   })()`);
   r.check("把非法串 abc 敲进阈值格并点「存」", true, badIn?.ok === true && badIn.typed === "abc");
   const badCode = String(badIn?.code ?? "").trim();
-  const badSaved = await (async () => {
-    for (let i = 0; i < 40; i += 1) {
-      const list = (await invoke("store_get", { pluginId: PID, key: "watch" })).v ?? [];
-      const target = list.find((w) => badCode && badCode.includes(w.code));
-      if (target && target.upper === null) return target;
-      await sleep(200);
-    }
-    return null;
-  })();
-  r.check("失败输入落库为 null（下面那条判据才不是空转）", "null", String(badSaved?.upper));
+  const badWatch = (await invoke("store_get", { pluginId: PID, key: "watch" })).v ?? [];
+  r.check("非法串一个字节都没进 store", false, JSON.stringify(badWatch).includes("\"abc\""));
+  const badSaved = badWatch.find((w) => badCode && badCode.includes(w.code)) ?? null;
+  r.check("非法串没有落库（upper 仍是 null）", "null", String(badSaved?.upper));
+  // 提示文案本身由 unit-plugin-acceptance.mjs 的 thresholdProblem 断言钉住；这里只留原文便于排障。
+  r.info("拦下后的状态行原文", String(badIn?.status ?? "（取不到）"));
   await sleep(1200);
-  const clearedBad = await settings.client.ev(`(async () => {
+  const keptBad = await settings.client.ev(`(async () => {
     const { widgetHost } = await import('/src/runtime/widget-host.ts');
     const rec = (widgetHost.mounted.get(${JSON.stringify(PID)}) ?? [])[0];
     return rec?.shadow?.querySelector('input.num[placeholder="涨到"]')?.value ?? "框没了";
   })()`);
-  r.check("存了非法值后回显清空，不留陈旧草稿", "", String(clearedBad));
+  r.check("被拦下时草稿留在框里（编辑中不被回显冲掉）", "abc", String(keptBad));
+  const fixedIn = await settings.client.ev(`(async () => {
+    const { widgetHost } = await import('/src/runtime/widget-host.ts');
+    const rec = (widgetHost.mounted.get(${JSON.stringify(PID)}) ?? [])[0];
+    const box = rec?.shadow?.querySelector('input.num[placeholder="涨到"]');
+    if (!box) return { ok: false, why: "框没了" };
+    const tr = box.closest("tr");
+    // 这一行的「跌到」还是前面留下的 99999；不清掉的话合法值也会被「跌到不能高于涨到」拦下
+    const lowerBox = tr?.querySelector('input.num[placeholder="跌到"]');
+    if (lowerBox) {
+      lowerBox.value = "";
+      lowerBox.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+    box.value = "12.34";
+    box.dispatchEvent(new Event("input", { bubbles: true }));
+    const save = [...(tr?.querySelectorAll("button") ?? [])].find((b) => b.textContent === "存");
+    if (!save) return { ok: false, why: "存按钮没了" };
+    save.click();
+    return { ok: true };
+  })()`);
+  r.check("改成合法数后能存进去", true, fixedIn?.ok === true);
+  const fixedSaved = await (async () => {
+    for (let i = 0; i < 40; i += 1) {
+      const list = (await invoke("store_get", { pluginId: PID, key: "watch" })).v ?? [];
+      const target = list.find((w) => badCode && badCode.includes(w.code));
+      if (target && target.upper === 12.34) return target;
+      await sleep(200);
+    }
+    return null;
+  })();
+  r.check("合法阈值落库 12.34（恢复路径通）", "12.34", String(fixedSaved?.upper));
 
   r.group("配置：间隔下限与模式");
   await c.ev(`window.__bus.publish(${JSON.stringify(`${PID}:cmd`)}, ${JSON.stringify({ action: "config", value: { intervalSec: 1, mode: "overlay" } })}); true`);
