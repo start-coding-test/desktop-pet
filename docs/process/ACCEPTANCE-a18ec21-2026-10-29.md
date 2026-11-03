@@ -58,7 +58,7 @@
 | G8-02 | 修出新问题 | **已修（长行留 R3）** | CONVENTIONS 的硬编码基线表整段换成「基线的唯一来源」（只认 e2e-gate.json + `check:e2e-gate` + 最近绿 run）；`48 条注册命令`、`1249 个用例` 等陈旧数字改为「以命令输出为准」；fmt 退出码 0 的旧说法改成「a18ec21 上红、修复卡 R1」。8452 字单行与 38 行 >400 字未动 → R3。 |
 | G8-03 | 未修 | **已修** | `tools/check-docs.mjs` 的 `PLUGIN_IDS` 增至 5 个（含 `com.pet.goat-gauge`），README 速览行同步；check:docs R-C 现在 `ids=5/5`。 |
 | G8-04 | 部分 | **已修** | AGENTS 状态段改为「b6d98cd CI 绿（run 40643854516）、a18ec21 红在 fmt、E2E 门未触发、本地读数不是 tag 字节、分支保护未开」；直推清单补 `f2e9fd0`/`a18ec21`；文件 5986 字节（R-F limit 6000）。 |
-| G8-05 | 未修 | **部分** | PLUGIN-HANDBOOK 硬性规则 4 与 PLUGIN-REVIEW 检查表补「回显防冲写守卫」口径；共享 helper 仍未抽（`plugins/**` 不在本卡范围）→ R5。 |
+| G8-05 | 未修 | **已收口（2026-11-03 / R5）** | PLUGIN-HANDBOOK 硬性规则 4 与 PLUGIN-REVIEW 检查表补「回显防冲写守卫」口径；共享方式定为源码级（跨插件 import 被 `is_safe_rel` 挡住），契约写在 PLUGIN_SDK「6.1 设置页回显与防冲写」，goat-gauge 的内联守卫已抽成 `views/settings/lock.js`。 |
 | G8-06 | 未修 | **部分** | `unit-settings-echo.mjs` 的过时注释已改（F03′ 差量更新后旧虚拟节点 id 仍有效）；插件侧 `watch-list.js` 注释在 `plugins/**`，本卡不改 → 留给插件卡。 |
 | G8-07 | 未修 | **部分** | `.gitattributes` 清单补 `tests/e2e/harness/pet-window.ps1`；`src/main.ts` 的「单飞防 HMR」注释在 `src/**`，本卡不改。 |
 
@@ -114,7 +114,7 @@ N8 = G8-01（R-J 加「状态板内不许空行、每行列数 == 表头」）�
 - R1：main CI Rust fmt 红（`src-tauri/**` 25 处差异）；只动格式，等 CI 全绿。
 - R3：巨型 E2E 文件拆分与 CONVENTIONS 超长行，只搬不改判据；`localhost:1420` 与固定 sleep 的收口同批。
 - R4：NSIS Case C 在真机重跑（`-AcceptKnownGapC` 只降低误报，不等价于通过）；0.2.4 包 SHA256 补录。
-- R5：`docs/plugin-dev` 的防冲写共享 helper 抽取（`plugins/**` 范围）。
+- R5：**已收口（2026-11-03）**：`PLUGIN_SDK.md` 新增「6.1 设置页回显与防冲写」，HANDBOOK 规则 4 / REVIEW 检查表改为指向该节；goat-gauge 内联守卫抽成 `views/settings/lock.js`；跨插件 import 被 `is_safe_rel` 挡住，共享固定为源码级（复制带来源注释）。
 - 范围外：G1-11（PR 标题 lint）、G7-11（include_str!）、G7-13（enqueue 单测）、G8-06 的插件侧注释、
   G8-07 的 `src/main.ts` 注释、G9-03 的 formatter 开关。
 
@@ -228,7 +228,7 @@ N8 = G8-01（R-J 加「状态板内不许空行、每行列数 == 表头」）�
 **架构债务**
 - 同 realm 插件可 `import { invoke }` 绕过 JS 桥、插件身份由调用方自报（ADR-0011 / CODE-REVIEW R2 已记为未解决，本轮未假装解决）。
 - R3：巨型 E2E 文件拆分与 `CONVENTIONS.md` 超长行（只搬不改判据）。
-- R5：`docs/plugin-dev` 防冲写/编辑锁共享 helper；G5-03 整表 replace→差分更新。
+- R5：防冲写/编辑锁共享 helper **已收口（源码级共享）**；G5-03 整表 replace→差分更新仍未做。
 - 范围外小项：G1-11（PR 标题 lint）、G7-11（`include_str!` 计数）、G7-13（enqueue 单测）、G9-03（formatter 开关）。
 
 ## 7. 本轮没有做的事（不得读成通过）

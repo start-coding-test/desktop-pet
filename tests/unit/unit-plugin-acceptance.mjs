@@ -283,8 +283,17 @@ group("编辑锁实现一致：三处都是「追上即放」（G9-09）");
     check(`lock.js 导出 ${fn}`, new RegExp(`export function ${fn}`).test(lock), fn);
   }
   check("放锁条件是「值追上了」", lock.includes("locks.delete(node)"), "lock.js");
-  const goatPrefs = fileText("com.pet.goat-gauge", "views/settings/prefs.js");
-  check("goat 用同一口径的 syncSelect/syncCheck", /const syncSelect =/.test(goatPrefs) && /const syncCheck =/.test(goatPrefs), "prefs.js");
+  const goatLock = fileText("com.pet.goat-gauge", "views/settings/lock.js");
+  check("goat 也抽出 lock.js", goatLock.length > 0, "views/settings/lock.js");
+  for (const fn of ["syncSelect", "syncCheck"]) {
+    check(`goat lock.js 导出 ${fn}`, new RegExp(`export function ${fn}`).test(goatLock), fn);
+  }
+  check("goat 放锁条件同样是「值追上了」", goatLock.includes("locks.delete(node)"), "views/settings/lock.js");
+  check(
+    "goat 设置页用的是 lock.js",
+    fileText("com.pet.goat-gauge", "views/settings/prefs.js").includes('from "./lock.js"'),
+    "views/settings/prefs.js",
+  );
   for (const file of ["views/settings/prefs.js", "views/settings/board.js"]) {
     check(`astock ${file} 用的是共享 lock.js`, fileText("com.pet.astock", file).includes('from "./lock.js"'), file);
   }

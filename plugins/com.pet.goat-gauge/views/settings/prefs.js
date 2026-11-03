@@ -3,6 +3,7 @@
 import { TOPIC_CMD } from "../../topics.js";
 import { button, card, hint, input, row, tag, text } from "../dom.js";
 import { currencyPatch } from "./apply.js";
+import { syncCheck, syncSelect } from "./lock.js";
 
 const BADGE_MODES = [
   ["five_hour", "5 小时"],
@@ -202,28 +203,11 @@ export function mountPrefs(ctx, state) {
 
   box.append(refreshCard, currencyCard, thresholdCard, displayCard, posCard, demoCard);
 
-  /**
-   * select 的回显：用户刚选过（在 editing 里）就先不动，等推送里的值追上用户所选时复位放行 ——
-   * 那时写回的就是用户自己选的那一项，冲不掉任何东西。
-   * 为什么不学文本框用 blur 复位：select 的 blur 不在宿主转发的 value 事件里，而「追上即放行」
-   * 既能挡住推送覆盖，又不会把 editing 写成永不复位（外部改的币种/徽标照样进得来）。
-   */
-  const syncSelect = (node, want) => {
-    if (editing.has(node)) {
-      if (String(node.value ?? "") === want) editing.delete(node);
-      else return;
-    }
-    node.value = want;
-  };
-
-  /** checkbox 同理：这条也是「选了立即发补丁」，回显追上即复位 */
-  const syncCheck = (node, want) => {
-    if (editing.has(node)) {
-      if (node.checked === want) editing.delete(node);
-      else return;
-    }
-    node.checked = want;
-  };
+  // select / checkbox 的回显走共享契约的实现（views/settings/lock.js，两份同式实现之一）：
+  // 用户刚选过（在 editing 里）就先不动，等推送里的值追上用户所选时复位放行 ——
+  // 那时写回的就是用户自己选的那一项，冲不掉任何东西。为什么不像文本框那样用 blur 复位：
+  // select 的 blur 不在宿主转发的 value 事件里，而「追上即放行」既能挡住推送覆盖，
+  // 又不会把 editing 写成永不复位（外部改的币种/徽标照样进得来）。
 
   function render(view) {
     const d = view ?? {};
@@ -245,11 +229,11 @@ export function mountPrefs(ctx, state) {
     if (!editing.has(xInput)) xInput.value = String(c.overlayX ?? 360);
     if (!editing.has(yInput)) yInput.value = String(c.overlayY ?? 220);
     // 下面五条以前是无条件写：推送一来就把用户刚选的币种/徽标/开关冲回旧值（Bug4）
-    syncSelect(currencySel, c.currency === "CNY" ? "CNY" : "USD");
-    syncSelect(badgeSel, String(c.badgeMode ?? "five_hour"));
-    syncCheck(showOverlay, c.showOverlay !== false);
-    syncCheck(petBox, c.petReact !== false);
-    syncCheck(demoBox, c.demo === true);
+    syncSelect(currencySel, c.currency === "CNY" ? "CNY" : "USD", editing);
+    syncSelect(badgeSel, String(c.badgeMode ?? "five_hour"), editing);
+    syncCheck(showOverlay, c.showOverlay !== false, editing);
+    syncCheck(petBox, c.petReact !== false, editing);
+    syncCheck(demoBox, c.demo === true, editing);
   }
 
   return { box, render };

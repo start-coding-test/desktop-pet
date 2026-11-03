@@ -490,8 +490,10 @@ check(
 );
 } // end of "pwsh 可用" 分支
 
-// 套件那条路：cleanup 子进程的 env 必须来自同一份收口，而不是各拼一份
-const bridge = read("tests/e2e/verify-agent-bridge.mjs");
+// 套件那条路：cleanup 子进程的 env 必须来自同一份收口，而不是各拼一份。
+// R3（G9-08）把 verify-agent-bridge.mjs 拆成 agent/phases-*.mjs 后，这段落在 phases-qoder.mjs；
+// 钉的是「这份收口还在、且仍被 cleanup 分支使用」，位置随拆分更新，判据不变。
+const bridge = read("tests/e2e/agent/phases-qoder.mjs");
 check(
   "cleanup 子进程的 env 走统一的 agentIsolationEnv",
   bridge.includes("const isolationPatch = agentIsolationEnv(env)") &&

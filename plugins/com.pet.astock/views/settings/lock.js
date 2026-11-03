@@ -4,7 +4,9 @@
 // 用户刚点过的控件，在下一次推送（配置还没追上这次点击）到来时被冲回旧值 ——
 // 视觉上是「点了没用」，甚至会把用户的选择写回默认。
 //
-// 口径与 goat-gauge 的 prefs.js 一致（两个插件不能互相 import，各自留一份同式实现）：
+// 口径见 docs/plugin-dev/PLUGIN_SDK.md 的「6.1 设置页回显与防冲写（编辑锁）」；
+// com.pet.goat-gauge/views/settings/lock.js 是同式实现（插件之间不能互相 import，共享发生在源码级，
+// 见 `src-tauri/src/commands/plugins.rs` 的 `is_safe_rel`）。改契约时两处一起改。
 //   - 控件被用户碰过 → 记进 locks，回显先绕开它；
 //   - 推送里的值追上用户所选 → 复位放行（这时写回的就是用户自己选的那项，冲不掉东西）；
 //   - 不在锁上 → 只写变化的值，别每帧重发同一个 op。

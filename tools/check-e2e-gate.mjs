@@ -114,9 +114,23 @@ for (const suite of allSuites) {
     continue;
   }
   // G4：门的 GREEN 依赖这条机器行；入口脚本自己打不出来，就永远是 NO-SUMMARY-RED。
-  const src = readText(file);
-  const emits = src.includes(".summary()") || src.includes("summary()");
-  if (!emits) fail(`${rel(file)} 没有调用 report.summary()：门的 NO-SUMMARY-RED 会一直红`);
+  // R3（G9-08）拆分后入口只留骨架，summary 落在它 import 的本地模块里（如 agent/teardown.mjs），
+  // 所以这里沿一层相对 import 找，而不是只盯入口文件本身。
+  const srcOf = (f) => {
+    try {
+      return readText(f);
+    } catch {
+      return "";
+    }
+  };
+  const localImports = (text) =>
+    [...text.matchAll(/from\s+["'](\.{1,2}\/[^"']+)["']/g)]
+      .map((m) => path.resolve(path.dirname(file), m[1]))
+      .filter((f) => f.endsWith(".mjs"));
+  const src = srcOf(file);
+  const emits =
+    src.includes(".summary(") || localImports(src).some((f) => fs.existsSync(f) && srcOf(f).includes(".summary("));
+  if (!emits) fail(`${rel(file)} 没有调用 report.summary()（含它 import 的本地模块）：门的 NO-SUMMARY-RED 会一直红`);
 }
 
 // ---- G6 / G7 / G8 ---------------------------------------------------------

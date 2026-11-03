@@ -387,12 +387,23 @@ MVP 范围：<这一轮只做什么>
   离线 `npm run unit` 2241/0、`check:docs` / `check:shape` / `lint` / `build` 退出 0；Rust fmt 红项转 R1。
 - 明确不做的：不 push、不建 GitHub Release、不改分支保护、不豁免 fmt 红。
 
-### R3 巨型 E2E 文件与超长行排版（G9-08 / G8-02 残余） · 状态：**待排**
+### R3 巨型 E2E 文件与超长行排版（G9-08 / G8-02 残余） · 状态：**已收口（2026-11-03）**
 
 - 目标：把 `tests/e2e/verify-isolation.mjs`（4064 行）、`verify-agent-bridge.mjs`（2372 行）按组拆成
   harness + 分片脚本；`docs/process/CONVENTIONS.md` 里 8452 字的单行与 38 行 >400 字按段落折行。
 - 约束：只搬不改判据；拆完 `npm run verify` / `verify:agent` 的断言数与标题集合必须不变
-  （用 `audit-assertions` 对标题集合，不比数字）。
+  （仓库里没有 `audit-assertions`，改用「拆分前完整跑一次的日志 + 顺序敏感逐条 diff」对标题集合，不比数字）。
+- 收口方式：两个入口只留骨架（4074→**59** 行、2407→**44** 行），实现按原顺序搬到
+  `tests/e2e/isolation/`（env / consent / fake-cdp / session / teardown + 6 个 `phases-*`）与
+  `tests/e2e/agent/`（env / session / teardown + 6 个 `phases-*`），单个文件最长 664 行；
+  跨段共享值改为显式挂在 `state` 上，赋值时机与拆分前一致。`CONVENTIONS.md` 242→**328** 行，
+  38 条 >400 字节的段落折成 124 行，折后 `byte>400 = 0`、最长 400 字节，去空白后的字符数前后全等（32671）。
+- 证据（2026-11-03，干净树、杀净实例后实测）：`node tools/e2e-run.mjs --only verify,verify:agent`
+  → **verify 485/0（262s）、verify:agent 318/0（61s）**；标题与拆分前的 `temp/e2e-recheck-full.log` 逐条比：
+  verify 485 条、verify:agent 318 条，**顺序敏感 diff 0 行**（排序后集合同样 0 增 0 删 0 改）；
+  `npm run unit` **2642/0**、`npm run lint` 238 文件 0 fix、`npm run build` 退出 0、
+  `check:docs` rules=10 failing=0、`check:shape` commands=52 failing=0。
+  单测里 `tests/unit/unit-nsis-hook.mjs` 的三条源码钉子随拆分改读 `tests/e2e/agent/phases-qoder.mjs`（判据不变）。
 - 为什么不在 t1：改动面覆盖测试主流程，低风险才做；本轮只记录，不硬拆。
 
 ### R4 NSIS Case C 真机重跑 + 0.2.4 SHA256 补录 · 状态：**待排（需真机与打包产物）**
@@ -402,10 +413,15 @@ MVP 范围：<这一轮只做什么>
   [RELEASE-CHECKLIST.md](RELEASE-CHECKLIST.md) 的 0.2.4 节。
 - 为什么不在 t1：需要真机安装/卸载与已打好但未入库的安装包（`release-package/` 被 `.gitignore` 覆盖）。
 
-### R5 docs/plugin-dev 防冲写/编辑锁口径 + 共享 helper（G8-05 / G9-09） · 状态：**待排**
+### R5 docs/plugin-dev 防冲写/编辑锁口径 + 共享 helper（G8-05 / G9-09） · 状态：**已收口（2026-11-03）**
 
 - 目标：在 `PLUGIN_SDK.md` / `PLUGIN_HANDBOOK.md` / `PLUGIN_REVIEW.md` 写清「回显守卫 / 防冲写」
   的插件侧义务；把重复的实现抽成 `plugins/` 共享 helper 或在文档里写明「暂不抽、复制要带理由」。
+- 收口方式：`PLUGIN_SDK.md` 新增「6.1 设置页回显与防冲写（编辑锁）」（契约 + 参考实现 + 共享边界），
+  `PLUGIN-HANDBOOK.md` 规则 4 与 `PLUGIN-REVIEW.md` 检查表改为指向该节；`com.pet.goat-gauge` 设置页
+  的内联守卫抽成 `plugins/com.pet.goat-gauge/views/settings/lock.js`（与 `com.pet.astock/.../lock.js` 同式）。
+  跨插件 import 不可行（`petplugin://<id>/…` + `is_safe_rel` 拒绝 `..`），因此共享固定在**源码级**：
+  复制必须保留来源注释、改契约时所有副本一起改；行为兜底是 `verify:astock` / `verify:goat-gauge`。
 - 为什么不在 t1：`plugins/**` 与 ADR 不在本卡范围，且抽 helper 要动插件运行时代码。
 
 ### R6 真机项汇总 · 状态：**待排（需真机与桌面会话）**

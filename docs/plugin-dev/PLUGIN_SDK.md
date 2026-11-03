@@ -271,6 +271,32 @@ overlay 的**位置与尺寸属于你自己那扇窗**：`show({ x, y, height })
 插件停用时宿主会 `destroy` 掉它的悬浮窗，你不需要自己收尾（`deactivate()` 里调 `destroy()` 也无害）。
 
 
+### 6.1 设置页回显与防冲写（编辑锁）
+
+设置页是在另一个窗口新建的，插件主逻辑拿不到它的历史；因此每次状态变化都用 `<id>:widget` 推全量配置，
+面板挂载时订阅并据此设控件（见 `PLUGIN-HANDBOOK.md` 硬性规则 4）。只做到这一步还不够：**回显不能覆盖用户正在编辑的控件** ——
+用户敲了一半的阈值、刚选的 `<select>`、刚改的勾选框，会被下一次推送冲回旧值，看起来像「改了没用」（Bug4）。
+
+契约（`com.pet.astock` 与 `com.pet.goat-gauge` 的设置页都按它实现，`verify:astock` / `verify:goat-gauge`
+各有一条「改了未应用 → 推送不冲掉」的断言）：
+
+- 控件被用户碰过（`input`/`change` 事件里）→ 记进本页的 `locks: Set`，回显先绕开它；
+- 推送里的值**追上用户所选**（相等）→ 从 `locks` 删除并放行，这一帧写回的就是用户自己选的那项，冲不掉东西；
+- 不在 `locks` 上 → 只写真正变化的控件，别每帧重发同一个 op（每帧重写会让光标跳动、也掩盖真实的回显 bug）；
+- radio 组按整组判：组里只要有一个在锁上就整组别碰，否则写别人的 `checked` 等于取消用户刚勾的那项。
+
+参考实现（源码级共享，见下一条）：
+
+- `plugins/com.pet.astock/views/settings/lock.js` —— `syncSelect` / `syncCheck` / `syncRadioGroup`，三个 helper 都返回
+  「这一帧有没有真的写下去」，纯函数、可直接单测；
+- `plugins/com.pet.goat-gauge/views/settings/lock.js` —— 同式的 `syncSelect` / `syncCheck`（该插件没有 radio 组）。
+
+**为什么每个插件留一份、而不是 import 一个公共模块**：插件的文件只由 `petplugin://<自己的 id>/…` 提供，
+协议层逐段校验（`src-tauri/src/commands/plugins.rs` 的 `is_safe_rel`）拒绝 `.` / `..` 段，插件之间无法互相 import；
+宿主也不会为一个公共目录建第二套解析点。所以共享发生在**源码级**：新插件复制实现时必须保留来源注释
+（指明契约章节与参考实现的插件 id），改契约时所有副本一起改，不允许悄悄分叉。复制而不是复用的代价，
+就是这一条要人工核对 —— `verify:astock` / `verify:goat-gauge` 是行为兜底，代码评审是来源兜底。
+
 ## 7. 调试
 
 ```bash
