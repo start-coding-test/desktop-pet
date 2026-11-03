@@ -50,7 +50,13 @@
 - 离线门：`npm run unit` 2642/0、`npm run lint` 238 文件 0 fix、`npm run build` 退出 0、
   `check:docs` rules=10 failing=0、`check:shape` commands=52 failing=0、`check:e2e-gate` suites=12 failing=0；
   `cargo test` 428/0、`cargo fmt --all -- --check` 干净、`clippy --all-targets -- -D warnings` 退出 0。
-- tag / Release：待本节最终回填（见下条）。分支保护：**仍未开启**（网页创建被 GitHub sudo 二次认证拦下）。
+- tag / Release：tag `v0.2.5` 已打并推送（指向 `d5a3ee5`，该提交 CI run `41581638182` 全绿）；
+  GitHub Release **v0.2.5 已发布**（`https://github.com/start-coding-test/desktop-pet/releases/tag/v0.2.5`），
+  资产 `DesktopPet_0.2.5_x64-setup.exe`（2,809,161 B，asset id `704397272`），label=Latest。
+  分支保护：**仍未开启**（网页创建被 GitHub sudo 二次认证拦下）。
+  上传通道备忘：`bsk_interact upload` 对 GitHub 的 sr-only 文件输入无效；可行路径是把安装包推到一个临时分支
+  （`.tmp-release/…`），在 releases/new 页面里 `fetch` raw.githubusercontent 的同源文件构造 `File`，
+  向 `file-attachment.js-upload-release-file` 派发 dragenter/dragover/drop；发布后删掉临时分支。
 - 未验：真机安装/覆盖升级、DSH 真机联动、四家 Agent 真机写盘、DPI≠100% 拖动、蓝牙与在线行情。
 
 ## 0.2.4（2026-10-28，修复轮）

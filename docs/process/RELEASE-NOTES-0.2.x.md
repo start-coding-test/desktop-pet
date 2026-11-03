@@ -5,6 +5,8 @@
 
 ## 0.2.5 — 2026-11-03（验收修复轮；tag `v0.2.5`）
 
+> 已发布：GitHub Release `v0.2.5`（tag 指向 `d5a3ee5`，CI run `41581638182` 全绿；资产 `DesktopPet_0.2.5_x64-setup.exe` 2,809,161 B、asset id `704397272`）。
+
 ### 主要变化
 
 - **验收报告 P1/P2 收口**（`33c78d8`）：Rust fmt 23 处差异清零 → main CI 第 12 步「Rust 格式检查」转绿；
